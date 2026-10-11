@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Ingest the telemetry spool into the usage/sessions tables.
 
 ~/bin/agent-telemetry-hook (dash) writes one private file per Claude Code hook event into the spool:
@@ -25,15 +25,11 @@ Env: AGENTOS_TELEMETRY_SPOOL, AGENTOS_TELEMETRY_DB, AGENTOS_TELEMETRY_ERRLOG (te
      AGENTOS_TELEMETRY_TEST_CRASH=before-commit|after-commit simulates a crash (regression.sh only).
 Exit: 0 ok / nothing to do / lock busy; 1 ingest failed (files kept for the next run, error logged).
 """
+# The shebang runs Python with -I -S: no $PYTHONPATH, no script dir or cwd on sys.path, no site
+# (sitecustomize, .pth files). The hook starts this in every session; a stray json.py must not run here.
 import os
 import sys
 import time
-
-# Like python -I: never import from the script dir, the cwd or $PYTHONPATH (a stray json.py there would run
-# inside the hook's ingester). Everything imported later is stdlib.
-_skip = {os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.realpath(__file__))}
-_skip.update(os.path.abspath(p) for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p)
-sys.path[:] = [p for p in sys.path if p and os.path.abspath(p) not in _skip]
 
 HOME = os.path.expanduser("~")
 SPOOL = os.environ.get("AGENTOS_TELEMETRY_SPOOL") or os.path.join(HOME, ".agent-os", "runtime", "telemetry-spool")

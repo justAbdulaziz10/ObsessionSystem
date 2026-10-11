@@ -276,6 +276,14 @@ for i in $(seq 1 50); do [ "$(qraw "select count(*) from sessions where session_
 [ "$dt" -lt 1000 ] || fail "Stop hook took ${dt} ms (detached ingest must not add latency)"
 ok "failed ingest keeps spool + logs; min-age defers fresh files; Stop hook returns in ${dt} ms and a detached ingest lands it"
 
+# The ingester runs in every session; code planted on PYTHONPATH or in the cwd must not run inside it.
+mkdir -p "$TMP/trap"
+printf 'open("%s/trap/ran", "w").write("x")\n' "$TMP" > "$TMP/trap/sitecustomize.py"
+cp "$TMP/trap/sitecustomize.py" "$TMP/trap/json.py"
+(cd "$TMP/trap" && PYTHONPATH="$TMP/trap" "$INGEST" --quiet) || fail "ingest with planted modules rc=$?"
+[ ! -e "$TMP/trap/ran" ] || fail "ingest imported a module from PYTHONPATH or the cwd"
+ok "ingest ignores sitecustomize.py and json.py on PYTHONPATH and in the cwd"
+
 sleep 0.3; ingest   # let any detached ingester finish before the temp dir goes away
 echo "PASS: $pass checks (db: $AGENTOS_TELEMETRY_DB)"
 [ -n "${KEEP:-}" ] || rm -rf "$TMP"

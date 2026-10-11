@@ -6,24 +6,30 @@
 #   ./uninstall.sh --purge    also delete ~/.agent-os (config, task records, telemetry)
 #   ./uninstall.sh --dry-run  print what would change, change nothing
 #
-# Only paths listed in ~/.agent-os/install-manifest.tsv are removed. A copied
-# file (install.sh --copy) you have since edited is kept and reported.
-# Files it edits (CLAUDE.md, settings.json) are backed up first. Like
-# install.sh, it covers $CLAUDE_CONFIG_DIR (default ~/.claude) and $AGENT_CLAUDE_DIRS.
+# Only paths listed in ~/.agent-os/install-manifest.tsv are removed, and only
+# if unchanged since install: a link still pointing where it did, a copy
+# (install.sh --copy) with the same content. Anything else is kept and reported.
+# Files it edits (CLAUDE.md, settings.json) are backed up first, in every Claude
+# config dir the manifest lists, plus $CLAUDE_CONFIG_DIR and $AGENT_CLAUDE_DIRS.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAUDE_DIRS=()
-IFS=: read -ra _extra <<<"${AGENT_CLAUDE_DIRS:-}"
-for _c in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ${_extra[@]+"${_extra[@]}"}; do
-  [ -n "$_c" ] || continue
-  _c="${_c/#\~/$HOME}"; _c="${_c%/}"
-  for _s in ${CLAUDE_DIRS[@]+"${CLAUDE_DIRS[@]}"}; do
-    if [ "$_s" = "$_c" ] || [ "$_s" -ef "$_c" ]; then continue 2; fi
-  done
-  CLAUDE_DIRS+=("$_c")
-done
 MANIFEST="$HOME/.agent-os/install-manifest.tsv"
+CLAUDE_DIRS=()
+add_dir() {
+  local c="${1/#\~/$HOME}" s
+  c="${c%/}"; [ -n "$c" ] || return 0
+  for s in ${CLAUDE_DIRS[@]+"${CLAUDE_DIRS[@]}"}; do
+    if [ "$s" = "$c" ] || [ "$s" -ef "$c" ]; then return 0; fi
+  done
+  CLAUDE_DIRS+=("$c")
+}
+add_dir "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+IFS=: read -ra _extra <<<"${AGENT_CLAUDE_DIRS:-}"
+for _c in ${_extra[@]+"${_extra[@]}"}; do add_dir "$_c"; done
+if [ -f "$MANIFEST" ]; then
+  while IFS=$'\t' read -r _k _c _; do [ "$_k" = config ] && add_dir "$_c"; done < "$MANIFEST"
+fi
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DRY=0 PURGE=0
 for a in "$@"; do
@@ -37,18 +43,24 @@ done
 run() { if [ "$DRY" = 1 ]; then printf '    $ %s\n' "$*"; else "$@"; fi; }
 gone() { printf '  - %s\n' "${1/#$HOME/~}"; }
 kept() { printf '  = %s\n' "${1/#$HOME/~}"; }
+# treesum PATH: the same function as in install.sh; keep them identical.
+treesum() {
+  if [ -d "$1" ]; then
+    (cd "$1" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do printf '%s ' "$f"; cksum < "$f"; done) | cksum
+  else cksum < "$1"; fi
+}
 
 if [ -f "$MANIFEST" ]; then
   # Reverse order of creation, so links inside a copied directory go first.
-  while IFS=$'\t' read -r kind dest src; do
+  while IFS=$'\t' read -r kind dest value; do
     case "$kind" in
       link)
-        if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then run rm "$dest"; gone "$dest"
+        if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$value" ]; then run rm "$dest"; gone "$dest"
         elif [ -e "$dest" ] || [ -L "$dest" ]; then kept "$dest (changed since install, left alone)"; fi ;;
       copy)
-        if [ ! -e "$dest" ]; then continue; fi
-        if [ -e "$src" ] && diff -rq "$src" "$dest" >/dev/null 2>&1; then run rm -rf "$dest"; gone "$dest"
-        else kept "$dest (copy differs from the checkout or the checkout is gone; remove it yourself)"; fi ;;
+        if [ -L "$dest" ]; then kept "$dest (now a link, left alone)"
+        elif [ -e "$dest" ] && [ "$(treesum "$dest")" = "$value" ]; then run rm -rf "$dest"; gone "$dest"
+        elif [ -e "$dest" ]; then kept "$dest (edited since install, left alone)"; fi ;;
     esac
   done < <(awk '{ l[NR] = $0 } END { for (i = NR; i > 0; i--) print l[i] }' "$MANIFEST")
   run rm "$MANIFEST"

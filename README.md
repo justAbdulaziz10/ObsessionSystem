@@ -98,8 +98,8 @@ This needs `zsh`, `jq` and `sqlite3`. It installs into a temporary `HOME` and ru
 | `agent-task` | 29 |
 | Codex add-on | 24 |
 | `agent-overnight` | 10 |
-| Telemetry | 13 groups |
-| Install and uninstall | 36 checks in 11 scenarios |
+| Telemetry | 14 groups |
+| Install and uninstall | 46 checks in 16 scenarios |
 | Skill lint | the 9 skills |
 
 ## Limits

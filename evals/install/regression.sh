@@ -70,7 +70,7 @@ echo "# mine" >> "$HOME/bin/agent-task"
 out="$("$R/uninstall.sh")"
 check "unchanged copy removed" '[ ! -e "$HOME/bin/agent-ship" ]'
 check "edited copy kept" '[ -f "$HOME/bin/agent-task" ]'
-check "edited copy reported" 'grep -q "agent-task (copy differs" <<<"$out"'
+check "edited copy reported" 'grep -q "agent-task (edited since install" <<<"$out"'
 check "copied skill dir removed" '[ ! -e "$HOME/.agents/skills/correct" ]'
 
 echo "-- 6. dry runs change nothing"
@@ -124,5 +124,48 @@ check "each dir set up once" '[ "$(grep -c "^Claude Code -> " <<<"$out")" = 2 ]'
 "$R/uninstall.sh" >/dev/null
 check "both dirs cleaned, backups kept" '[ -z "$(find "$HOME/.claude" "$HOME/.claude_second" -mindepth 1 \( -type l -o -type f \) -not -name "*.bak-*")" ] && ls "$HOME/.claude_second" | grep -q "settings.json.bak-"'
 unset AGENT_CLAUDE_DIRS
+
+echo "-- 12. --copy: an edited skill reached through a re-pointed skills dir is kept"
+fresh
+"$R/install.sh" --copy >/dev/null
+rm -rf "$HOME/.claude/skills" && ln -s "$HOME/.agents/skills" "$HOME/.claude/skills"
+echo "my note" >> "$HOME/.agents/skills/correct/SKILL.md"
+"$R/uninstall.sh" >/dev/null
+check "edited skill kept" 'grep -q "my note" "$HOME/.agents/skills/correct/SKILL.md"'
+check "unedited skill removed" '[ ! -e "$HOME/.agents/skills/diagnosing-bugs" ]'
+
+echo "-- 13. --copy: a changed checkout does not pin unedited copies"
+fresh
+"$R/install.sh" --copy >/dev/null
+echo "# newer" >> "$R/bin/agent-ship"
+out="$("$R/install.sh" --copy)"
+check "reinstall updates the unedited copy" 'grep -q "# newer" "$HOME/bin/agent-ship"'
+check "other copies left as they were" 'grep -q "agent-task (already copied)" <<<"$out"'
+echo "# older checkout again" >> "$R/bin/agent-task"
+"$R/uninstall.sh" >/dev/null
+check "unedited copies removed after the checkout changed" '[ -z "$(ls -A "$HOME/bin")" ]'
+
+echo "-- 14. a recorded link the user re-pointed is theirs"
+fresh
+"$R/install.sh" >/dev/null
+echo mine > "$HOME/my-recall"; rm "$HOME/bin/agent-recall"; ln -s "$HOME/my-recall" "$HOME/bin/agent-recall"
+"$R/install.sh" >/dev/null
+check "reinstall leaves it" '[ "$(readlink "$HOME/bin/agent-recall")" = "$HOME/my-recall" ]'
+"$R/uninstall.sh" >/dev/null
+check "uninstall leaves it" '[ "$(readlink "$HOME/bin/agent-recall")" = "$HOME/my-recall" ]'
+
+echo "-- 15. uninstall finds config dirs from the manifest, without AGENT_CLAUDE_DIRS"
+fresh
+AGENT_CLAUDE_DIRS="$HOME/.claude_second" "$R/install.sh" --with-hooks >/dev/null
+"$R/uninstall.sh" >/dev/null
+check "second dir block and hooks removed" '[ ! -e "$HOME/.claude_second/CLAUDE.md" ] && [ ! -e "$HOME/.claude_second/settings.json" ]'
+
+echo "-- 16. a HOME with a space in it"
+fresh
+SP="$HOME/with space"; mkdir -p "$SP"; mv "$R" "$SP/"; R="$SP/checkout"; HOME="$SP"
+"$R/install.sh" --with-hooks >/dev/null
+check "installed" '[ -L "$HOME/bin/agent-ship" ] && [ -L "$HOME/.claude/skills/correct" ]'
+"$R/uninstall.sh" >/dev/null
+check "nothing left" '[ -z "$(find "$HOME" -type l -not -path "$R/*")" ] && [ ! -e "$HOME/.claude/settings.json" ]'
 
 exit $fail

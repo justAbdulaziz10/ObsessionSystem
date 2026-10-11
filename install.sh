@@ -55,30 +55,50 @@ ok()   { printf '  + %s\n' "$*"; }
 keep() { printf '  = %s\n' "$*"; }
 run()  { if [ "$DRY" = 1 ]; then printf '    $ %s\n' "$*"; else "$@"; fi; }
 
-# The manifest has one line per path this installer created: kind<TAB>dest<TAB>src.
-recorded() { [ -f "$MANIFEST" ] && awk -F'\t' -v d="$1" '$2 == d { f = 1 } END { exit !f }' "$MANIFEST"; }
+# The manifest has one line per thing this installer created, kind<TAB>path<TAB>value:
+#   link    path  link target
+#   copy    path  checksum of the copied content (uninstall removes it only if unchanged)
+#   config  dir   -   (a Claude config dir that got the import block and hooks)
+recorded() { # recorded KIND PATH: print the value, fail if there is no such line
+  [ -f "$MANIFEST" ] && K="$1" P="$2" awk -F'\t' '$1 == ENVIRON["K"] && $2 == ENVIRON["P"] { v = $3; f = 1 } END { if (f) print v; exit !f }' "$MANIFEST"
+}
 record() {
   [ "$DRY" = 1 ] && return 0
   mkdir -p "$AOS"
   if [ -f "$MANIFEST" ]; then
-    awk -F'\t' -v d="$2" '$2 != d' "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+    P="$2" awk -F'\t' '$2 != ENVIRON["P"]' "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
   fi
   printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$MANIFEST"
 }
+# treesum PATH: checksum of a file, or of every file name and content under a directory.
+# uninstall.sh has the same function; keep them identical.
+treesum() {
+  if [ -d "$1" ]; then
+    (cd "$1" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do printf '%s ' "$f"; cksum < "$f"; done) | cksum
+  else cksum < "$1"; fi
+}
 
 # place SRC DEST: symlink (or copy) SRC to DEST unless something else is already there.
-# A link this installer made earlier is updated, e.g. after the checkout moved.
+# What this installer made earlier and nobody changed since is updated: a link after the
+# checkout moved, an unedited copy after the checkout changed.
 place() {
-  local src="$1" dest="$2"
-  if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then keep "$(tilde "$dest") (already linked)"; return; fi
-  if [ -L "$dest" ] && recorded "$dest"; then
+  local src="$1" dest="$2" was
+  if [ "$COPY" = 0 ] && [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then keep "$(tilde "$dest") (already linked)"; return; fi
+  if [ -L "$dest" ] && was="$(recorded link "$dest")" && [ "$(readlink "$dest")" = "$was" ]; then
     run rm "$dest"
+  elif [ -e "$dest" ] && [ ! -L "$dest" ] && was="$(recorded copy "$dest")" && [ "$(treesum "$dest")" = "$was" ]; then
+    if [ "$COPY" = 1 ] && [ "$(treesum "$src")" = "$was" ]; then keep "$(tilde "$dest") (already copied)"; return; fi
+    run rm -rf "$dest"
   elif [ -e "$dest" ] || [ -L "$dest" ]; then
     keep "$(tilde "$dest") exists, left alone"; return
   fi
   run mkdir -p "$(dirname "$dest")"
-  if [ "$COPY" = 1 ]; then run cp -R "$src" "$dest"; record copy "$dest" "$src"
-  else run ln -s "$src" "$dest"; record link "$dest" "$src"; fi
+  if [ "$COPY" = 1 ]; then
+    run cp -R "$src" "$dest"
+    [ "$DRY" = 1 ] || record copy "$dest" "$(treesum "$dest")"
+  else
+    run ln -s "$src" "$dest"; record link "$dest" "$src"
+  fi
   ok "$(tilde "$dest")"
 }
 
@@ -110,9 +130,12 @@ for d in "$REPO"/skills/*/; do place "${d%/}" "$SKILLS/$(basename "$d")"; done
 setup_claude_dir() {
   local CLAUDE="$1" n f MD S sep
   echo "Claude Code -> $(tilde "$CLAUDE")"
+  record config "$CLAUDE" -   # so uninstall.sh finds this dir even without AGENT_CLAUDE_DIRS
   for f in "$REPO"/skills/*/; do
     n="$(basename "$f")"
-    if [ ! "$SKILLS" -ef "$CLAUDE/skills" ]; then place "$SKILLS/$n" "$CLAUDE/skills/$n"; fi
+    [ ! "$SKILLS" -ef "$CLAUDE/skills" ] || continue
+    # Links go through ~/.agents/skills; copies come straight from the checkout.
+    if [ "$COPY" = 1 ]; then place "${f%/}" "$CLAUDE/skills/$n"; else place "$SKILLS/$n" "$CLAUDE/skills/$n"; fi
   done
   for f in "$REPO"/agents/*.md; do place "$f" "$CLAUDE/agents/$(basename "$f")"; done
 
