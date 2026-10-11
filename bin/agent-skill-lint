@@ -1,0 +1,660 @@
+#!/usr/bin/python3
+"""agent-skill-lint: deterministic checks for SKILL.md skills (no LLM, stdlib only).
+
+Usage:
+  agent-skill-lint [--all] [--plugins] [--json] [--rule ID] [--quiet] [--strict] [<skill-dir>...]
+
+  --all       every skill dir under ~/.agents/skills (default when no dir is given)
+  --plugins   also lint Claude/Codex plugin skill dirs (provenance check skipped there)
+  --json      machine-readable findings
+  --rule ID   show only findings for this rule id (summary still counts all)
+  --quiet     summary only
+  --strict    count errors in third-party upstream skills too (old behaviour)
+
+Ownership comes from ~/.agents/skill-sources.json and .skill-lock.json. Findings in skills
+whose provenance is a third-party upstream (a source with a repository, unless the skill is a
+'local-adaptation'; .skill-lock.json entries; plugin-symlinked skills) are tagged `upstream`
+and errors there are downgraded to warnings: we do not edit those files, so they must not hide
+errors in our own skills. The summary still reports them as upstream_errors.
+
+hash-drift: SKILL.md sha256 differs from installed_sha256 in skill-sources.json. Error for
+device-local skills (source without a repository), warning for upstream-sourced ones. Refresh a
+sanctioned edit with `agent-system-change rehash <skill> --change <id>`.
+
+Exit code: 0 = no errors in our own skills (warnings and upstream errors allowed; with --strict
+upstream errors count), 1 = at least one counted error, 2 = usage error.
+
+Standard: ~/.agents/skills/writing-skills/SKILL.md. Rule ideas adapted (reimplemented, MIT)
+from tigerless-labs/autoharness lib/validate.py (trigger cue, body altitude, subfile pointers,
+absolute paths) and addyosmani/agent-skills docs/skill-anatomy.md (description = what + when,
+no process summary).
+"""
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+HOME = Path.home()
+SKILLS_ROOT = HOME / ".agents" / "skills"
+SOURCES = HOME / ".agents" / "skill-sources.json"
+LOCK = HOME / ".agents" / ".skill-lock.json"
+PLUGIN_GLOBS = [
+    ".claude/plugins/cache/*/*/*/skills/*",
+    ".claude_second/plugins/cache/*/*/*/skills/*",
+    ".codex/plugins/cache/*/*/*/skills/*",
+]
+
+DESC_WARN, DESC_HARD, DESC_MAX = 300, 500, 1024
+BODY_WARN = 200
+CURRENT_OS_MAJOR = 27          # iOS/iPadOS/macOS/watchOS/tvOS/visionOS/Xcode 27 shipped 2026
+CURRENT_SWIFT = (6, 4)
+CURRENT_YEAR = 2026
+HOME_GROWN_MARKERS = {"home-grown", "agentos-home-grown", "agentos"}
+
+SEVERITY = {
+    "frontmatter-missing": "E", "frontmatter-yaml": "E", "frontmatter-comment": "W",
+    "name-missing": "E", "name-mismatch": "E", "desc-missing": "E",
+    "desc-too-long": "E", "desc-long": "W", "desc-no-trigger": "W", "desc-process-summary": "W",
+    "body-long": "W", "ref-missing": "E", "ref-missing-path": "W", "ref-orphan": "W",
+    "abs-user-path": "W", "nested-plugin-layout": "E", "stale-platform": "W",
+    "provenance-missing": "W", "hash-drift": "E",
+}
+
+PLACEHOLDER_USERS = {"user", "username", "you", "me", "name", "example", "someone", "john",
+                     "jane", "alice", "bob", "dev", "runner", "foo", "yourname", "your-name", "x"}
+
+
+# ---------------------------------------------------------------- frontmatter
+
+def split_frontmatter(text):
+    """Return (frontmatter_lines, body_text, body_start_line) or (None, text, 1)."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None, text, 1
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return lines[1:i], "\n".join(lines[i + 1:]), i + 2
+    return None, text, 1
+
+
+KEY_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*)\s*:(?:\s+(.*)|\s*)$")
+
+
+def _plain_scalar_problems(val, where):
+    """YAML plain-scalar hazards that make the whole frontmatter fail to parse (or truncate)."""
+    probs = []
+    v = val.strip()
+    if not v:
+        return probs
+    if v[0] in "@`%":
+        probs.append(("frontmatter-yaml", "%s starts with reserved character %r" % (where, v[0])))
+    if v[0] in "&*!" and not re.match(r"^\*\*", v):
+        probs.append(("frontmatter-yaml", "%s starts with YAML anchor/alias/tag %r" % (where, v[0])))
+    if v[0] in "[{" and v[-1] not in "]}":
+        probs.append(("frontmatter-yaml", "%s starts a flow collection %r that never closes" % (where, v[0])))
+    if re.search(r":\s", v + " ") and v[0] not in "[{":
+        probs.append(("frontmatter-yaml", "%s plain scalar contains ': ' (quote the value)" % where))
+    if re.search(r"\s#", v):
+        probs.append(("frontmatter-comment", "%s contains ' #': YAML drops the rest as a comment" % where))
+    return probs
+
+
+def parse_frontmatter(fm_lines):
+    """Small YAML subset parser. Returns (fields, problems). Handles plain, quoted, block
+    scalars, folded multi-line plain scalars, nested maps and lists. Problems are
+    (rule, message) for constructs a real YAML parser would reject."""
+    fields, problems, seen = {}, [], set()
+    i, n = 0, len(fm_lines)
+    while i < n:
+        line = fm_lines[i]
+        if not line.strip() or line.lstrip().startswith("#"):
+            i += 1
+            continue
+        if line.startswith("\t") or re.match(r"^ *\t", line):
+            problems.append(("frontmatter-yaml", "line %d: tab indentation" % (i + 2)))
+            i += 1
+            continue
+        if line[0] == " ":
+            problems.append(("frontmatter-yaml", "line %d: unexpected indentation" % (i + 2)))
+            i += 1
+            continue
+        m = KEY_RE.match(line)
+        if not m:
+            problems.append(("frontmatter-yaml", "line %d: not a 'key: value' line" % (i + 2)))
+            i += 1
+            continue
+        key, raw = m.group(1), (m.group(2) or "").strip()
+        if key in seen:
+            problems.append(("frontmatter-yaml", "duplicate key %r" % key))
+        seen.add(key)
+        i += 1
+        cont = []
+        while i < n and (fm_lines[i].startswith((" ", "\t")) or not fm_lines[i].strip()):
+            cont.append(fm_lines[i])
+            i += 1
+        while cont and not cont[-1].strip():
+            cont.pop()
+        where = "key %r" % key
+        if raw[:1] in ("|", ">") and re.match(r"^[|>][+-]?\d?$", raw):
+            parts = [c.strip() for c in cont]
+            fields[key] = ("\n".join(parts) if raw[0] == "|" else " ".join(p for p in parts if p)).strip()
+        elif raw[:1] == '"':
+            full = " ".join([raw] + [c.strip() for c in cont])
+            body = full[1:]
+            if not re.search(r'(?<!\\)(?:\\\\)*"\s*(#.*)?$', body):
+                problems.append(("frontmatter-yaml", "%s double-quoted string not closed" % where))
+                fields[key] = body
+            else:
+                inner = re.sub(r'"\s*(#.*)?$', "", body)
+                fields[key] = inner.replace('\\"', '"').replace("\\n", " ")
+        elif raw[:1] == "'":
+            full = " ".join([raw] + [c.strip() for c in cont])
+            body = full[1:]
+            if not re.search(r"'\s*(#.*)?$", body):
+                problems.append(("frontmatter-yaml", "%s single-quoted string not closed" % where))
+            inner = re.sub(r"'\s*(#.*)?$", "", body)
+            if re.search(r"(?<!')'(?!')", inner):
+                problems.append(("frontmatter-yaml", "%s has an unescaped ' inside single quotes" % where))
+            fields[key] = inner.replace("''", "'")
+        elif raw == "" and cont and not any(
+                re.match(r"^\s*(- |-$|[A-Za-z0-9_][A-Za-z0-9_.-]*\s*:(\s|$))", c) for c in cont if c.strip()):
+            # multi-line plain scalar starting on the next line
+            for c in cont:
+                problems += _plain_scalar_problems(c, where + " (continuation)")
+            fields[key] = " ".join(c.strip() for c in cont if c.strip())
+        elif raw == "":
+            # nested map / list / empty
+            sub = {}
+            items = []
+            for c in cont:
+                s = c.strip()
+                if not s or s.startswith("#"):
+                    continue
+                if s.startswith("- "):
+                    items.append(s[2:].strip().strip("'\""))
+                    continue
+                mm = KEY_RE.match(s)
+                if mm:
+                    sub[mm.group(1)] = (mm.group(2) or "").strip().strip("'\"")
+            fields[key] = sub if sub else (items if items else "")
+        else:
+            problems += _plain_scalar_problems(raw, where)
+            for c in cont:
+                problems += _plain_scalar_problems(c, where + " (continuation)")
+            fields[key] = " ".join([raw] + [c.strip() for c in cont if c.strip()])
+    return fields, problems
+
+
+# ---------------------------------------------------------------- provenance
+
+def load_provenance():
+    names = {}
+    try:
+        data = json.loads(SOURCES.read_text())
+        for src in data.get("sources", []):
+            for s in src.get("skills", []):
+                names[s] = src.get("id", "skill-sources")
+    except Exception:
+        pass
+    try:
+        lock = json.loads(LOCK.read_text())
+        for s, v in lock.get("skills", {}).items():
+            names.setdefault(s, "skill-lock:" + str(v.get("source", "?")))
+    except Exception:
+        pass
+    return names
+
+
+def third_party_names():
+    """Skills attributed to an upstream repository (not device-local)."""
+    out = set()
+    try:
+        data = json.loads(SOURCES.read_text())
+        for src in data.get("sources", []):
+            if src.get("repository"):
+                out.update(src.get("skills", []))
+    except Exception:
+        pass
+    try:
+        out.update(json.loads(LOCK.read_text()).get("skills", {}).keys())
+    except Exception:
+        pass
+    return out
+
+
+def load_ownership():
+    """skill name -> (ownership, source id, review dict). ownership is one of
+    device-local | adapted | upstream."""
+    out = {}
+    try:
+        data = json.loads(SOURCES.read_text())
+    except Exception:
+        data = {}
+    for src in data.get("sources", []) if isinstance(data, dict) else []:
+        reviews = src.get("skill_reviews") if isinstance(src.get("skill_reviews"), dict) else {}
+        for s in src.get("skills", []):
+            review = reviews.get(s) if isinstance(reviews.get(s), dict) else {}
+            if not src.get("repository"):
+                kind = "device-local"
+            elif review.get("comparison") == "local-adaptation":
+                kind = "adapted"
+            else:
+                kind = "upstream"
+            out[s] = (kind, src.get("id", "skill-sources"), review)
+    try:
+        for s in json.loads(LOCK.read_text()).get("skills", {}):
+            out.setdefault(s, ("upstream", "skill-lock", {}))
+    except Exception:
+        pass
+    return out
+
+
+def check_hash_drift(skill_dir, owner):
+    if not owner:
+        return []
+    kind, sid, review = owner
+    recorded = review.get("installed_sha256")
+    if not recorded:
+        return []
+    try:
+        current = hashlib.sha256((Path(skill_dir) / "SKILL.md").read_bytes()).hexdigest()
+    except OSError:
+        return []
+    if current == recorded:
+        return []
+    sev = "E" if kind == "device-local" else "W"
+    return [("hash-drift", "SKILL.md sha256 %s != installed_sha256 %s in skill-sources.json (%s, %s); "
+             "if the edit was sanctioned: agent-system-change rehash %s --change <id>"
+             % (current[:12], recorded[:12], sid, kind, Path(skill_dir).name), sev)]
+
+
+# ---------------------------------------------------------------- checks
+
+TRIGGER_RE = re.compile(r"\bwhen(ever)?\b|\btrigger|\bif the user\b|\buse (it )?for\b|\"[^\"]{3,}\"|“[^”]{3,}”|'[^']{3,}'", re.I)
+SEQ_RE = re.compile(r"\bthen\b|\bafter that\b|\bfinally\b|\bnext,|→|->", re.I)
+STEP_START_RE = re.compile(r"^\s*(first\b|step\s*\d|\d+[.)]\s|then\b)", re.I)
+VERBS = set("""
+ground design implement verify build run debug inspect integrate resolve remove produce validate
+create generate fetch capture identify apply fix write read analyze analyse audit review test
+deploy plan orchestrate execute scan check collect compare report summarize summarise install
+configure launch profile measure record refactor migrate update upgrade add clone pull push
+regenerate preserve prove reproduce diagnose find choose pick select define draft document map
+extract convert render export ship merge commit scaffold bootstrap explore gather prioritize
+triage classify assess evaluate enable adopt harden keep make open mirror lint format package
+sign notarize publish detect locate trace confirm upload download parse
+""".split())
+
+
+def process_summary(desc):
+    reasons = []
+    if STEP_START_RE.search(desc):
+        reasons.append("starts with a step marker")
+    if len(SEQ_RE.findall(desc)) >= 2:
+        reasons.append("chains steps with then/finally/arrows")
+    first = re.split(r"(?<=[.!?])\s+|\bUse (?:when|for|it)\b", re.sub(r"\([^)]*\)", "", desc).strip(), maxsplit=1)[0]
+    clauses = re.split(r",|;|\band\b|\bthen\b", first)
+    verbs = [c.strip().split()[0].lower() for c in clauses if c.strip()]
+    hits = sorted(set(v for v in verbs if v in VERBS), key=verbs.index)
+    if len(hits) >= 3:
+        reasons.append("first sentence is an imperative step list (%s)" % ", ".join(hits[:5]))
+    return reasons
+
+
+LINK_RE = re.compile(r"\[[^\]]*\]\(\s*<?([^)\s>]+)>?(?:\s+\"[^\"]*\")?\s*\)")
+PATH_RE = re.compile(r"(?<![\w/.~$-])((?:references|reference|scripts|assets|templates|examples|resources|rules|docs|lib|bin|agents)/[A-Za-z0-9._/-]*[A-Za-z0-9_-]\.[A-Za-z0-9]{1,5})\b")
+ABS_RE = re.compile(r"(?:/Users|/home)/([A-Za-z0-9._-]+)/")
+OS_RE = re.compile(r"\b(iOS|iPadOS|macOS|watchOS|tvOS|visionOS|Xcode)\s+(\d{2})(?:\.\d+)?\b")
+SWIFT_RE = re.compile(r"\bSwift\s+(\d)\.(\d+)\b")
+ASOF_RE = re.compile(r"\bas of (?:[A-Z][a-z]+ )?(20\d\d)\b")
+RECENT_RE = re.compile(r"\b(latest|currently|newest|most recent|is the default|default (?:version|toolchain|sdk|deployment target)|current (?:version|release|sdk|toolchain|major|stable)|up[- ]to[- ]date|this year)\b", re.I)
+TEXT_EXT = {".md", ".py", ".sh", ".js", ".mjs", ".ts", ".json", ".yaml", ".yml", ".txt", ".toml", ".swift", ".rb"}
+
+
+def iter_text_files(skill_dir):
+    for root, dirs, files in os.walk(skill_dir):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in ("node_modules", "__pycache__")]
+        for f in files:
+            p = Path(root) / f
+            if p.suffix.lower() in TEXT_EXT and ".bak-" not in f:
+                try:
+                    if p.stat().st_size < 1_000_000:
+                        yield p
+                except OSError:
+                    pass
+
+
+def ref_targets(text):
+    for m in LINK_RE.finditer(text):
+        t = m.group(1)
+        if re.match(r"^[a-z][a-z0-9+.-]*:", t, re.I) or t.startswith(("#", "/", "~")):
+            continue
+        if any(ch in t for ch in "<>{}$*|") or "path/to" in t or t.startswith("example"):
+            continue
+        t = re.split(r"[#?]", t)[0]
+        if t:
+            yield "link", t.replace("%20", " ")
+
+
+def check_refs(skill_dir, skill_md, body):
+    out = []
+    missing_links, missing_paths = [], []
+    scan = [(skill_md, body)]
+    refdir = skill_dir / "references"
+    if refdir.is_dir():
+        for p in sorted(refdir.rglob("*.md")):
+            try:
+                scan.append((p, p.read_text(errors="replace")))
+            except OSError:
+                pass
+    for path, text in scan:
+        for _, t in ref_targets(text):
+            cand = [(path.parent / t), (skill_dir / t)]
+            if not any(c.exists() for c in cand):
+                missing_links.append("%s -> %s" % (path.relative_to(skill_dir), t))
+    link_targets = set(t for _, t in ref_targets(body))
+    for m in PATH_RE.finditer(body):
+        t = m.group(1)
+        if t not in link_targets and not (skill_dir / t).exists():
+            missing_paths.append(t)
+    if missing_links:
+        out.append(("ref-missing", "%d broken link(s): %s" % (len(missing_links), "; ".join(sorted(set(missing_links))[:4]))))
+    if missing_paths:
+        u = sorted(set(missing_paths))
+        out.append(("ref-missing-path", "%d path(s) not in skill dir: %s" % (len(u), ", ".join(u[:4]))))
+    # orphans: every file under references/ must be reachable by a mention somewhere else in the skill
+    if refdir.is_dir():
+        corpus = {}
+        for p in iter_text_files(skill_dir):
+            try:
+                corpus[p] = p.read_text(errors="replace")
+            except OSError:
+                pass
+        orphans = []
+        for f in sorted(refdir.rglob("*")):
+            if not f.is_file() or f.name.startswith(".") or ".bak-" in f.name:
+                continue
+            rel = str(f.relative_to(skill_dir))
+            rel_ref = str(f.relative_to(refdir))
+            parents = [str(p.relative_to(skill_dir)) + "/" for p in f.parents if refdir in p.parents]
+            keys = [rel, rel_ref, f.name, f.stem if f.suffix == ".md" else f.name] + parents
+            found = False
+            for p, txt in corpus.items():
+                if p == f:
+                    continue
+                if any(k and k in txt for k in keys):
+                    found = True
+                    break
+            if not found:
+                orphans.append(rel)
+        if orphans:
+            out.append(("ref-orphan", "%d unreferenced file(s) in references/: %s" % (len(orphans), ", ".join(orphans[:4]))))
+    return out
+
+
+def check_abs_paths(skill_dir):
+    hits = []
+    for p in iter_text_files(skill_dir):
+        try:
+            txt = p.read_text(errors="replace")
+        except OSError:
+            continue
+        for m in ABS_RE.finditer(txt):
+            if m.group(1).lower() in PLACEHOLDER_USERS or m.group(1).startswith("<"):
+                continue
+            hits.append(str(p.relative_to(skill_dir)))
+            break
+    if hits:
+        return [("abs-user-path", "absolute user path in %d file(s): %s" % (len(hits), ", ".join(sorted(hits)[:4])))]
+    return []
+
+
+def check_stale(skill_dir, skill_md):
+    files = [skill_md] + sorted((skill_dir / "references").rglob("*.md")) if (skill_dir / "references").is_dir() else [skill_md]
+    hits = []
+    for p in files:
+        try:
+            lines = p.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for no, line in enumerate(lines, 1):
+            stale = []
+            newest = max([int(m.group(2)) for m in OS_RE.finditer(line)] + [0])
+            if RECENT_RE.search(line) and newest < CURRENT_OS_MAJOR:
+                for m in OS_RE.finditer(line):
+                    if int(m.group(2)) < CURRENT_OS_MAJOR and int(m.group(2)) >= 10:
+                        stale.append("%s %s" % (m.group(1), m.group(2)))
+                for m in SWIFT_RE.finditer(line):
+                    if (int(m.group(1)), int(m.group(2))) < CURRENT_SWIFT and int(m.group(1)) >= 5:
+                        stale.append("Swift %s.%s" % (m.group(1), m.group(2)))
+            for m in ASOF_RE.finditer(line):
+                if int(m.group(1)) < CURRENT_YEAR:
+                    stale.append("as of %s" % m.group(1))
+            if stale:
+                hits.append("%s:%d (%s)" % (p.relative_to(skill_dir), no, ", ".join(sorted(set(stale)))))
+    if hits:
+        return [("stale-platform", "%d line(s) claim an old version is current: %s" % (len(hits), "; ".join(hits[:3])))]
+    return []
+
+
+def check_nested(skill_dir, name):
+    out = []
+    if (skill_dir / ".claude-plugin").exists():
+        out.append(".claude-plugin/")
+    nested = sorted(skill_dir.glob("skills/*/SKILL.md"))
+    if nested:
+        out.append(", ".join(str(p.relative_to(skill_dir)) for p in nested[:3]))
+    if out:
+        return [("nested-plugin-layout", "plugin layout inside a shared skill dir registers it twice (%s:%s): %s"
+                 % (name, name, "; ".join(out)))]
+    return []
+
+
+def lint_skill(skill_dir, provenance, check_provenance=True):
+    skill_dir = Path(skill_dir)
+    name_dir = skill_dir.name
+    skill_md = skill_dir / "SKILL.md"
+    findings = []
+    meta = {"skill": name_dir, "path": str(skill_dir), "desc_chars": 0, "body_lines": 0,
+            "symlink": skill_dir.is_symlink()}
+    try:
+        text = skill_md.read_text(errors="replace")
+    except OSError as e:
+        return meta, [("frontmatter-missing", "cannot read SKILL.md: %s" % e)]
+    fm_lines, body, _ = split_frontmatter(text)
+    if fm_lines is None:
+        findings.append(("frontmatter-missing", "no leading '---' frontmatter block"))
+        fields = {}
+    else:
+        fields, probs = parse_frontmatter(fm_lines)
+        findings += probs
+    name = fields.get("name") if isinstance(fields.get("name"), str) else ""
+    desc = fields.get("description") if isinstance(fields.get("description"), str) else ""
+    meta["description"] = desc
+    meta["desc_chars"] = len(desc)
+    meta["disable_model_invocation"] = str(fields.get("disable-model-invocation", "")).lower() == "true"
+    body_lines = body.splitlines()
+    meta["body_lines"] = len(body_lines)
+    if fm_lines is not None:
+        if not name:
+            findings.append(("name-missing", "frontmatter has no name"))
+        elif name != name_dir:
+            findings.append(("name-mismatch", "name %r != directory %r" % (name, name_dir)))
+        if not desc:
+            findings.append(("desc-missing", "frontmatter has no description"))
+    if desc:
+        L = len(desc)
+        if L > DESC_MAX:
+            findings.append(("desc-too-long", "description is %d chars (> %d hard limit; hosts truncate)" % (L, DESC_MAX)))
+        elif L > DESC_WARN:
+            findings.append(("desc-long", "description is %d chars (target <= %d%s)" % (L, DESC_WARN, "; over the %d hard warn" % DESC_HARD if L > DESC_HARD else "")))
+        if not meta["disable_model_invocation"] and not TRIGGER_RE.search(desc):
+            findings.append(("desc-no-trigger", "no trigger cue: add 'Use when ...' or a quoted user phrase"))
+        ps = process_summary(desc)
+        if ps:
+            findings.append(("desc-process-summary", "description summarises the process: " + "; ".join(ps)))
+    if len(body_lines) > BODY_WARN:
+        findings.append(("body-long", "body is %d lines (> %d); move reference material to references/" % (len(body_lines), BODY_WARN)))
+    findings += check_refs(skill_dir, skill_md, body)
+    findings += check_abs_paths(skill_dir)
+    findings += check_nested(skill_dir, name_dir)
+    findings += check_stale(skill_dir, skill_md)
+    if check_provenance:
+        meta_field = fields.get("metadata") if isinstance(fields.get("metadata"), dict) else {}
+        origin = str(meta_field.get("origin", "")).lower()
+        real = os.path.realpath(skill_dir)
+        plugin_managed = "/plugins/" in real and not real.startswith(str(SKILLS_ROOT))
+        if name_dir in provenance:
+            meta["provenance"] = provenance[name_dir]
+        elif origin in HOME_GROWN_MARKERS:
+            meta["provenance"] = "home-grown"
+        elif plugin_managed:
+            meta["provenance"] = "plugin-symlink:" + real
+        else:
+            meta["provenance"] = ""
+            findings.append(("provenance-missing", "not in skill-sources.json/.skill-lock.json and no 'metadata: origin: home-grown'"))
+    return meta, findings
+
+
+# ---------------------------------------------------------------- driver
+
+def discover(all_flag, plugins, dirs):
+    out = []
+    if dirs:
+        out += [(Path(d).expanduser().resolve() if not Path(d).expanduser().is_symlink() else Path(d).expanduser(), True) for d in dirs]
+    if all_flag or not dirs:
+        for d in sorted(SKILLS_ROOT.iterdir()):
+            if d.name.startswith(".") or not (d / "SKILL.md").is_file():
+                continue
+            out.append((d, True))
+    if plugins:
+        seen = set()
+        latest = {}
+        for g in PLUGIN_GLOBS:
+            for d in HOME.glob(g):
+                version_dir = d.parent.parent
+                plug = version_dir.parent
+                try:
+                    mt = version_dir.stat().st_mtime
+                except OSError:
+                    continue
+                if plug not in latest or mt > latest[plug][0]:
+                    latest[plug] = (mt, version_dir)
+        active = set(v for _, v in latest.values())
+        for g in PLUGIN_GLOBS:
+            for d in sorted(HOME.glob(g)):
+                if d.parent.parent not in active:
+                    continue
+                if (d / "SKILL.md").is_file():
+                    key = os.path.realpath(d)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append((d, False))
+    return out
+
+
+def main(argv):
+    args = [a for a in argv if not a.startswith("--")]
+    flags = [a for a in argv if a.startswith("--")]
+    rule_filter = None
+    if "--rule" in argv:
+        k = argv.index("--rule")
+        if k + 1 >= len(argv):
+            print("--rule needs an id", file=sys.stderr)
+            return 2
+        rule_filter = argv[k + 1]
+        args = [a for a in args if a != rule_filter]
+    if "--help" in flags or "-h" in argv:
+        print(__doc__)
+        return 0
+    unknown = set(flags) - {"--all", "--plugins", "--json", "--rule", "--quiet", "--strict"}
+    if unknown:
+        print("unknown flag(s): %s" % ", ".join(sorted(unknown)), file=sys.stderr)
+        return 2
+    strict = "--strict" in flags
+    provenance = load_provenance()
+    ownership = load_ownership()
+    results = []
+    for d, check_prov in discover("--all" in flags, "--plugins" in flags, args):
+        if not (Path(d) / "SKILL.md").is_file():
+            print("skip (no SKILL.md): %s" % d, file=sys.stderr)
+            continue
+        meta, raw = lint_skill(d, provenance, check_prov)
+        owner = ownership.get(meta["skill"]) if check_prov else None
+        raw = raw + check_hash_drift(d, owner)
+        kind = owner[0] if owner else ("plugin" if not check_prov else "own")
+        if check_prov and str(meta.get("provenance", "")).startswith("plugin-symlink:"):
+            kind = "upstream"
+        meta["ownership"] = kind
+        upstream = kind == "upstream"
+        findings = []
+        for f in raw:
+            rule, msg = f[0], f[1]
+            sev = f[2] if len(f) > 2 else SEVERITY.get(rule, "W")
+            eff = "W" if (upstream and sev == "E" and not strict) else sev
+            findings.append({"rule": rule, "severity": eff, "original_severity": sev,
+                             "upstream": upstream, "message": msg})
+        results.append((meta, findings))
+
+    by_rule = {}
+    nerr = nwarn = nup_err = 0
+    for meta, fs in results:
+        for f in fs:
+            by_rule[f["rule"]] = by_rule.get(f["rule"], 0) + 1
+            if f["severity"] == "E":
+                nerr += 1
+            else:
+                nwarn += 1
+            if f["upstream"] and f["original_severity"] == "E":
+                nup_err += 1
+    total_desc = sum(m["desc_chars"] for m, _ in results)
+    listed_desc = sum(m["desc_chars"] for m, _ in results if not m.get("disable_model_invocation"))
+
+    if "--json" in flags:
+        print(json.dumps({
+            "skills": [dict({k: v for k, v in m.items() if k != "description"}, findings=fs)
+                       for m, fs in results],
+            "summary": {"skills": len(results), "errors": nerr, "warnings": nwarn,
+                        "upstream_errors": nup_err, "upstream_errors_counted": strict, "by_rule": by_rule,
+                        "description_chars_total": total_desc,
+                        "description_chars_model_invocable": listed_desc},
+        }, indent=1))
+        return 1 if nerr else 0
+
+    if "--quiet" not in flags:
+        w = max([len(m["skill"]) + (11 if m.get("ownership") == "upstream" else 0) for m, _ in results] + [5])
+        print("%-*s  %3s %3s  %5s %5s  %s" % (w, "skill", "E", "W", "desc", "body", "findings"))
+        print("-" * (w + 60))
+        for meta, fs in results:
+            shown = [f for f in fs if rule_filter in (None, f["rule"])]
+            if rule_filter and not shown:
+                continue
+            e = sum(1 for f in fs if f["severity"] == "E")
+            label = meta["skill"] + (" [upstream]" if meta.get("ownership") == "upstream" else "")
+            print("%-*s  %3d %3d  %5d %5d  %s" % (w, label, e, len(fs) - e, meta["desc_chars"],
+                                                   meta["body_lines"], ", ".join(f["rule"] for f in shown) or "ok"))
+            for f in shown:
+                tag = ""
+                if f["upstream"]:
+                    tag = " (upstream%s)" % ("; error with --strict" if f["original_severity"] == "E" and f["severity"] == "W" else "")
+                print("%-*s      %s %s%s: %s" % (w, "", f["severity"], f["rule"], tag, f["message"]))
+    print()
+    print("SUMMARY  skills=%d  errors=%d  warnings=%d  upstream_errors=%d%s  clean=%d" % (
+        len(results), nerr, nwarn, nup_err,
+        " (counted: --strict)" if strict else " (downgraded to warnings; --strict counts them)" if nup_err else "",
+        sum(1 for _, fs in results if not fs)))
+    rule_sev = {}
+    for _, fs in results:
+        for f in fs:
+            rule_sev.setdefault(f["rule"], set()).add(f["severity"])
+    for r in sorted(by_rule, key=lambda x: (-by_rule[x], x)):
+        print("  %s %-22s %d" % ("/".join(sorted(rule_sev.get(r, {"W"}))), r, by_rule[r]))
+    print("  description chars: total=%d  model-invocable=%d" % (total_desc, listed_desc))
+    worst = sorted(results, key=lambda mf: (-sum(3 if f["severity"] == "E" else 1 for f in mf[1]), mf[0]["skill"]))[:8]
+    print("  worst: " + ", ".join("%s(%d)" % (m["skill"], len(fs)) for m, fs in worst if fs))
+    return 1 if nerr else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

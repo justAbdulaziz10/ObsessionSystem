@@ -1,0 +1,405 @@
+#!/usr/bin/python3 -I -S
+"""Ingest the AgentOS telemetry spool into the usage/sessions tables (change 20261010-202747-b8cde9).
+
+~/bin/agent-telemetry-hook (dash) writes one private file per Claude Code hook event into the spool:
+    <spool>/e.<pid>[.<n>]    line 1: AOS1<TAB>CLAUDE_CONFIG_DIR<TAB>mode    rest: hook JSON; mtime = event time
+This program turns those files into exactly the rows the former Python hook wrote synchronously:
+    PreToolUse (Skill, Agent/Task, Read of */skills/<n>/SKILL.md or */agents/<n>.md, mcp__*) -> usage row
+                                                                  (+ INSERT OR IGNORE sessions row)
+    Stop / StopFailure / SessionEnd -> sessions upsert (paths, counts, error type; never transcript text)
+
+  agent-telemetry-ingest [--wait SEC] [--min-age SEC] [--quiet]   ingest now (agent-usage, autopilot, tests)
+  agent-telemetry-ingest --detach                                 hook trigger: own session, sleep min-age, ingest
+  agent-telemetry-ingest --status                                 pending spool files, oldest age, leftover batches
+
+Crash safety / exactly-once:
+  1. flock(<spool>/.ingest.lock): one ingester at a time (others wait up to --wait, then exit 0).
+  2. Leftover <spool>/batch.* dirs from a crashed run are finished first.
+  3. Files older than --min-age (default 1 s, so in-flight writes are never claimed) are renamed atomically
+     into a fresh <spool>/batch.<ns>.<pid>/ dir.
+  4. One transaction inserts all rows of the batch plus a telemetry_ingest(batch) marker. A batch whose marker
+     already exists is not inserted again (crash between COMMIT and delete), so a re-run never duplicates rows.
+  5. The batch files are deleted, then the marker.
+Unparseable files are discarded and logged; files older than 30 days that still sit in the spool are dropped.
+Env: AGENTOS_TELEMETRY_SPOOL, AGENTOS_TELEMETRY_DB, AGENTOS_TELEMETRY_ERRLOG (tests), AGENTOS_TELEMETRY_MIN_AGE;
+     AGENTOS_TELEMETRY_TEST_CRASH=before-commit|after-commit simulates a crash (regression.sh only).
+Exit: 0 ok / nothing to do / lock busy; 1 ingest failed (files kept for the next run, error logged).
+"""
+import os
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+SPOOL = os.environ.get("AGENTOS_TELEMETRY_SPOOL") or os.path.join(HOME, ".agent-os", "runtime", "telemetry-spool")
+ERRLOG = os.environ.get("AGENTOS_TELEMETRY_ERRLOG") or os.path.join(HOME, ".agent-os", "runtime", "telemetry-errors.log")
+MAX_FILE = 16 * 1024 * 1024
+MAX_AGE_DAYS = 30
+CRASH = os.environ.get("AGENTOS_TELEMETRY_TEST_CRASH") or ""  # regression only: before-commit | after-commit
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS usage(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT, session_id TEXT, account TEXT, mode TEXT, cwd TEXT, repo TEXT,
+    kind TEXT, name TEXT, detail TEXT, subagent TEXT
+);
+CREATE INDEX IF NOT EXISTS usage_ts ON usage(ts);
+CREATE INDEX IF NOT EXISTS usage_session ON usage(session_id);
+CREATE INDEX IF NOT EXISTS usage_kind_name ON usage(kind, name);
+CREATE TABLE IF NOT EXISTS sessions(
+    session_id TEXT PRIMARY KEY,
+    account TEXT, mode TEXT, cwd TEXT, repo TEXT, transcript_path TEXT,
+    first_seen TEXT, last_seen TEXT, end_reason TEXT,
+    stops INTEGER DEFAULT 0, stop_failures INTEGER DEFAULT 0, last_error TEXT,
+    tool_counts TEXT, distilled_at TEXT, distill_result TEXT
+);
+CREATE INDEX IF NOT EXISTS sessions_last_seen ON sessions(last_seen);
+CREATE TABLE IF NOT EXISTS telemetry_ingest(
+    batch TEXT PRIMARY KEY, ingested_at TEXT, files INTEGER, usage_rows INTEGER, session_events INTEGER,
+    discarded INTEGER
+);
+"""
+
+
+def db_path():
+    return os.environ.get("AGENTOS_TELEMETRY_DB") or os.path.join(HOME, ".agent-os", "v2", "db", "agentos.sqlite")
+
+
+def iso(t):
+    """Same format the Python hook wrote: local time, milliseconds, +HH:MM offset."""
+    lt = time.localtime(t)
+    off = time.strftime("%z", lt)
+    return time.strftime("%Y-%m-%dT%H:%M:%S", lt) + ".%03d" % int((t % 1) * 1000) + off[:3] + ":" + off[3:]
+
+
+def account_of(transcript, config_dir):
+    t = transcript or ""
+    if "/.claude_second/" in t:
+        return "claude2"
+    if "/.claude/" in t:
+        return "claude1"
+    d = (config_dir or "").rstrip("/")
+    if d.endswith("/.claude_second"):
+        return "claude2"
+    if not d or d.endswith("/.claude"):
+        return "claude1"
+    return os.path.basename(d) or "unknown"
+
+
+def repo_of(cwd):
+    """Nearest ancestor holding .git (dir or worktree file): stat calls only, no git subprocess."""
+    p = cwd
+    for _ in range(40):
+        if not p or p == "/":
+            return ""
+        if os.path.exists(p + "/.git"):
+            return p
+        p = os.path.dirname(p)
+    return ""
+
+
+def classify(ev):
+    """(kind, name, detail) for a PreToolUse payload, or None when it is not a capability load."""
+    tool = ev.get("tool_name") or ""
+    ti = ev.get("tool_input")
+    if not isinstance(ti, dict):
+        ti = {}
+    if tool == "Skill":
+        name = ti.get("skill") or ti.get("command") or ti.get("name") or ""
+        return ("skill", str(name).lstrip("/")[:200], "") if name else None
+    if tool in ("Agent", "Task"):
+        return ("agent", str(ti.get("subagent_type") or "general-purpose")[:200], str(ti.get("model") or "")[:40])
+    if tool == "Read":
+        fp = str(ti.get("file_path") or "")
+        if fp.endswith("/SKILL.md"):
+            parts = fp.split("/")
+            if len(parts) >= 3 and parts[-3] == "skills":
+                detail = ""
+                if "/plugins/" in fp and "/cache/" in fp:
+                    try:
+                        i = parts.index("cache")
+                        detail = "plugin:" + parts[i + 2]
+                    except (ValueError, IndexError):
+                        detail = "plugin"
+                return ("read_skill", parts[-2][:200], detail)
+        elif fp.endswith(".md") and "/agents/" in fp:
+            parts = fp.split("/")
+            if len(parts) >= 2 and parts[-2] == "agents":
+                return ("read_agent", parts[-1][:-3][:200], "")
+        return None
+    if tool.startswith("mcp__"):
+        bits = tool.split("__", 2)
+        server = bits[1] if len(bits) > 1 else ""
+        return ("mcp", server[:200], (bits[2] if len(bits) > 2 else "")[:200])
+    return None
+
+
+def counts_json(counts):
+    return "{" + ", ".join('"%s": %d' % (str(k).replace('"', ""), int(v)) for k, v in sorted(counts.items())) + "}"
+
+
+def log_error(msg):
+    try:
+        os.makedirs(os.path.dirname(ERRLOG), exist_ok=True)
+        try:
+            if os.path.getsize(ERRLOG) > 1_000_000:
+                os.replace(ERRLOG, ERRLOG + ".1")
+        except OSError:
+            pass
+        with open(ERRLOG, "a") as f:
+            f.write("%s agent-telemetry-ingest: %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), str(msg)[:400]))
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------- spool files
+
+def parse_file(path):
+    """(event dict, config_dir, mode, mtime) or raise ValueError."""
+    import json
+    st = os.stat(path)
+    if st.st_size > MAX_FILE:
+        raise ValueError("spool file too large (%d bytes)" % st.st_size)
+    with open(path, "rb") as f:
+        raw = f.read()
+    head, sep, body = raw.partition(b"\n")
+    bits = head.decode("utf-8", "replace").split("\t")
+    if not sep or len(bits) != 3 or bits[0] != "AOS1":
+        raise ValueError("bad spool header %r" % head[:80])
+    ev = json.loads(body.decode("utf-8", "replace").strip())
+    if not isinstance(ev, dict):
+        raise ValueError("payload is %s, not an object" % type(ev).__name__)
+    return ev, bits[1], (bits[2].strip() or "owner"), st.st_mtime_ns / 1e9
+
+
+def apply_event(c, ev, config_dir, md, t):
+    """Write the rows the Python hook wrote for this event. Returns (usage_rows, session_events)."""
+    event = ev.get("hook_event_name") or ""
+    sid = str(ev.get("session_id") or "")
+    cwd = str(ev.get("cwd") or "")
+    tp = str(ev.get("transcript_path") or "")
+    ts = iso(t)
+    if event == "PreToolUse":
+        hit = classify(ev)
+        if not hit:
+            return 0, 0
+        kind, name, detail = hit
+        acct, repo = account_of(tp, config_dir), repo_of(cwd)
+        sub = str(ev.get("agent_type") or "") if ev.get("agent_id") else ""
+        c.execute("INSERT INTO usage(ts,session_id,account,mode,cwd,repo,kind,name,detail,subagent) "
+                  "VALUES(?,?,?,?,?,?,?,?,?,?)", (ts, sid, acct, md, cwd, repo, kind, name, detail, sub))
+        if sid:
+            c.execute("INSERT OR IGNORE INTO sessions(session_id,account,mode,cwd,repo,transcript_path,"
+                      "first_seen,last_seen) VALUES(?,?,?,?,?,?,?,?)", (sid, acct, md, cwd, repo, tp, ts, ts))
+        return 1, 0
+    if event not in ("Stop", "StopFailure", "SessionEnd") or not sid:
+        return 0, 0
+    acct, repo = account_of(tp, config_dir), repo_of(cwd)
+    stop = 1 if event in ("Stop", "StopFailure") else 0
+    fail = 1 if event == "StopFailure" else 0
+    err = str(ev.get("error") or "")[:60] if fail else None  # error type only (rate_limit, ...), never text
+    reason = str(ev.get("reason") or "")[:60] if event == "SessionEnd" else None
+    counts = dict(c.execute("SELECT kind, COUNT(*) FROM usage WHERE session_id=? GROUP BY kind", (sid,)))
+    c.execute(
+        "INSERT INTO sessions(session_id,account,mode,cwd,repo,transcript_path,first_seen,last_seen,"
+        "end_reason,stops,stop_failures,last_error,tool_counts) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT(session_id) DO UPDATE SET last_seen=excluded.last_seen, mode=excluded.mode, "
+        "cwd=COALESCE(NULLIF(sessions.cwd,''),excluded.cwd), repo=COALESCE(NULLIF(sessions.repo,''),excluded.repo), "
+        "transcript_path=COALESCE(NULLIF(excluded.transcript_path,''),sessions.transcript_path), "
+        "end_reason=COALESCE(excluded.end_reason,sessions.end_reason), "
+        "stops=sessions.stops+excluded.stops, stop_failures=sessions.stop_failures+excluded.stop_failures, "
+        "last_error=COALESCE(excluded.last_error,sessions.last_error), tool_counts=excluded.tool_counts",
+        (sid, acct, md, cwd, repo, tp, ts, ts, reason, stop, fail, err, counts_json(counts)))
+    return 0, 1
+
+
+def connect():
+    import sqlite3
+    c = sqlite3.connect(db_path(), timeout=30, isolation_level=None)
+    c.execute("PRAGMA busy_timeout=30000")
+    return c
+
+
+def process_batch(bdir, stats):
+    """Insert one claimed batch exactly once, then delete it."""
+    batch = os.path.basename(bdir)
+    names = sorted(n for n in os.listdir(bdir) if n.startswith("e."))
+    events, discarded = [], 0
+    for n in names:
+        p = os.path.join(bdir, n)
+        try:
+            ev, cfg, md, t = parse_file(p)
+            events.append((t, n, ev, cfg, md))
+        except Exception as e:  # malformed payload: drop it, never block the batch
+            discarded += 1
+            log_error("discarded %s: %s: %s" % (n, type(e).__name__, e))
+    events.sort(key=lambda x: (x[0], x[1]))
+    c = connect()
+    try:
+        c.executescript(SCHEMA)
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            done = c.execute("SELECT 1 FROM telemetry_ingest WHERE batch=?", (batch,)).fetchone()
+            urows = sevents = 0
+            if not done:
+                for t, n, ev, cfg, md in events:
+                    u, s = apply_event(c, ev, cfg, md, t)
+                    urows += u
+                    sevents += s
+                c.execute("INSERT INTO telemetry_ingest(batch,ingested_at,files,usage_rows,session_events,discarded) "
+                          "VALUES(?,?,?,?,?,?)", (batch, iso(time.time()), len(names), urows, sevents, discarded))
+            if CRASH == "before-commit":
+                os._exit(3)
+            c.execute("COMMIT")
+            if CRASH == "after-commit":
+                os._exit(3)
+        except BaseException:
+            c.execute("ROLLBACK")
+            raise
+        if done:
+            stats["replayed"] += 1
+        else:
+            stats["files"] += len(names)
+            stats["usage_rows"] += urows
+            stats["session_events"] += sevents
+            stats["discarded"] += discarded
+        for n in os.listdir(bdir):
+            os.remove(os.path.join(bdir, n))
+        os.rmdir(bdir)
+        c.execute("DELETE FROM telemetry_ingest WHERE batch=?", (batch,))
+    finally:
+        c.close()
+
+
+def claim(min_age, stats):
+    """Atomically move ready event files into a new batch dir; None when there is nothing to claim."""
+    now = time.time()
+    bdir = None
+    for n in sorted(os.listdir(SPOOL)):
+        if not n.startswith("e."):
+            continue
+        p = os.path.join(SPOOL, n)
+        try:
+            age = now - os.stat(p).st_mtime
+        except OSError:
+            continue
+        if age > MAX_AGE_DAYS * 86400:
+            try:
+                os.remove(p)
+                stats["expired"] += 1
+                log_error("expired spool file %s (%.0f days old)" % (n, age / 86400))
+            except OSError:
+                pass
+            continue
+        if age < min_age:
+            stats["deferred"] += 1
+            continue
+        if bdir is None:
+            bdir = os.path.join(SPOOL, "batch.%d.%d" % (time.time_ns(), os.getpid()))
+            os.mkdir(bdir, 0o700)
+        try:
+            os.rename(p, os.path.join(bdir, n))
+        except FileNotFoundError:
+            pass
+    return bdir
+
+
+def lock(wait):
+    import fcntl
+    fd = os.open(os.path.join(SPOOL, ".ingest.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+    deadline = time.time() + wait
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.time() >= deadline:
+                os.close(fd)
+                return None
+            time.sleep(0.1)
+
+
+def ingest(min_age, wait):
+    stats = dict(files=0, usage_rows=0, session_events=0, discarded=0, replayed=0, deferred=0, expired=0,
+                 batches=0, busy=False)
+    if not os.path.isdir(SPOOL):
+        return stats
+    fd = lock(wait)
+    if fd is None:
+        stats["busy"] = True
+        return stats
+    try:
+        leftovers = sorted(os.path.join(SPOOL, n) for n in os.listdir(SPOOL) if n.startswith("batch."))
+        for b in leftovers:  # a previous run died after claiming: finish (or just delete) those first
+            process_batch(b, stats)
+            stats["batches"] += 1
+        b = claim(min_age, stats)
+        if b:
+            process_batch(b, stats)
+            stats["batches"] += 1
+    finally:
+        os.close(fd)
+    return stats
+
+
+def status():
+    if not os.path.isdir(SPOOL):
+        print("spool %s: absent (nothing pending)" % SPOOL)
+        return
+    now = time.time()
+    ages = []
+    batches = 0
+    for n in os.listdir(SPOOL):
+        p = os.path.join(SPOOL, n)
+        if n.startswith("e."):
+            try:
+                ages.append(now - os.stat(p).st_mtime)
+            except OSError:
+                pass
+        elif n.startswith("batch."):
+            batches += 1
+    print("spool %s: %d pending event file(s)%s, %d leftover batch dir(s)" % (
+        SPOOL, len(ages), ", oldest %.0f s" % max(ages) if ages else "", batches))
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--detach", action="store_true", help="hook trigger: new session, ignore SIGHUP, sleep min-age")
+    ap.add_argument("--wait", type=float, default=None, help="seconds to wait for a running ingester (default 15; 30 detached)")
+    ap.add_argument("--min-age", type=float, default=None, help="only claim files at least this old (default 1 s)")
+    ap.add_argument("--quiet", action="store_true")
+    ap.add_argument("--status", action="store_true")
+    a = ap.parse_args()
+    if a.status:
+        status()
+        return 0
+    min_age = a.min_age if a.min_age is not None else float(os.environ.get("AGENTOS_TELEMETRY_MIN_AGE") or 1.0)
+    wait = a.wait if a.wait is not None else (30.0 if a.detach else 15.0)
+    if a.detach:
+        import signal
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        try:
+            os.setsid()
+        except OSError:
+            pass
+        time.sleep(min_age + 0.1)
+    try:
+        s = ingest(min_age, wait)
+    except Exception as e:
+        log_error("ingest failed: %s: %s" % (type(e).__name__, e))
+        if not a.quiet and not a.detach:
+            print("telemetry ingest failed: %s: %s (spool kept)" % (type(e).__name__, e), file=sys.stderr)
+        return 1
+    if not a.quiet and not a.detach:
+        if s["busy"]:
+            print("telemetry ingest: another ingester holds the lock; skipped")
+        else:
+            print("telemetry ingest: %d file(s) in %d batch(es) -> %d usage row(s), %d session event(s); "
+                  "%d discarded, %d replayed batch(es), %d too new, %d expired" % (
+                      s["files"], s["batches"], s["usage_rows"], s["session_events"], s["discarded"],
+                      s["replayed"], s["deferred"], s["expired"]))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

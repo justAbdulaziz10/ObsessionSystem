@@ -1,0 +1,14 @@
+[
+ {"task": "Build a swipeable card stack for the matching screen in our SwiftUI app", "domain": "engineering", "skills_any": ["swiftpieces"], "mcps_any": ["xcode"]},
+ {"task": "Which keywords should our landing page target to get customers from Google?", "domain": "research", "skills_any": ["seo-growth-loop"], "mcps_any": []},
+ {"task": "Our organic search traffic dropped 30% this month, find which pages lost clicks", "domain": "data", "skills_any": ["seo-growth-loop"], "mcps_any": []},
+ {"task": "Adapt our shipping iOS app for the foldable iPhone Duo", "domain": "engineering", "skills_any": ["swiftui-iphone-duo", "apple-hig"], "mcps_any": ["xcode"]},
+ {"task": "What does Apple's HIG say about minimum touch target size?", "domain": "design", "skills_any": ["apple-hig", "apple-design"], "mcps_any": []},
+ {"task": "Add a floating tab bar with a glass look to our SwiftUI app", "domain": "engineering", "skills_any": ["swiftpieces", "swiftui-liquid-glass"], "mcps_any": ["xcode"]},
+ {"task": "Get our product mentioned when people ask ChatGPT for the best scheduling apps", "domain": "research", "skills_any": ["seo-growth-loop"], "mcps_any": []},
+ {"task": "Fix the Next.js hydration error on the dashboard page", "domain": "engineering", "skills_any": ["vercel-react", "next"], "mcps_any": []},
+ {"task": "Write the privacy policy and terms pages for our app", "domain": "document", "skills_any": ["privacy-legal-pages"], "mcps_any": []},
+ {"task": "Profile why our SwiftUI list scrolls slowly", "domain": "engineering", "skills_any": ["swiftui-performance-audit", "swiftui-pro", "swiftui-specialist", "performance"], "mcps_any": ["xcode"]},
+ {"task": "Review this onboarding screen design screenshot for UX issues", "domain": "design", "skills_any": ["apple-design", "impeccable", "web-design-guidelines"], "mcps_any": []},
+ {"task": "Migrate the Flutter app to the new Material 3 theme", "domain": "engineering", "skills_any": ["flutter-"], "mcps_any": ["dart"]}
+]

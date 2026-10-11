@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+"""Run a queue of coding tasks unattended, each proven by a pass/fail check.
+
+  agent-overnight add --repo PATH --done "CMD" [--base main] [--engine codex|claude]
+                      [--no-baseline] [--key KEY] [--source WHO] "GOAL"
+  agent-overnight list
+  agent-overnight run [--attempts 3] [--max N] [--no-review] [--claude-fallback] [--detach]
+  agent-overnight brief            morning summary (Attention first)
+  agent-overnight cancel           stop a detached run
+  agent-overnight clean ID | --merged   remove finished worktrees and branches
+
+Each task gets its own git worktree and branch (overnight/<id>-<slug>) off
+--base. The done check runs on the base first (already passing = nothing to
+do), then after every Codex attempt; Codex's own report never counts. A
+passing attempt is committed on the task branch and, unless --no-review, read
+by a Claude reviewer (a different model family from Codex) that lists what
+deserves attention. Nothing is merged or pushed. Every step is a row in
+decisions.tsv. Exit 75 from codex-ha (no account) stops the run unless
+--claude-fallback is given. Claude calls try each Claude account in turn when
+one is out of usage. One run at a time (run.lock).
+
+--no-baseline is for upkeep tasks whose check already passes (maintaining a
+skill): the agent runs anyway and "no-change" is a valid outcome. --key makes
+add idempotent while a task with that key is pending or running.
+
+Pattern from Lauren Tan's pstack "overnight contract": a checkable finish
+condition, an isolated worktree, a decision log, and a morning audit.
+"""
+import argparse
+import fcntl
+import datetime as dt
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("AGENT_OVERNIGHT_DIR") or Path.home() / ".agent-os" / "runtime" / "overnight")
+QUEUE = ROOT / "queue.json"
+WORKTREES = ROOT / "worktrees"
+PIDFILE = ROOT / "run.pid"
+ATTEMPT_TIMEOUT = 2 * 3600
+CHECK_TIMEOUT = 30 * 60
+REVIEW_BUDGET = "2"
+CLAUDE_HOMES = [Path.home() / ".claude", Path.home() / ".claude_second"]
+# Every agent and check runs with pushes disabled at the git level: an empty
+# pushInsteadOf prefix rewrites every push URL to a helper that does not exist.
+NO_PUSH_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
+               "GIT_CONFIG_KEY_0": "url.agent-overnight-push-disabled://.pushInsteadOf", "GIT_CONFIG_VALUE_0": ""}
+# A linked worktree shares refs with the user's repo; the agent must not move them.
+CLAUDE_DENY = ["Agent"] + [f"Bash(git {c}:*)" for c in
+                           ("push", "merge", "commit", "checkout", "switch", "reset", "branch", "stash", "rebase",
+                            "worktree", "tag", "update-ref", "cherry-pick", "revert", "clean")]
+MAX_INTERRUPTIONS = 2
+OUT_OF_USAGE = re.compile(r"usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage|"
+                          r"credit balance|not logged in|please run /login|overloaded", re.I)
+# Untracked files that are never part of a change; they stay out of the commit.
+JUNK = re.compile(r"(^|/)(__pycache__|\.pytest_cache|\.DS_Store|node_modules|\.agentos-brief\.md)(/|$)|"
+                  r"\.(tmp|log|orig|rej|swp|pyc)$")
+
+
+def now():
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+class queue_lock:
+    """Exclusive lock around every read-modify-write of queue.json."""
+    def __enter__(self):
+        ROOT.mkdir(parents=True, exist_ok=True)
+        self.f = open(ROOT / "queue.lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+
+    def __exit__(self, *_):
+        self.f.close()
+
+
+def load():
+    try:
+        return json.loads(QUEUE.read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def save(tasks):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = QUEUE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(tasks, indent=1, ensure_ascii=False))
+    os.replace(tmp, QUEUE)
+
+
+def update(task_id, **fields):
+    with queue_lock():
+        tasks = load()
+        for t in tasks:
+            if t["id"] == task_id:
+                t.update(fields)
+        save(tasks)
+
+
+def log_row(task, attempt, phase, decision, reason, evidence=""):
+    path = ROOT / "decisions.tsv"
+    new = not path.exists()
+    clean = lambda s: str(s).replace("\t", " ").replace("\n", " ")[:300]
+    with path.open("a") as f:
+        if new:
+            f.write("time\ttask\tattempt\tphase\tdecision\treason\tevidence\n")
+        f.write("\t".join(clean(x) for x in (now(), task["id"], attempt, phase, decision, reason, evidence)) + "\n")
+
+
+def sh(cmd, cwd, timeout, log=None, stdin=None, shell=False):
+    """Run a command; return (rc, output). Output also goes to log if given."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, input=stdin if stdin is not None else "", capture_output=True, text=True,
+                           timeout=timeout, shell=shell, env={**os.environ, **NO_PUSH_ENV})
+        out, rc = (p.stdout or "") + (p.stderr or ""), p.returncode
+    except subprocess.TimeoutExpired as e:
+        out, rc = f"{e.stdout or ''}{e.stderr or ''}\nTIMEOUT after {timeout}s", 124
+    if log:
+        with open(log, "a") as f:
+            f.write(f"\n$ {cmd if isinstance(cmd, str) else ' '.join(cmd)}  (rc={rc})\n{out}\n")
+    return rc, out
+
+
+def git(repo, *args):
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
+def tail(text, n=60):
+    return "\n".join(text.strip().splitlines()[-n:])
+
+
+def claude(args, cwd, timeout, log=None):
+    """Run `claude -p ARGS`, trying each Claude account until one is not out of usage.
+    Return (rc, result text)."""
+    rc, text = 75, "no Claude account available"
+    for home in CLAUDE_HOMES:
+        if not home.exists():
+            continue
+        env = {**os.environ, **NO_PUSH_ENV, "CLAUDE_CONFIG_DIR": str(home)}
+        stdout = ""
+        try:
+            p = subprocess.run(["claude", "-p", "--output-format", "json", *args], cwd=cwd, env=env, input="",
+                               capture_output=True, text=True, timeout=timeout)
+            stdout, raw, rc = p.stdout, p.stdout + p.stderr, p.returncode
+        except subprocess.TimeoutExpired:
+            raw, rc = f"TIMEOUT after {timeout}s", 124
+        try:
+            d = json.loads(stdout)
+        except ValueError:
+            d = None
+        if isinstance(d, dict):
+            text, is_error = str(d.get("result") or ""), bool(d.get("is_error"))
+        else:
+            text, is_error = raw, rc != 0
+        if log:
+            with open(log, "a") as f:
+                f.write(f"\n$ claude -p ... (CLAUDE_CONFIG_DIR={home}, rc={rc})\n{text}\n")
+        if is_error and OUT_OF_USAGE.search(text or raw):
+            rc, text = 75, f"{home.name}: {tail(text or raw, 1)[:160]}"
+            continue
+        return rc, text
+    return rc, text
+
+
+def cmd_add(a):
+    repo = Path(a.repo).expanduser().resolve()
+    if git(repo, "rev-parse", "--show-toplevel").returncode:
+        sys.exit(f"Not a git repository: {repo}")
+    if git(repo, "rev-parse", "--verify", a.base).returncode:
+        sys.exit(f"Base {a.base!r} not found in {repo}")
+    with queue_lock():
+        tasks = load()
+        if a.key and any(t.get("key") == a.key and t["status"] in ("pending", "running") for t in tasks):
+            print(f"Already queued: {a.key}")
+            return
+        # IDs never repeat, even after clean removes old tasks (runs/ and notifications key on them).
+        seq_file = ROOT / "seq"
+        try:
+            seq = int(seq_file.read_text()) + 1
+        except (OSError, ValueError):
+            seq = 1
+        seq_file.write_text(str(seq))
+        tid = f"{dt.datetime.now():%m%d}-{seq:03d}"
+        slug = re.sub(r"[^a-z0-9]+", "-", a.goal.lower()).strip("-")[:32]
+        tasks.append({"id": tid, "slug": slug, "repo": str(repo), "base": a.base, "goal": a.goal,
+                      "done": a.done, "status": "pending", "added": now(), "engine": a.engine,
+                      "baseline": not a.no_baseline, "key": a.key, "source": a.source})
+        save(tasks)
+    print(f"Added {tid}: {a.goal}\n  done when: {a.done}")
+
+
+def cmd_list(_):
+    for t in load():
+        print(f"{t['id']}  {t['status']:<14} {Path(t['repo']).name:<20} {t['goal'][:70]}")
+
+
+def brief_for(task, attempt, last_failure):
+    text = f"""You are working unattended overnight. Nobody will answer questions; make reasonable decisions and record them.
+
+Task: {task['goal']}
+
+Done means this command exits 0 from the repository root:
+    {task['done']}
+It is run by the harness after you finish; your own report does not count.
+
+Rules:
+- Inspect `git status`, `git diff`, and the relevant code and tests before editing.
+- Smallest change that meets the goal. Stay in scope; preserve unrelated code. Fix root causes, not symptoms.
+- For a bug, reproduce it first and keep the failing output, then fix and rerun the same repro.
+- Run the done command yourself and the project's relevant tests, lint, typecheck, and build.
+- Never weaken, skip, or delete the check or tests to make them pass. Never relax the goal.
+- Do not run git commands that write (add, commit, merge, push, checkout, reset, branch, stash, rebase); the harness commits. Remove temporary files you created.
+- Work only inside the current directory (a dedicated worktree). Never cd into, read from for editing, or modify any other checkout of this repo.
+- Do not start nested agents. Do not push, deploy, or contact external services.
+- If you are truly stuck, stop and explain why instead of guessing.
+- Finish with: changed files, commands run with results (marked measured or inferred), and remaining risks.
+"""
+    if last_failure:
+        text += f"""
+Attempt {attempt}. The previous attempt did not pass the done command. Its output ended with:
+---
+{tail(last_failure, 80)}
+---
+Start from the current working tree (the previous attempt's changes are still there) and fix the cause.
+"""
+    return text
+
+
+def run_check(task, wt, log):
+    return sh(task["done"], cwd=wt, timeout=CHECK_TIMEOUT, log=log, shell=True)
+
+
+def implement(task, wt, brief, log, claude_fallback):
+    """Return (rc, engine). rc 75 means no engine available."""
+    if task.get("engine") == "claude":
+        rc, _ = claude(["--permission-mode", "bypassPermissions", "--max-budget-usd", "5",
+                        "--disallowedTools", *CLAUDE_DENY, "--", brief], wt, ATTEMPT_TIMEOUT, log)
+        return rc, "claude"
+    rc, _ = sh(["codex-ha", "ready"], cwd=wt, timeout=60)
+    if rc == 0:
+        rc, _ = sh(["codex-ha", "run", "-"], cwd=wt, timeout=ATTEMPT_TIMEOUT, log=log, stdin=brief)
+        if rc != 75:
+            return rc, "codex"
+    if not claude_fallback:
+        return 75, "none"
+    rc, _ = claude(["--permission-mode", "bypassPermissions", "--max-budget-usd", "5",
+                    "--disallowedTools", *CLAUDE_DENY, "--", brief], wt, ATTEMPT_TIMEOUT, log)
+    return rc, "claude"
+
+
+def review(task, wt, run_dir):
+    prompt = f"""You are an independent reviewer. A different agent made the change on this branch unattended.
+Goal: {task['goal']}
+Done check (already passed): {task['done']}
+
+Read `git log --oneline {task['base']}..HEAD` and `git diff {task['base']}...HEAD`. Run the done check and anything else that helps. Do not modify files.
+Look for: goal not actually met, scope creep, weakened tests or checks, security or data risks, regressions, leftover junk files.
+Reply in this exact shape:
+ATTENTION:
+- <what the human must look at first, with file:line> (or "- nothing")
+FINDINGS:
+- BLOCKER|IMPORTANT|NON-BLOCKING: <finding>
+VERDICT: SHIP or NO-SHIP
+"""
+    rc, out = claude(["--permission-mode", "bypassPermissions", "--max-budget-usd", REVIEW_BUDGET,
+                      "--disallowedTools", "Edit", "Write", "NotebookEdit", *CLAUDE_DENY, "--", prompt], wt, 1800)
+    (run_dir / "review.md").write_text(out)
+    if "NO-SHIP" in out:
+        return "NO-SHIP"
+    if "VERDICT: SHIP" in out:
+        return "SHIP"
+    return f"review failed (rc={rc}): {tail(out, 1)[:120]}"
+
+
+def run_task(task, a):
+    repo = Path(task["repo"])
+    run_dir = ROOT / "runs" / task["id"]
+    run_dir.mkdir(parents=True, exist_ok=True)
+    log = run_dir / "log.txt"
+    wt = WORKTREES / task["id"]
+    branch = f"overnight/{task['id']}-{task['slug']}"
+    update(task["id"], status="running", started=now(), branch=branch, worktree=str(wt), log=str(log))
+
+    if wt.exists():
+        # Left by an interrupted run. Anything on it is unreviewed work: hand it to the user.
+        ahead = git(wt, "rev-list", "--count", f"{task['base']}..HEAD").stdout.strip()
+        dirty = git(wt, "status", "--porcelain").stdout.strip()
+        if ahead not in ("", "0") or dirty:
+            reason = f"interrupted run left work in the worktree ({ahead} commit(s), dirty={bool(dirty)}); review it"
+            log_row(task, 0, "setup", "blocked", reason, str(wt))
+            update(task["id"], status="blocked", reason=reason)
+            return "blocked"
+    else:
+        r = git(repo, "worktree", "add", "-b", branch, str(wt), task["base"])
+        if r.returncode:
+            log_row(task, 0, "setup", "blocked", r.stderr.strip())
+            update(task["id"], status="blocked", reason=r.stderr.strip()[:300])
+            return "blocked"
+    start_sha = git(wt, "rev-parse", "HEAD").stdout.strip()
+
+    rc, out = run_check(task, wt, log)
+    if rc == 0 and not task.get("baseline", True):
+        log_row(task, 0, "baseline", "continue", "upkeep task; check passes on base, running anyway", str(log))
+        out = ""
+    elif rc == 0:
+        log_row(task, 0, "baseline", "stop", "done check already passes on base", str(log))
+        update(task["id"], status="already-done", finished=now())
+        return "already-done"
+    else:
+        log_row(task, 0, "baseline", "continue", f"done check fails on base (rc={rc})", str(log))
+
+    last = out
+    for attempt in range(1, a.attempts + 1):
+        rc, engine = implement(task, wt, brief_for(task, attempt, last if attempt > 1 else ""), log,
+                               a.claude_fallback)
+        if rc == 75:
+            log_row(task, attempt, "implement", "blocked", "no account available for this engine", str(log))
+            update(task["id"], status="pending", note="no account available; left queued")
+            return "codex-unavailable"
+        rc, out = run_check(task, wt, log)
+        if rc != 0:
+            log_row(task, attempt, "verify", "retry" if attempt < a.attempts else "give-up",
+                    f"{engine} attempt; done check rc={rc}", str(log))
+            last = out
+            continue
+        new_files, junk = [], []
+        for line in git(wt, "status", "--porcelain", "--untracked-files=all").stdout.splitlines():
+            if line.startswith("??"):
+                path = line[3:]
+                (junk if JUNK.search(path) else new_files).append(path)
+        git(wt, "add", "-u")
+        if new_files:
+            git(wt, "add", "--", *new_files)
+        staged = bool(git(wt, "diff", "--cached", "--name-only").stdout.strip())
+        moved = git(wt, "rev-parse", "HEAD").stdout.strip() != start_sha
+        if not staged and not moved:
+            log_row(task, attempt, "verify", "no-change", f"{engine} attempt; check passes, nothing to commit", str(log))
+            update(task["id"], status="no-change", finished=now(), attempts=attempt, engine=engine)
+            return "no-change"
+        if junk:
+            log_row(task, attempt, "commit", "excluded", "untracked junk left out: " + ", ".join(junk[:10]))
+        msg = f"{task['goal'][:68]}\n\nUnattended run {task['id']} ({engine}, attempt {attempt}).\nDone check: {task['done']}"
+        c = git(wt, "-c", "user.name=agent-overnight", "-c", "user.email=agent-overnight@localhost",
+                "commit", "-q", "-m", msg) if staged else None
+        if c and c.returncode:
+            log_row(task, attempt, "commit", "blocked", c.stderr.strip() or c.stdout.strip(), str(log))
+            update(task["id"], status="blocked", reason="commit failed")
+            return "blocked"
+        stat = git(wt, "diff", "--stat", f"{start_sha}..HEAD").stdout.strip().splitlines()[-1:]
+        log_row(task, attempt, "verify", "commit", f"done check passed; {stat[0] if stat else ''}", str(log))
+        verdict = "not reviewed"
+        if not a.no_review:
+            verdict = review(task, wt, run_dir)
+            log_row(task, attempt, "review", verdict, "claude reviewer", str(run_dir / "review.md"))
+        update(task["id"], status="passed", finished=now(), attempts=attempt, engine=engine,
+               verdict=verdict, new_files=new_files, junk=junk,
+               commit=git(wt, "rev-parse", "HEAD").stdout.strip())
+        return "passed"
+
+    update(task["id"], status="failed", finished=now(), attempts=a.attempts,
+           last_output=tail(last, 30) or f"(no output, exit code {rc})")
+    return "failed"
+
+
+def cmd_run(a):
+    if a.detach:
+        ROOT.mkdir(parents=True, exist_ok=True)
+        args = [sys.argv[0], "run", "--attempts", str(a.attempts)] + (["--max", str(a.max)] if a.max else [])
+        args += [f"--deny={p}" for p in a.deny] + [f"--allow={p}" for p in a.allow]
+        args += ["--no-review"] * a.no_review + ["--claude-fallback"] * a.claude_fallback
+        # caffeinate keeps the Mac from idle-sleeping while the run lasts.
+        with open(ROOT / "run.out", "a") as out:
+            p = subprocess.Popen(["caffeinate", "-i", *args], stdout=out, stderr=out,
+                                 stdin=subprocess.DEVNULL, start_new_session=True)
+        PIDFILE.write_text(str(p.pid))
+        print(f"Started overnight run (pid {p.pid}). Morning: agent-overnight brief")
+        return
+    ROOT.mkdir(parents=True, exist_ok=True)
+    lock = open(ROOT / "run.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("Another run is in progress.")
+        return
+    # A task left "running" by a killed run is retried a limited number of times.
+    with queue_lock():
+        tasks = load()
+        for t in tasks:
+            if t["status"] == "running":
+                t["interrupted"] = t.get("interrupted", 0) + 1
+                if t["interrupted"] > MAX_INTERRUPTIONS:
+                    t.update(status="blocked", reason=f"interrupted {t['interrupted']} times; not retrying")
+                else:
+                    t.update(status="pending", note="previous run was interrupted")
+        save(tasks)
+
+    def denied(t):
+        low = t["repo"].lower()
+        return (any(p.lower() in low for p in a.deny if p)
+                and not any(p.lower() in low for p in a.allow if len(p) >= 4))
+
+    pending = [t for t in load() if t["status"] == "pending" and not denied(t)]
+    if not pending:
+        print("Queue is empty.")
+        return
+    for t in pending[: a.max or None]:
+        print(f"[{now()}] {t['id']}: {t['goal'][:70]}", flush=True)
+        try:
+            result = run_task(t, a)
+        except Exception as e:  # one broken task must not leave itself "running" or stop the queue
+            import traceback
+            update(t["id"], status="blocked", reason=f"crashed: {e!r}"[:300])
+            log_row(t, 0, "crash", "blocked", traceback.format_exc()[-280:])
+            result = "crashed"
+        print(f"[{now()}] {t['id']}: {result}", flush=True)
+        if result == "codex-unavailable":
+            print("No Codex account available; stopping. Remaining tasks stay queued.")
+            break
+    subprocess.run(["agent-storage"], capture_output=True)
+
+
+def cmd_brief(_):
+    tasks = load()
+    if not tasks:
+        print("Queue is empty.")
+        return
+    attention = []
+    for t in tasks:
+        rv = ROOT / "runs" / t["id"] / "review.md"
+        if t["status"] == "passed" and rv.exists():
+            m = re.search(r"ATTENTION:\s*\n(.*?)(?:\nFINDINGS:|\Z)", rv.read_text(), re.S)
+            items = [l.strip() for l in (m.group(1) if m else "").splitlines() if l.strip()]
+            items = [i for i in items if i not in ("- nothing", "-nothing")]
+            if t.get("verdict") != "SHIP":
+                items.append(f"- review verdict: {t.get('verdict')} ({rv})")
+            if t.get("new_files"):
+                items.append("- new files committed: " + ", ".join(t["new_files"][:10]))
+            if items:
+                attention.append((t, items))
+        elif t["status"] in ("failed", "blocked"):
+            attention.append((t, [f"- {t['status']}: {t.get('reason') or 'done check never passed'}"]))
+    print("# Overnight brief\n")
+    print("## Attention\n")
+    if not attention:
+        print("- nothing flagged\n")
+    for t, items in attention:
+        print(f"**{t['id']}** {t['goal'][:80]}")
+        for i in items:
+            print(f"  {i}")
+        print()
+    print("## Tasks\n")
+    for t in tasks:
+        line = f"- **{t['id']}** `{t['status']}` {t['goal'][:80]}"
+        if t["status"] == "passed":
+            stat = git(t["worktree"], "diff", "--shortstat", f"{t['base']}...HEAD").stdout.strip()
+            line += (f"\n  branch `{t['branch']}`, {t.get('attempts')} attempt(s) via {t.get('engine')}, "
+                     f"review {t.get('verdict')}; {stat}\n  worktree `{t['worktree']}`")
+        elif t["status"] == "failed":
+            line += f"\n  last check output: {t.get('last_output', '').splitlines()[-1:] or ''}"
+        print(line)
+    print(f"\nDecision log: {ROOT / 'decisions.tsv'}. Nothing was merged or pushed; "
+          "merge passed branches after reading their diff, then `agent-overnight clean --merged`.")
+
+
+def cmd_cancel(_):
+    try:
+        pid = int(PIDFILE.read_text())
+    except (OSError, ValueError):
+        sys.exit("No detached run recorded.")
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+        print(f"Stopped run {pid}. Interrupted tasks show as running; set them back with clean or re-add.")
+    except ProcessLookupError:
+        print("Run already finished.")
+    PIDFILE.unlink(missing_ok=True)
+
+
+def cmd_clean(a):
+    if not a.target and not a.merged:
+        sys.exit("Usage: agent-overnight clean ID | --merged")
+    explicit = None if a.merged else a.target
+    with queue_lock():
+        tasks, keep = load(), []
+        for t in tasks:
+            wt = Path(t.get("worktree") or "")
+            branch = t.get("branch")
+            if explicit:
+                target = t["id"] == explicit
+            elif t["status"] == "passed":
+                # Merged into the base, or into the local branch when the base is a remote ref (origin/main).
+                bases = [t["base"]] + ([t["base"].split("/", 1)[1]] if "/" in t["base"] else [])
+                target = any(git(t["repo"], "merge-base", "--is-ancestor", t.get("commit", "x"), b).returncode == 0
+                             for b in bases)
+            elif t["status"] in ("already-done", "no-change"):
+                # Only if the branch really holds nothing beyond its base.
+                ahead = git(t["repo"], "rev-list", "--count", f"{t['base']}..{branch}").stdout.strip() if branch else "0"
+                target = ahead in ("", "0")
+            else:
+                target = False
+            if not target:
+                keep.append(t)
+                continue
+            if wt.exists():
+                if git(wt, "status", "--porcelain").stdout.strip():
+                    print(f"{t['id']}: worktree has uncommitted changes, kept: {wt}")
+                    keep.append(t)
+                    continue
+                r = git(t["repo"], "worktree", "remove", str(wt))
+                if r.returncode:
+                    print(f"{t['id']}: could not remove worktree, kept: {r.stderr.strip()}")
+                    keep.append(t)
+                    continue
+            if branch and git(t["repo"], "rev-parse", "--verify", "-q", f"refs/heads/{branch}").returncode == 0:
+                r = git(t["repo"], "branch", "-D" if explicit else "-d", branch)
+                if r.returncode:
+                    print(f"{t['id']}: branch {branch} kept: {r.stderr.strip()}")
+                    keep.append(t)
+                    continue
+            print(f"{t['id']}: cleaned")
+        save(keep)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("add")
+    p.add_argument("--repo", required=True)
+    p.add_argument("--done", required=True, help="shell command that exits 0 when the task is done")
+    p.add_argument("--base", default="main")
+    p.add_argument("--engine", choices=["codex", "claude"], default="codex")
+    p.add_argument("--no-baseline", action="store_true", help="upkeep task: run even if the check already passes")
+    p.add_argument("--key", help="skip if a pending or running task has this key")
+    p.add_argument("--source", default="user")
+    p.add_argument("goal")
+    sub.add_parser("list")
+    p = sub.add_parser("run")
+    p.add_argument("--attempts", type=int, default=3)
+    p.add_argument("--max", type=int, default=0, help="run at most N pending tasks")
+    p.add_argument("--deny", action="append", default=[], help="skip tasks whose repo path contains this")
+    p.add_argument("--allow", action="append", default=[], help="overrides --deny for matching repos")
+    p.add_argument("--no-review", action="store_true")
+    p.add_argument("--claude-fallback", action="store_true", help="use Claude when no Codex account is available")
+    p.add_argument("--detach", action="store_true")
+    sub.add_parser("brief")
+    sub.add_parser("cancel")
+    p = sub.add_parser("clean")
+    p.add_argument("target", nargs="?", help="task id")
+    p.add_argument("--merged", action="store_true", help="all tasks merged into their base")
+    a = ap.parse_args()
+    {"add": cmd_add, "list": cmd_list, "run": cmd_run, "brief": cmd_brief,
+     "cancel": cmd_cancel, "clean": cmd_clean}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()

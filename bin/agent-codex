@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# agent-codex "TASK"              run Codex HA in the foreground
+# agent-codex --detach < task     start in the background, print a job id
+# agent-codex --detach --file F   same, reading (and then deleting) brief file F
+# agent-codex --wait <job> [sec]  wait up to sec (default 540) for the job
+# agent-codex --cancel <job>      stop a detached job and its process tree
+# Exit 75 means every Codex account is exhausted (from --detach or --wait).
+#
+# Claude Code kills a foreground Bash call after 10 minutes, and an xhigh
+# Codex task often runs longer, so dispatchers must use --detach/--wait.
+set -uo pipefail
+
+JOBS="$HOME/.agent-os/runtime/codex-jobs"
+
+usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; }
+
+# Flags are parsed before anything else: --help must never reach the task
+# path, which records events/checkpoints and starts Codex.
+case "${1-}" in
+  -h|--help) usage; exit 0 ;;
+  --cancel|--wait|--detach) ;;
+  -*) echo "agent-codex: unknown option: $1" >&2; usage >&2; exit 2 ;;
+esac
+if [ "${1-}" = "--detach" ]; then
+  case "${2-}" in
+    -h|--help) usage; exit 0 ;;
+    --file|"") ;;
+    -*) echo "agent-codex: unknown option: $2" >&2; usage >&2; exit 2 ;;
+  esac
+fi
+
+if [ "${1-}" = "--cancel" ]; then
+  # Detached jobs outlive the session that started them; stop one and its
+  # whole process tree (agent-codex -> codex-ha -> codex).
+  JOB="${2:?Usage: agent-codex --cancel <job>}"
+  DIR="$JOBS/$JOB"
+  [ -f "$DIR/pid" ] || { echo "No such job: $JOB" >&2; exit 2; }
+  tree() { local p; for p in $(pgrep -P "$1"); do tree "$p"; done; echo "$1"; }
+  PIDS="$(tree "$(cat "$DIR/pid")")"
+  kill -TERM $PIDS 2>/dev/null
+  [ -f "$DIR/rc" ] || echo 143 > "$DIR/rc"
+  echo "AGENT_CODEX_CANCELLED job=$JOB"
+  exit 0
+fi
+
+if [ "${1-}" = "--wait" ]; then
+  JOB="${2:?Usage: agent-codex --wait <job> [seconds]}"
+  MAX="${3:-540}"
+  DIR="$JOBS/$JOB"
+  [ -d "$DIR" ] || { echo "No such job: $JOB" >&2; exit 2; }
+  PID="$(cat "$DIR/pid")"
+  END=$((SECONDS + MAX))
+  while [ ! -f "$DIR/rc" ] && kill -0 "$PID" 2>/dev/null && [ "$SECONDS" -lt "$END" ]; do
+    sleep 5
+  done
+  if [ -f "$DIR/rc" ]; then
+    RC="$(cat "$DIR/rc")"
+    tail -n 60 "$DIR/log"
+    echo "AGENT_CODEX_DONE job=$JOB exit=$RC log=$DIR/log"
+    exit "$RC"
+  fi
+  if ! kill -0 "$PID" 2>/dev/null; then
+    tail -n 60 "$DIR/log"
+    echo "AGENT_CODEX_DIED job=$JOB (no exit code recorded) log=$DIR/log"
+    exit 1
+  fi
+  tail -n 5 "$DIR/log"
+  echo "AGENT_CODEX_RUNNING job=$JOB — call: agent-codex --wait $JOB"
+  exit 0
+fi
+
+if [ "${1-}" = "--detach" ]; then
+  shift
+  # --file: a worktree-isolated subagent cannot put a brief that mentions
+  # git into a Bash command (Claude Code refuses it), so it writes the brief
+  # with the Write tool instead. The file is consumed so it is never committed.
+  if [ "${1-}" = "--file" ]; then
+    SRC="${2:?Usage: agent-codex --detach --file <path>}"
+    PROMPT="$(cat "$SRC")" && rm -f "$SRC"
+  elif [ "$#" -gt 0 ]; then PROMPT="$*"; else PROMPT="$(cat)"; fi
+  [ -n "$PROMPT" ] || { echo "Usage: agent-codex --detach < task" >&2; exit 2; }
+  # Fail fast instead of starting a job that cannot run. Dispatchers should
+  # already have checked `codex-ha ready`; this covers the race.
+  if ! READY="$(codex-ha ready)"; then
+    echo "$READY"
+    echo "AGENT_CODEX_EXHAUSTED exit=75: no job started; the caller must implement it without Codex."
+    exit 75
+  fi
+  JOB="$(date +%Y%m%d-%H%M%S)-$$"
+  DIR="$JOBS/$JOB"
+  mkdir -p "$DIR"
+  printf '%s\n' "$PROMPT" > "$DIR/prompt.txt"
+  pwd > "$DIR/cwd.txt"
+  nohup bash -c '"$0" < "$1/prompt.txt" > "$1/log" 2>&1; echo $? > "$1/rc"' \
+    "$0" "$DIR" < /dev/null > /dev/null 2>&1 &
+  echo $! > "$DIR/pid"
+  echo "AGENT_CODEX_STARTED job=$JOB log=$DIR/log"
+  echo "Next: agent-codex --wait $JOB"
+  exit 0
+fi
+
+if [ "$#" -gt 0 ]; then
+  PROMPT="$*"
+else
+  PROMPT="$(cat)"
+fi
+
+if [ -z "$PROMPT" ]; then
+  echo "Usage: agent-codex \"TASK\"" >&2
+  exit 2
+fi
+
+agent-storage >/dev/null 2>&1 || true
+agent-ops event codex_start "$PROMPT" >/dev/null 2>&1 || true
+agent-ops checkpoint pre-codex >/dev/null 2>&1 || true
+
+set +e
+codex-ha run "$PROMPT"
+RC=$?
+set -e
+
+agent-ops event codex_end "exit=$RC" >/dev/null 2>&1 || true
+agent-ops checkpoint "post-codex-$RC" >/dev/null 2>&1 || true
+agent-storage >/dev/null 2>&1 || true
+
+exit "$RC"

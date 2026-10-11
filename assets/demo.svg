@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="640" viewBox="0 0 1200 640" role="img" aria-labelledby="t d">
+  <title id="t">Terminal session</title>
+  <desc id="d">Real output from a clean install: agent-v2 starts a durable task, agent-review-route detects an auth change and routes it to the Opus risk reviewer plus a security specialist, and agent-ship ci fails closed until the project has checks.</desc>
+  <style>
+    .t{font:500 15px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;fill:#C9D0EE;white-space:pre}
+    .p{fill:#7C5CFF;font-weight:700}
+    .c{fill:#EEF1FB;font-weight:700}
+    .d{fill:#6B75A3}
+    .g{fill:#34D399}
+    .r{fill:#F87171}
+    .y{fill:#FBBF24}
+    .b{fill:#60A5FA}
+  </style>
+  <rect width="1200" height="640" rx="16" fill="#0A0D18"/>
+  <rect width="1200" height="44" rx="16" fill="#141A2E"/>
+  <rect y="28" width="1200" height="16" fill="#141A2E"/>
+  <circle cx="26" cy="22" r="7" fill="#F87171"/><circle cx="50" cy="22" r="7" fill="#FBBF24"/><circle cx="74" cy="22" r="7" fill="#34D399"/>
+  <text x="600" y="27" text-anchor="middle" class="t d" style="font-size:13px">~/acme-app — real output, clean install</text>
+
+  <text x="32" y="86" class="t"><tspan class="p">❯</tspan> <tspan class="c">agent-v2 start</tspan> "add rate limiting to login"</text>
+  <text x="32" y="110" class="t d">20261011-021111-5e61e760     <tspan class="d"># durable task: spec, events, proof</tspan></text>
+
+  <text x="32" y="152" class="t"><tspan class="p">❯</tspan> <tspan class="c">agent-review-route</tspan> --range HEAD~1..HEAD "add rate limiting to login"</text>
+  <text x="32" y="176" class="t">  risk.recommended   <tspan class="y">true</tspan></text>
+  <text x="32" y="200" class="t">  signals            path <tspan class="b">auth.py [auth]</tspan> · task <tspan class="b">'login'</tspan>   <tspan class="d">(2 strong, 0 weak)</tspan></text>
+  <text x="32" y="224" class="t">  reviewers</text>
+  <text x="32" y="248" class="t">    general      code-reviewer          <tspan class="d">general final review of the whole change</tspan></text>
+  <text x="32" y="272" class="t">    risk         <tspan class="y">agent-risk-reviewer</tspan>    <tspan class="d">opus · high-risk change: auth, task-declared</tspan></text>
+  <text x="32" y="296" class="t">    specialist   security-review        <tspan class="d">auth/crypto/secrets surface: auth</tspan></text>
+
+  <text x="32" y="338" class="t"><tspan class="p">❯</tspan> <tspan class="c">agent-ship ci</tspan></text>
+  <text x="32" y="362" class="t"><tspan class="g">ok</tspan>   secret scan (HEAD)</text>
+  <text x="32" y="386" class="t"><tspan class="g">ok</tspan>   floor guard (last commit)</text>
+  <text x="32" y="410" class="t"><tspan class="g">ok</tspan>   whitespace/conflict markers</text>
+  <text x="32" y="434" class="t d">no checks known for this project: run `agent-ship ci --learn` on the base branch</text>
+  <text x="32" y="458" class="t"><tspan class="r">local CI FAILED</tspan> for 364d252df     <tspan class="d"># fails closed: no checks ≠ pass</tspan></text>
+
+  <text x="32" y="500" class="t"><tspan class="p">❯</tspan> <tspan class="c">agent-ship ci --set</tspan> "make test"</text>
+  <text x="32" y="524" class="t d">checks for local_acme-app: ['make test']</text>
+
+  <text x="32" y="566" class="t"><tspan class="p">❯</tspan> <tspan class="c">agent-proof --checks</tspan> "add rate limiting to login"</text>
+  <text x="32" y="590" class="t d">~/.agent-os/proof/4d0a4dff1f762e59/20261011-021126.json</text>
+  <rect x="32" y="606" width="10" height="18" fill="#7C5CFF"/>
+</svg>

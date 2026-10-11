@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+HOME = pathlib.Path.home()
+MANIFEST = HOME / ".config" / "mcpall" / "servers.json"
+
+PROVIDERS = ("claude1", "claude2", "codex")
+
+LABELS = {
+    "claude1": "Claude 1",
+    "claude2": "Claude 2",
+    "codex": "Codex",
+}
+
+CLAUDE1_ENV = os.environ.copy()
+# Account 1 is the default config dir; a Claude 2 session exports
+# CLAUDE_CONFIG_DIR, which would otherwise redirect every claude1 call.
+CLAUDE1_ENV.pop("CLAUDE_CONFIG_DIR", None)
+
+CLAUDE2_ENV = os.environ.copy()
+CLAUDE2_ENV["CLAUDE_CONFIG_DIR"] = str(HOME / ".claude_second")
+
+CODEX_AUTH_BLOCKED = {
+    "slack",
+    "google-drive",
+    "google-calendar",
+    "gmail",
+}
+
+STATUS_SYMBOL = {
+    "ready": "✅",
+    "auth": "🟡",
+    "missing": "❌",
+    "failed": "🔴",
+    "disabled": "⚫",
+    "blocked": "⛔",
+    "unknown": "⚪",
+}
+
+STATUS_TEXT = {
+    "ready": "Ready",
+    "auth": "Auth required",
+    "missing": "Missing",
+    "failed": "Failed",
+    "disabled": "Disabled",
+    "blocked": "OAuth blocked",
+    "unknown": "Installed / auth unknown",
+}
+
+_output_cache = {}
+
+
+def die(msg, code=1):
+    print(msg)
+    sys.exit(code)
+
+
+def run(cmd, env=None, capture=False, timeout=90):
+    try:
+        p = subprocess.run(
+            cmd,
+            env=env,
+            text=True,
+            capture_output=capture,
+            timeout=timeout,
+        )
+        if capture:
+            return p.returncode, (p.stdout or "") + (p.stderr or "")
+        return p.returncode, ""
+    except subprocess.TimeoutExpired:
+        return 124, "TIMEOUT"
+    except FileNotFoundError:
+        return 127, "COMMAND_NOT_FOUND"
+
+
+def cli_exists(name):
+    return shutil.which(name) is not None
+
+
+def load():
+    if not MANIFEST.exists():
+        die(f"Manifest not found: {MANIFEST}")
+
+    try:
+        data = json.loads(MANIFEST.read_text())
+    except Exception as e:
+        die(f"Invalid manifest: {e}")
+
+    if not isinstance(data, list):
+        die("Manifest root must be a JSON array.")
+
+    return data
+
+
+def save(data):
+    MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+    MANIFEST.write_text(json.dumps(data, indent=2) + "\n")
+
+
+def server_providers(server):
+    p = server.get("providers")
+    if not p:
+        return list(PROVIDERS)
+    return [x for x in p if x in PROVIDERS]
+
+
+def provider_output(provider, refresh=False):
+    if not refresh and provider in _output_cache:
+        return _output_cache[provider]
+
+    if provider == "claude1":
+        rc, out = run(
+            ["claude", "mcp", "list"],
+            CLAUDE1_ENV,
+            True,
+            timeout=120,
+        )
+
+    elif provider == "claude2":
+        rc, out = run(
+            ["claude", "mcp", "list"],
+            CLAUDE2_ENV,
+            True,
+            timeout=120,
+        )
+
+    elif provider == "codex":
+        rc, out = run(
+            ["codex", "mcp", "list"],
+            None,
+            True,
+            timeout=120,
+        )
+
+    else:
+        return ""
+
+    if rc == 127:
+        out = "COMMAND_NOT_FOUND"
+
+    _output_cache[provider] = out
+    return out
+
+
+def invalidate(provider=None):
+    if provider:
+        _output_cache.pop(provider, None)
+    else:
+        _output_cache.clear()
+
+
+def claude_block(server, provider):
+    out = provider_output(provider)
+
+    if out == "COMMAND_NOT_FOUND":
+        return ""
+
+    lines = out.splitlines()
+
+    name = server["name"].lower()
+    url = server.get("url", "").lower()
+
+    matches = []
+
+    for i, line in enumerate(lines):
+        low = line.lower()
+
+        hit = False
+
+        if url and url in low:
+            hit = True
+
+        if low.strip().startswith(name + ":"):
+            hit = True
+
+        if ("claude.ai " + name) in low:
+            hit = True
+
+        if hit:
+            start = max(0, i - 1)
+            end = min(len(lines), i + 4)
+            matches.append("\n".join(lines[start:end]))
+
+    return "\n".join(matches)
+
+
+def codex_line(server):
+    out = provider_output("codex")
+
+    if out == "COMMAND_NOT_FOUND":
+        return ""
+
+    name = server["name"]
+
+    for line in out.splitlines():
+        stripped = line.strip()
+        if stripped == name:
+            return stripped
+        if stripped.startswith(name + " "):
+            return stripped
+        if stripped.startswith(name + "\t"):
+            return stripped
+
+    return ""
+
+
+def status(server, provider):
+    if provider not in server_providers(server):
+        return "blocked", "Not targeted by manifest"
+
+    name = server["name"]
+
+    if provider == "codex" and name in CODEX_AUTH_BLOCKED:
+        line = codex_line(server)
+
+        if not line:
+            return "blocked", "Codex OAuth registration currently blocked"
+
+        if "not logged in" in line.lower():
+            return "blocked", "Installed but Codex OAuth registration is blocked"
+
+    if provider in ("claude1", "claude2"):
+        block = claude_block(server, provider)
+
+        if not block:
+            return "missing", "Not installed"
+
+        low = block.lower()
+
+        if "✔ connected" in low or "connected" in low:
+            return "ready", "Connected"
+
+        if "needs authentication" in low:
+            return "auth", "Needs authentication"
+
+        if "failed to connect" in low or "connection_closed" in low:
+            return "failed", "Connection failed"
+
+        if "enoent" in low:
+            return "failed", "Executable/path missing"
+
+        return "unknown", "Installed; connection state unclear"
+
+    if provider == "codex":
+        line = codex_line(server)
+
+        if not line:
+            return "missing", "Not installed"
+
+        low = line.lower()
+
+        if "disabled" in low:
+            return "disabled", "Disabled"
+
+        if "not logged in" in low:
+            return "auth", "Needs OAuth login"
+
+        if "enabled" in low and "oauth" in low:
+            return "ready", "OAuth"
+
+        if server.get("type") == "stdio" and "enabled" in low:
+            return "ready", "Local stdio server"
+
+        if "enabled" in low and "unsupported" in low:
+            return "unknown", "Enabled; automatic auth unsupported"
+
+        if "enabled" in low:
+            return "ready", "Enabled"
+
+        return "unknown", "Installed; state unclear"
+
+    return "unknown", "Unknown provider"
+
+
+def presence(server, provider):
+    st, _ = status(server, provider)
+    return st not in ("missing",)
+
+
+def add(server, provider):
+    name = server["name"]
+
+    if provider not in server_providers(server):
+        print(f"{LABELS[provider]}: skipped by manifest policy")
+        return 0
+
+    if provider == "codex" and name in CODEX_AUTH_BLOCKED:
+        print(f"{LABELS[provider]}: skipped — OAuth registration currently incompatible")
+        return 0
+
+    stype = server.get("type")
+
+    if stype == "http":
+        url = server["url"]
+
+        if provider == "claude1":
+            rc, _ = run([
+                "claude", "mcp", "add",
+                "--transport", "http",
+                "--scope", "user",
+                name, url
+            ], CLAUDE1_ENV)
+
+        elif provider == "claude2":
+            rc, _ = run([
+                "claude", "mcp", "add",
+                "--transport", "http",
+                "--scope", "user",
+                name, url
+            ], CLAUDE2_ENV)
+
+        elif provider == "codex":
+            rc, _ = run([
+                "codex", "mcp", "add",
+                name, "--url", url
+            ])
+
+        else:
+            return 1
+
+    elif stype == "stdio":
+        command = server["command"]
+        args = server.get("args", [])
+
+        if provider == "claude1":
+            rc, _ = run([
+                "claude", "mcp", "add",
+                "--transport", "stdio",
+                "--scope", "user",
+                name, "--", command, *args
+            ], CLAUDE1_ENV)
+
+        elif provider == "claude2":
+            rc, _ = run([
+                "claude", "mcp", "add",
+                "--transport", "stdio",
+                "--scope", "user",
+                name, "--", command, *args
+            ], CLAUDE2_ENV)
+
+        elif provider == "codex":
+            rc, _ = run([
+                "codex", "mcp", "add",
+                name, "--", command, *args
+            ])
+
+        else:
+            return 1
+
+    else:
+        print(f"Unknown server type: {stype}")
+        return 1
+
+    invalidate(provider)
+    return rc
+
+
+def remove_provider(name, provider):
+    if provider == "claude1":
+        rc, _ = run(
+            ["claude", "mcp", "remove", name, "--scope", "user"],
+            CLAUDE1_ENV,
+        )
+
+    elif provider == "claude2":
+        rc, _ = run(
+            ["claude", "mcp", "remove", name, "--scope", "user"],
+            CLAUDE2_ENV,
+        )
+
+    elif provider == "codex":
+        rc, _ = run(["codex", "mcp", "remove", name])
+
+    else:
+        return 1
+
+    invalidate(provider)
+    return rc
+
+
+def do_diff():
+    servers = load()
+
+    print(f'{"MCP":22} {"Claude 1":11} {"Claude 2":11} {"Codex":11}')
+    print("-" * 61)
+
+    for s in servers:
+        cells = []
+
+        for p in PROVIDERS:
+            st, _ = status(s, p)
+            cells.append(STATUS_SYMBOL[st])
+
+        print(
+            f'{s["name"]:22} '
+            f'{cells[0]:11} '
+            f'{cells[1]:11} '
+            f'{cells[2]:11}'
+        )
+
+
+def do_doctor():
+    servers = load()
+
+    print("mcpall v3 doctor")
+    print()
+
+    if not cli_exists("claude"):
+        print("🔴 Claude CLI: not found")
+    else:
+        print(f"✅ Claude CLI: {shutil.which('claude')}")
+
+    if not cli_exists("codex"):
+        print("🔴 Codex CLI: not found")
+    else:
+        print(f"✅ Codex CLI: {shutil.which('codex')}")
+
+    usage = shutil.disk_usage(HOME)
+    free_gb = usage.free / (1024 ** 3)
+
+    if free_gb < 5:
+        disk_icon = "🔴"
+    elif free_gb < 15:
+        disk_icon = "🟡"
+    else:
+        disk_icon = "✅"
+
+    print(f"{disk_icon} Free disk: {free_gb:.1f} GB")
+    print(f"✅ Manifest: {MANIFEST}")
+    print()
+
+    print(
+        f'{"MCP":20} '
+        f'{"Claude 1":22} '
+        f'{"Claude 2":22} '
+        f'{"Codex":22}'
+    )
+    print("-" * 90)
+
+    issues = []
+
+    for s in servers:
+        row = []
+
+        for p in PROVIDERS:
+            st, detail = status(s, p)
+            value = f'{STATUS_SYMBOL[st]} {STATUS_TEXT[st]}'
+            row.append(value)
+
+            if st in ("auth", "missing", "failed", "disabled", "blocked", "unknown"):
+                issues.append((s["name"], p, st, detail))
+
+        print(
+            f'{s["name"]:20} '
+            f'{row[0]:22} '
+            f'{row[1]:22} '
+            f'{row[2]:22}'
+        )
+
+    print()
+    print("Legend:")
+    print("✅ Ready")
+    print("🟡 Authentication required")
+    print("❌ Missing")
+    print("🔴 Failed")
+    print("⚫ Disabled")
+    print("⛔ Provider/OAuth incompatibility")
+    print("⚪ Installed but state/auth support unclear")
+
+    if issues:
+        print()
+        print("Issues / actions:")
+
+        for name, provider, st, detail in issues:
+            label = LABELS[provider]
+
+            if st == "auth":
+                if provider == "codex":
+                    action = f"codex mcp login {name}"
+                elif provider == "claude1":
+                    action = "claude → /mcp"
+                else:
+                    action = 'CLAUDE_CONFIG_DIR="$HOME/.claude_second" claude → /mcp'
+
+                print(f"- {name} / {label}: {detail} → {action}")
+
+            elif st == "missing":
+                print(f'- {name} / {label}: missing → mcpall sync "{name}"')
+
+            elif st == "blocked":
+                print(f"- {name} / {label}: {detail}")
+
+            elif st == "failed":
+                print(f"- {name} / {label}: {detail}")
+
+            elif st == "disabled":
+                print(f"- {name} / {label}: disabled")
+
+            elif st == "unknown":
+                print(f"- {name} / {label}: {detail}")
+
+    else:
+        print()
+        print("✅ No issues found.")
+
+
+def do_auth_status():
+    servers = load()
+    found = False
+
+    for s in servers:
+        for p in PROVIDERS:
+            st, detail = status(s, p)
+
+            if st == "auth":
+                found = True
+                print(f"🟡 {s['name']} / {LABELS[p]} — {detail}")
+
+            elif st == "blocked":
+                found = True
+                print(f"⛔ {s['name']} / {LABELS[p]} — {detail}")
+
+            elif st == "unknown":
+                found = True
+                print(f"⚪ {s['name']} / {LABELS[p]} — {detail}")
+
+    if not found:
+        print("✅ No authentication issues detected.")
+
+
+def do_sync(target=None):
+    servers = load()
+
+    if target:
+        servers = [s for s in servers if s["name"] == target]
+
+        if not servers:
+            die(f"Unknown MCP: {target}")
+
+    for s in servers:
+        print()
+        print(f'===== {s["name"]} =====')
+
+        for provider in PROVIDERS:
+            label = LABELS[provider]
+
+            if provider not in server_providers(s):
+                print(f"{label}: skipped by manifest")
+                continue
+
+            if provider == "codex" and s["name"] in CODEX_AUTH_BLOCKED:
+                print(f"{label}: skipped — OAuth compatibility issue")
+                continue
+
+            st, detail = status(s, provider)
+
+            if st != "missing":
+                print(f"{label}: already installed ({STATUS_TEXT[st]})")
+                continue
+
+            print(f"{label}: adding...")
+
+            rc = add(s, provider)
+
+            if rc == 0:
+                print(f"{label}: added")
+            else:
+                print(f"{label}: FAILED ({rc})")
+
+    print()
+    print("Sync finished.")
+
+
+def do_repair():
+    print("Repairing missing MCP definitions...")
+    do_sync()
+    print()
+    invalidate()
+    do_doctor()
+
+
+def add_http(name, url, providers=None):
+    data = load()
+    data = [s for s in data if s["name"] != name]
+
+    item = {
+        "name": name,
+        "type": "http",
+        "url": url,
+    }
+
+    if providers:
+        item["providers"] = providers
+
+    data.append(item)
+    save(data)
+    invalidate()
+    do_sync(name)
+
+
+def add_stdio(name, command, args, providers=None):
+    data = load()
+    data = [s for s in data if s["name"] != name]
+
+    item = {
+        "name": name,
+        "type": "stdio",
+        "command": command,
+        "args": args,
+    }
+
+    if providers:
+        item["providers"] = providers
+
+    data.append(item)
+    save(data)
+    invalidate()
+    do_sync(name)
+
+
+def do_remove(name):
+    data = load()
+    matches = [s for s in data if s["name"] == name]
+
+    if not matches:
+        die(f"Unknown MCP: {name}")
+
+    server = matches[0]
+
+    for provider in PROVIDERS:
+        if presence(server, provider):
+            print(f"{LABELS[provider]}: removing {name}")
+            remove_provider(name, provider)
+
+    data = [s for s in data if s["name"] != name]
+    save(data)
+
+    print(f"Removed {name} from manifest.")
+
+
+def do_login(provider, name):
+    if provider == "codex":
+        if name in CODEX_AUTH_BLOCKED:
+            die(f"{name}: Codex OAuth flow is currently marked incompatible.")
+
+        rc, _ = run(["codex", "mcp", "login", name])
+        invalidate("codex")
+        sys.exit(rc)
+
+    if provider == "claude1":
+        print("Open Claude 1:")
+        print("  claude")
+        print("Then run:")
+        print("  /mcp")
+        return
+
+    if provider == "claude2":
+        print("Open Claude 2:")
+        print('  CLAUDE_CONFIG_DIR="$HOME/.claude_second" claude')
+        print("Then run:")
+        print("  /mcp")
+        return
+
+    die("Provider must be: claude1, claude2, or codex")
+
+
+def do_raw():
+    print("===== CLAUDE 1 =====")
+    print(provider_output("claude1", refresh=True))
+
+    print()
+    print("===== CLAUDE 2 =====")
+    print(provider_output("claude2", refresh=True))
+
+    print()
+    print("===== CODEX =====")
+    print(provider_output("codex", refresh=True))
+
+
+def usage():
+    print("""
+mcpall v3
+
+Health:
+  mcpall doctor
+  mcpall auth-status
+  mcpall diff
+  mcpall raw
+
+Sync:
+  mcpall sync
+  mcpall sync <name>
+  mcpall repair
+
+Add:
+  mcpall add-http <name> <url>
+  mcpall add-stdio <name> <command> [args...]
+
+Authentication:
+  mcpall login codex <name>
+  mcpall login claude1 <name>
+  mcpall login claude2 <name>
+
+Remove:
+  mcpall remove <name>
+
+Examples:
+  mcpall doctor
+  mcpall sync huggingface
+  mcpall login codex revenuecat
+  mcpall add-http revenuecat https://mcp.revenuecat.ai/mcp
+
+Notes:
+  Claude 1 uses ~/.claude
+  Claude 2 uses ~/.claude_second
+  Codex uses the current shared Codex config.
+""".strip())
+
+
+args = sys.argv[1:]
+
+if not args:
+    usage()
+    sys.exit(0)
+
+cmd = args[0]
+
+if cmd == "doctor":
+    do_doctor()
+
+elif cmd == "auth-status":
+    do_auth_status()
+
+elif cmd == "diff":
+    do_diff()
+
+elif cmd == "raw":
+    do_raw()
+
+elif cmd == "sync":
+    do_sync(args[1] if len(args) > 1 else None)
+
+elif cmd == "repair":
+    do_repair()
+
+elif cmd == "add-http" and len(args) == 3:
+    add_http(args[1], args[2])
+
+elif cmd == "add-stdio" and len(args) >= 3:
+    add_stdio(args[1], args[2], args[3:])
+
+elif cmd == "remove" and len(args) == 2:
+    do_remove(args[1])
+
+elif cmd == "login" and len(args) == 3:
+    do_login(args[1], args[2])
+
+else:
+    usage()
+    sys.exit(1)

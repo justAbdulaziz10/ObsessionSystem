@@ -1,0 +1,242 @@
+#!/usr/bin/python3
+"""Capability usage recorded automatically by ~/bin/agent-telemetry-hook (Claude Code hooks).
+
+  agent-usage skills   [--days 14] [--account claude1|claude2] [--json]   Skill tool calls + Reads of SKILL.md
+  agent-usage agents   [--days 14] ...                                   Agent/Task calls + Reads of agents/*.md
+  agent-usage mcp      [--days 14] ...                                   MCP calls per server (top tools)
+  agent-usage unused   [--days 14] [--json]     installed skills with zero loads in the window
+  agent-usage sessions [--days 1]  [--json]     recorded sessions (paths and counts only)
+  agent-usage sync-stats [--days 14]            merge load counts into ~/.agent-os/telemetry/capability-stats.json
+
+Installed skills = ~/.agents/skills, ~/.claude*/skills, and skills of plugins enabled in either Claude account.
+Codex sessions are not instrumented (no Codex hook); counts are Claude-only.
+sync-stats adds `loads`, `loads_window_days`, `last_loaded` per key and never touches the manual
+`success`/`failure`/`seconds` outcome fields that `agent-cap record` owns.
+Every command first ingests the hook spool (~/bin/agent-telemetry-ingest) so reports include events up to
+~1 s ago; --no-ingest skips that.
+Env: AGENTOS_TELEMETRY_DB overrides the DB path; AGENTOS_CAP_STATS the stats file
+(AGENTOS_TELEMETRY_SPOOL is passed through to the ingester).
+"""
+import argparse
+import collections
+import datetime as dt
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+
+HOME = os.path.expanduser("~")
+DB = os.environ.get("AGENTOS_TELEMETRY_DB") or os.path.join(HOME, ".agent-os", "v2", "db", "agentos.sqlite")
+STATS = os.environ.get("AGENTOS_CAP_STATS") or os.path.join(HOME, ".agent-os", "telemetry", "capability-stats.json")
+CLAUDE_HOMES = [os.path.join(HOME, ".claude"), os.path.join(HOME, ".claude_second")]
+
+
+def ingest_spool():
+    """Move hook-spooled events into the DB before reading it; never fatal for a report."""
+    try:
+        r = subprocess.run([os.path.join(HOME, "bin", "agent-telemetry-ingest"), "--quiet", "--wait", "15"],
+                           stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=120)
+        if r.returncode != 0:
+            print("warning: telemetry spool ingest failed (rc=%d); report may miss recent events" % r.returncode,
+                  file=sys.stderr)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print("warning: telemetry spool ingest did not run (%s)" % type(e).__name__, file=sys.stderr)
+
+
+def con():
+    if not os.path.exists(DB):
+        sys.exit("no telemetry DB at %s" % DB)
+    c = sqlite3.connect(DB, timeout=5)
+    c.row_factory = sqlite3.Row
+    has = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "usage" not in has:
+        sys.exit("no usage table yet: the hook has not recorded anything (is it registered in settings.json?)")
+    return c
+
+
+def since(days):
+    t = dt.datetime.now().astimezone() - dt.timedelta(days=days)
+    return t.isoformat(timespec="milliseconds")
+
+
+def rows(c, kinds, days, account=None):
+    q = "SELECT * FROM usage WHERE kind IN (%s) AND ts >= ?" % ",".join("?" * len(kinds))
+    args = list(kinds) + [since(days)]
+    if account:
+        q += " AND account = ?"
+        args.append(account)
+    return c.execute(q, args).fetchall()
+
+
+def base_name(name):
+    """'plugin:skill' and 'skill' count as the same skill."""
+    return (name or "").split(":")[-1].strip().lower()
+
+
+def report(c, a, kinds, label):
+    rs = rows(c, kinds, a.days, a.account)
+    agg = collections.OrderedDict()
+    for r in rs:
+        key = r["name"] if label != "skill" else base_name(r["name"])
+        x = agg.setdefault(key, {"name": key, "total": 0, "via_tool": 0, "via_read": 0, "sessions": set(),
+                                 "accounts": set(), "last": "", "details": collections.Counter()})
+        x["total"] += 1
+        x["via_read" if r["kind"].startswith("read_") else "via_tool"] += 1
+        x["sessions"].add(r["session_id"])
+        x["accounts"].add(r["account"])
+        x["last"] = max(x["last"], r["ts"] or "")
+        if r["detail"]:
+            x["details"][r["detail"]] += 1
+    out = sorted(agg.values(), key=lambda x: (-x["total"], x["name"]))
+    if a.json:
+        print(json.dumps([dict(x, sessions=len(x["sessions"]), accounts=sorted(x["accounts"]),
+                               details=dict(x["details"].most_common(5))) for x in out], indent=1))
+        return
+    print("%s loads, last %d day(s)%s: %d event(s), %d distinct" % (
+        label, a.days, " (" + a.account + ")" if a.account else "", len(rs), len(out)))
+    if label == "mcp":
+        print("%6s %5s  %-28s %-16s %s" % ("calls", "sess", "server", "last", "top tools"))
+        for x in out:
+            tools = ", ".join("%s=%d" % kv for kv in x["details"].most_common(3))
+            print("%6d %5d  %-28s %-16s %s" % (x["total"], len(x["sessions"]), x["name"][:28], x["last"][:16], tools))
+        return
+    print("%6s %5s %5s %5s  %-40s %-16s %s" % ("total", "tool", "read", "sess", "name", "last", "accounts"))
+    for x in out:
+        print("%6d %5d %5d %5d  %-40s %-16s %s" % (x["total"], x["via_tool"], x["via_read"], len(x["sessions"]),
+                                                  x["name"][:40], x["last"][:16], ",".join(sorted(x["accounts"]))))
+
+
+def installed_skills():
+    """{base name: [sources]} for skills a Claude session can load."""
+    found = collections.defaultdict(set)
+
+    def scan(d, source):
+        try:
+            for n in sorted(os.listdir(d)):
+                if os.path.isfile(os.path.join(d, n, "SKILL.md")):
+                    found[n.lower()].add(source)
+        except OSError:
+            pass
+
+    scan(os.path.join(HOME, ".agents", "skills"), "user")
+    for h in CLAUDE_HOMES:
+        scan(os.path.join(h, "skills"), "user")
+        try:
+            enabled = {k for k, v in json.load(open(os.path.join(h, "settings.json"))).get("enabledPlugins", {}).items() if v}
+            installed = json.load(open(os.path.join(h, "plugins", "installed_plugins.json"))).get("plugins", {})
+        except (OSError, ValueError):
+            continue
+        for key in enabled:
+            for inst in installed.get(key, []):
+                if inst.get("scope") not in (None, "user"):
+                    continue
+                p = inst.get("installPath") or ""
+                scan(os.path.join(p, "skills"), "plugin:" + key.split("@")[0])
+    return found
+
+
+def cmd_unused(c, a):
+    used = {base_name(r["name"]) for r in rows(c, ("skill", "read_skill"), a.days)}
+    first = c.execute("SELECT MIN(ts) FROM usage").fetchone()[0]
+    inst = installed_skills()
+    unused = sorted(n for n in inst if n not in used)
+    if a.json:
+        print(json.dumps({"days": a.days, "recording_since": first, "installed": len(inst), "used": len(used),
+                          "unused": [{"name": n, "sources": sorted(inst[n])} for n in unused]}, indent=1))
+        return
+    print("installed skills: %d; loaded in last %d day(s): %d; never loaded: %d" % (
+        len(inst), a.days, len([n for n in inst if n in used]), len(unused)))
+    print("(recording since %s; a short history makes most skills look unused)" % (first or "never"))
+    for n in unused:
+        print("  %-48s %s" % (n, ",".join(sorted(inst[n]))))
+
+
+def cmd_sessions(c, a):
+    has = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if "sessions" not in has:
+        sys.exit("no sessions table yet")
+    rs = c.execute("SELECT * FROM sessions WHERE last_seen >= ? ORDER BY last_seen DESC", (since(a.days),)).fetchall()
+    if a.json:
+        print(json.dumps([dict(r) for r in rs], indent=1))
+        return
+    for r in rs:
+        print("%s %-7s %-6s stops=%-3s fail=%-2s end=%-18s %s  %s" % (
+            (r["last_seen"] or "")[:16], r["account"], r["mode"], r["stops"], r["stop_failures"],
+            r["end_reason"] or "-", r["tool_counts"] or "{}", r["repo"] or r["cwd"]))
+
+
+def mcp_key(server):
+    s = server or ""
+    if s.startswith("claude_ai_"):
+        s = s[len("claude_ai_"):]
+    elif s.startswith("plugin_"):
+        s = s.rsplit("_", 1)[-1]
+    return s.replace("_", "-").lower()
+
+
+def cmd_sync(c, a):
+    counts, last = collections.Counter(), {}
+    for r in c.execute("SELECT kind, name, ts FROM usage WHERE ts >= ?", (since(a.days),)):
+        kind = r["kind"]
+        if kind in ("skill", "read_skill"):
+            key = "skill:" + base_name(r["name"])
+        elif kind in ("agent", "read_agent"):
+            key = "agent:" + (r["name"] or "").lower()
+        elif kind == "mcp":
+            key = "mcp:" + mcp_key(r["name"])
+        else:
+            continue
+        counts[key] += 1
+        last[key] = max(last.get(key, ""), r["ts"] or "")
+    try:
+        with open(STATS) as f:
+            stats = json.load(f)
+    except (OSError, ValueError):
+        stats = {}
+    for key, row in stats.items():  # window moved on: stale counts drop to 0, history fields stay
+        if isinstance(row, dict) and "loads" in row and key not in counts:
+            row["loads"] = 0
+            row["loads_window_days"] = a.days
+    for key, n in counts.items():
+        row = stats.setdefault(key, {"success": 0, "failure": 0, "seconds": 0.0, "last_used": None})
+        row["loads"] = n
+        row["loads_window_days"] = a.days
+        row["last_loaded"] = max(row.get("last_loaded") or "", last[key])
+    os.makedirs(os.path.dirname(STATS), exist_ok=True)
+    tmp = STATS + ".tmp-usage"
+    with open(tmp, "w") as f:
+        f.write(json.dumps(stats, indent=2, ensure_ascii=False) + "\n")
+    os.replace(tmp, STATS)
+    print("capability-stats.json: %d key(s) with loads in the last %d day(s)" % (len(counts), a.days))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("cmd", choices=["skills", "agents", "mcp", "unused", "sessions", "sync-stats"])
+    ap.add_argument("--days", type=float, default=None)
+    ap.add_argument("--account", choices=["claude1", "claude2"])
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-ingest", action="store_true", help="report without ingesting the hook spool first")
+    a = ap.parse_args()
+    if not a.no_ingest:
+        ingest_spool()
+    if a.days is None:
+        a.days = 1 if a.cmd == "sessions" else 14
+    c = con()
+    if a.cmd == "skills":
+        report(c, a, ("skill", "read_skill"), "skill")
+    elif a.cmd == "agents":
+        report(c, a, ("agent", "read_agent"), "agent")
+    elif a.cmd == "mcp":
+        report(c, a, ("mcp",), "mcp")
+    elif a.cmd == "unused":
+        cmd_unused(c, a)
+    elif a.cmd == "sessions":
+        cmd_sessions(c, a)
+    else:
+        cmd_sync(c, a)
+
+
+if __name__ == "__main__":
+    main()

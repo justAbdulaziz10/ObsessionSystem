@@ -1,0 +1,35 @@
+name: Bug report
+description: Something behaves differently from what the docs or policy say
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The command you ran and the output you got.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Smallest reproduction
+      description: Ideally a few lines that fail in a fresh `$HOME` (see `evals/run-all.sh`).
+  - type: input
+    id: env
+    attributes:
+      label: Environment
+      placeholder: macOS 15, Python 3.9, Claude Code x.y, installed with --all
+  - type: checkboxes
+    id: privacy
+    attributes:
+      label: Privacy
+      options:
+        - label: I removed tokens, emails, private repo names and file paths from the output above.
+          required: true

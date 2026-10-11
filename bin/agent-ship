@@ -1,0 +1,2104 @@
+#!/usr/bin/env python3
+"""agent-ship: decide where git work comes from and goes to, from evidence.
+
+  topology [PATH] [--fetch] [--json]   remotes, canonical, mirrors, drift, CI, release tooling
+  plan     [PATH] [--branch B] [--json] what to pull, where to push, what to run first
+  sync     [PATH]                      fetch every remote; fast-forward clean local base branches
+  ci       [PATH] [--list|--learn|--set CMD...]
+                                       local CI gate for HEAD: secret scan + floor guard + the project's checks; a
+                                       check that already failed when learned does not block until it passes once
+                                       (ratchet). `ci --help` explains the floor guard and its ack trailer
+  floor    [PATH] [--range A..B] [--committed] [--json]
+                                       floor guard alone (read-only): does this change lower the bar (suppressions,
+                                       skipped/deleted tests, loosened lint/coverage/strict/CI, stubs)? Default:
+                                       unpublished commits + uncommitted work; run before committing
+  floor --stats [--days N] [--json]    per rule: findings, acked, blocked, top ack reasons, from the evaluations
+                                       `ci` records in $AGENT_SHIP_DIR/floor-log.jsonl (rotated at 1 MB)
+  push     [PATH] [--branch B] [--no-ci REASON] [--dry-run]
+                                       push to canonical (and fast-forward a stale mirror), never force
+  release  [PATH]                      release paths by project type (test channels vs. ask-first production)
+  tidy     [PATH] [--apply]            branches already merged, on GitHub, GitLab and locally (dry run by default)
+  scorecard [--days N]                 per-project CI pass rate, CI time, pushes
+  guard                                PreToolUse hook: blocks git pushes that break the topology
+
+Rules (see GLOBAL.md "Delivery"): the canonical remote is where commits actually land
+(the one ahead), confirmed by mirror-mechanism evidence. Push there only. A mirror is
+pushed only to fast-forward a base branch to exactly the canonical commit, when its own
+mirror job is not keeping up. Diverged remotes, force pushes to base branches and
+pushes behind the canonical branch stop for a human.
+"""
+import argparse, fnmatch, glob, hashlib, json, os, re, shlex, shutil, subprocess, sys, time
+from pathlib import Path
+
+HOME = Path.home()
+PROFILES = Path(os.environ.get("AGENT_SHIP_PROFILES", HOME / ".agent-os/delivery/profiles.json"))
+STATE = Path(os.environ.get("AGENT_SHIP_DIR", HOME / ".agent-os/runtime/ship"))
+BASES = ("main", "master", "develop", "development", "trunk")
+
+
+def git(repo, *args, check=False, timeout=120):
+    p = subprocess.run(["git", "-C", str(repo), "-c", "core.quotePath=false", *args], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace", timeout=timeout)
+    if check and p.returncode:
+        raise SystemExit(f"git {' '.join(args)}: {p.stderr.strip()}")
+    return p
+
+
+def out(repo, *args):
+    p = git(repo, *args)
+    return p.stdout.strip() if p.returncode == 0 else ""
+
+
+def clean_url(u):
+    return re.sub(r"//[^/@]+@", "//", u)  # drop any user:token@ from https URLs
+
+
+def host_kind(u):
+    u = u.lower()
+    if re.search(r"heroku|dokku|\.fly\.dev|render\.com|platform\.sh|azurewebsites|appspot|scalingo|clever-cloud", u):
+        return "deploy"
+    for k in ("github", "gitlab", "bitbucket", "codeberg", "azure"):
+        if k in u:
+            return k
+    return "local" if u.startswith(("/", "file:", ".")) else "other"
+
+
+def repo_slug(u):
+    m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", u)
+    return m.group(1).lower() if m else u.lower()
+
+
+def toplevel(path):
+    t = out(path, "rev-parse", "--show-toplevel")
+    if not t:
+        raise SystemExit(f"not a git repository: {path}")
+    return Path(t)
+
+
+def load_profile(remotes, root):
+    try:
+        data = json.loads(PROFILES.read_text())
+    except (OSError, ValueError):
+        return {}
+    keys = [repo_slug(r["url"]) for r in remotes] + [str(root), root.name]
+    defaults = data.get("defaults", {})
+    for p in data.get("profiles", []):
+        pats = p.get("match", [])
+        if any(fnmatch.fnmatch(k, pat.lower()) or fnmatch.fnmatch(k, pat) for k in keys for pat in pats):
+            return {**defaults, **p}
+    return dict(defaults)
+
+
+def mirror_evidence(root, remotes):
+    """Files that copy commits from one host to another, as (source_kind, target_kind, file, runs_on)."""
+    ev = []
+    for f in sorted(glob.glob(str(root / ".github/workflows/*.y*ml"))):
+        t = Path(f).read_text(errors="ignore")
+        if re.search(r"git\s+push", t) and re.search(r"gitlab", t, re.I):
+            ev.append({"source": "github", "target": "gitlab", "file": os.path.relpath(f, root), "runs_on": "github-actions"})
+    gl = root / ".gitlab-ci.yml"
+    if gl.exists():
+        t = gl.read_text(errors="ignore")
+        if re.search(r"git\s+push", t) and re.search(r"github\.com", t):
+            ev.append({"source": "gitlab", "target": "github", "file": ".gitlab-ci.yml", "runs_on": "gitlab-ci"})
+    return ev
+
+
+def relation(root, a, b):
+    """Commits a lacks and b lacks (behind, ahead) for refs a and b."""
+    p = git(root, "rev-list", "--left-right", "--count", f"{a}...{b}")
+    if p.returncode:
+        return None
+    left, right = map(int, p.stdout.split())
+    return {"a_only": left, "b_only": right}
+
+
+def ci_providers(root):
+    found = []
+    if glob.glob(str(root / ".github/workflows/*.y*ml")):
+        found.append("github-actions")
+    if (root / ".gitlab-ci.yml").exists():
+        found.append("gitlab-ci")
+    for f, name in (("bitbucket-pipelines.yml", "bitbucket"), (".circleci/config.yml", "circleci"),
+                    ("azure-pipelines.yml", "azure"), ("Jenkinsfile", "jenkins"), ("codemagic.yaml", "codemagic"),
+                    ("ci_scripts", "xcode-cloud")):
+        if (root / f).exists():
+            found.append(name)
+    return found
+
+
+def release_tooling(root):
+    lanes = []
+    for ff in out(root, "ls-files", "--", "fastlane/Fastfile", "*/fastlane/Fastfile").splitlines():
+        for m in re.finditer(r"^\s*lane\s+:(\w+)", (root / ff).read_text(errors="ignore"), re.M):
+            lanes.append(f"{ff}:{m.group(1)}")
+    return {"fastlane_lanes": lanes}
+
+
+CODE_HOSTS = ("github", "gitlab", "bitbucket", "codeberg", "azure")
+
+
+def repo_name(u):
+    return re.sub(r"\.git$", "", u.rstrip("/").split("/")[-1].split(":")[-1]).lower()
+
+
+def remembered(root, value=None):
+    """Last evidence-based canonical per repo, so a moment of zero drift doesn't flip the answer."""
+    path = STATE / "canonical.json"
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        d = {}
+    if value is None:
+        return d.get(str(root))
+    if d.get(str(root)) != value:
+        d[str(root)] = value
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(d, indent=1))
+
+
+def topology(path, fetch=False):
+    root = toplevel(path)
+    fetch_failed = False
+    if fetch:
+        fetch_failed = git(root, "fetch", "--all", "--prune", "--quiet", timeout=300).returncode != 0
+    remotes = []
+    for name in out(root, "remote").split():
+        url = out(root, "remote", "get-url", name)
+        pushes = [clean_url(u) for u in out(root, "remote", "get-url", "--push", "--all", name).splitlines() if u]
+        remotes.append({"name": name, "url": clean_url(url), "host": host_kind(url), "push_urls": pushes})
+    prof = load_profile(remotes, root)
+    names = [r["name"] for r in remotes]
+    rem = {r["name"]: r for r in remotes}
+    warnings, reason, ambiguous = [], "", False
+
+    # The mirror group: the same repository on different code hosts (e.g. GitHub + GitLab).
+    # Anything else (a fork's upstream, heroku/dokku deploy remotes, backups) is "other":
+    # agent-ship never pushes there and the guard leaves pushes to it to the user.
+    anchor = prof.get("canonical") if prof.get("canonical") in names else "origin" if "origin" in names else (names or [None])[0]
+    group = []
+    if anchor:
+        group = [anchor] + [n for n in names if n != anchor and rem[n]["host"] in CODE_HOSTS
+                            and rem[n]["host"] != rem[anchor]["host"] and repo_name(rem[n]["url"]) == repo_name(rem[anchor]["url"])]
+        group += [n for n in prof.get("mirrors", []) if n in names and n not in group]
+    others = [n for n in names if n not in group]
+
+    bases = [b for b in BASES if any(git(root, "rev-parse", "-q", "--verify", f"refs/remotes/{n}/{b}").returncode == 0 for n in group)]
+    heads = {n: {b: out(root, "rev-parse", "-q", "--verify", f"refs/remotes/{n}/{b}") or None for b in bases} for n in group}
+    ev = mirror_evidence(root, remotes)
+    by_host = {rem[n]["host"]: n for n in group}
+
+    score = {n: 0 for n in group}
+    diverged = []
+    for b in bases:
+        have = [n for n in group if heads[n][b]]
+        for i, x in enumerate(have):
+            for y in have[i + 1:]:
+                r = relation(root, f"refs/remotes/{x}/{b}", f"refs/remotes/{y}/{b}")
+                if not r:
+                    continue
+                if r["a_only"] and r["b_only"]:
+                    diverged.append(f"{b}: {x} and {y} each have commits the other lacks ({r['a_only']}/{r['b_only']})")
+                elif r["a_only"]:
+                    score[x] += 1
+                elif r["b_only"]:
+                    score[y] += 1
+
+    canonical = None
+    src = [by_host[e["source"]] for e in ev if e["source"] in by_host and e["target"] in by_host]
+    preferred = [n for n in group if rem[n]["host"] == prof.get("canonical_host")]
+    if prof.get("canonical") in names:
+        canonical, reason = prof["canonical"], "set in delivery profile"
+    elif preferred:
+        canonical, reason = preferred[0], f"user rule: pushes go to {prof['canonical_host']}"
+    elif len(group) == 1:
+        canonical, reason = group[0], "only remote for this repository" if not others else "no mirror on another host; " + ", ".join(others) + " left alone"
+    elif group:
+        top = max(score.values())
+        leaders = [n for n in group if score[n] == top]
+        if top and len(leaders) == 1:
+            canonical, reason = leaders[0], "the other remotes are behind it on base branches"
+        elif src:
+            canonical, reason = src[0], f"mirror job in {ev[0]['file']} copies from it"
+        elif remembered(root) in group:
+            canonical, reason = remembered(root), "remotes in sync; keeping the last evidence-based answer"
+        else:
+            canonical, reason, ambiguous = anchor, "remotes in sync and no mirror evidence; set `canonical` in the delivery profile", True
+        if canonical and not ambiguous and fetch and not fetch_failed and reason.startswith(("the other", "mirror job")):
+            remembered(root, canonical)
+
+    for e in ev:
+        if e["source"] not in by_host:
+            warnings.append(f"{e['file']} pushes {e['source']}->{e['target']} from a {e['source']} project with no local remote; "
+                            f"commits may also arrive on {e['target']} from there, so always sync before pushing")
+        elif e["target"] in by_host and by_host[e["source"]] != canonical:
+            warnings.append(f"{e['file']} copies {e['source']}->{e['target']}, the opposite direction to pushes ({canonical} first); "
+                            f"harmless when both already have the same commits")
+    warnings += diverged
+    if fetch_failed:
+        warnings.append("fetch failed; remote refs may be stale")
+    if not remotes:
+        warnings.append("no remote: this project exists only on this laptop (not backed up); your rule is GitHub first")
+    elif prof.get("canonical_host") and not any(r["host"] == prof["canonical_host"] for r in remotes):
+        warnings.append(f"not on {prof['canonical_host']} yet (your rule pushes there first); creating the repo needs your OK")
+    for r in remotes:
+        if len(r["push_urls"]) > 1 or (r["push_urls"] and r["push_urls"][0] != r["url"]):
+            warnings.append(f"remote {r['name']} pushes to {len(r['push_urls'])} URL(s) different from its fetch URL; "
+                            f"a push there also reaches: {', '.join(r['push_urls'])}")
+
+    mirrors = []
+    for n in group:
+        if n == canonical:
+            continue
+        drift = {}
+        for b in bases:
+            if heads[n][b] and heads[canonical][b]:
+                r = relation(root, f"refs/remotes/{canonical}/{b}", f"refs/remotes/{n}/{b}")
+                if r:
+                    drift[b] = {"behind": r["a_only"], "ahead": r["b_only"]}
+        host = rem[n]["host"]
+        mech = [e for e in ev if e["target"] == host and by_host.get(e["source"]) == canonical]
+        stale = any(d["behind"] and not d["ahead"] for d in drift.values())
+        mirrors.append({"name": n, "host": host, "drift": drift, "mechanism": mech,
+                        "state": "diverged" if any(d["ahead"] for d in drift.values()) else
+                                 "stale" if stale else "in-sync"})
+        if stale:
+            how = f"mirror job {mech[0]['file']} ({mech[0]['runs_on']}) is not keeping up" if mech else "no mirror job pushes it"
+            warnings.append(f"{n} is behind {canonical}: " + ", ".join(f"{b} -{d['behind']}" for b, d in drift.items() if d["behind"]) + f"; {how}")
+
+    gd = out(root, "rev-parse", "--git-common-dir")
+    age = None
+    if gd:
+        fh = Path(gd) if Path(gd).is_absolute() else root / gd
+        fh = fh / "FETCH_HEAD"
+        if fh.exists():
+            age = round((time.time() - fh.stat().st_mtime) / 3600, 1)
+    return {"repo": str(root), "remotes": remotes, "canonical": canonical, "canonical_reason": reason,
+            "ambiguous": ambiguous, "others": others, "bases": bases, "mirrors": mirrors, "mirror_evidence": ev,
+            "ci": ci_providers(root), "release": release_tooling(root), "profile": prof.get("name"),
+            "rules": prof.get("rules", []), "fetch_age_hours": age, "fetch_failed": fetch_failed,
+            "fetched_now": fetch and not fetch_failed, "mirror_all": bool(prof.get("mirror_all_branches")),
+            "warnings": warnings}
+
+
+def current_branch(root):
+    return out(root, "symbolic-ref", "-q", "--short", "HEAD")
+
+
+def plan(path, branch=None, fetch=True):
+    t = topology(path, fetch=fetch)
+    root = Path(t["repo"])
+    c = t["canonical"]
+    branch = branch or current_branch(root)
+    steps, stop = [], []
+    if t["fetch_failed"]:
+        stop.append("fetch failed: remote state unknown, so drift and canonical are unverified")
+    if any(m["state"] == "diverged" for m in t["mirrors"]) or any("each have commits" in w for w in t["warnings"]):
+        stop.append("remotes diverged: a human picks which history wins; never force")
+    if not c:
+        stop.append("no remote: nothing to push to")
+        return {**t, "branch": branch, "steps": steps, "stop": stop}
+    is_base = branch in BASES
+    if t["ambiguous"] and t["mirrors"]:
+        stop.append(f"cannot tell whether {c} or {', '.join(m['name'] for m in t['mirrors'])} is canonical: "
+                    "set `canonical` in ~/.agent-os/delivery/profiles.json before pushing")
+    up = f"refs/remotes/{c}/{branch}"
+    mine = f"refs/heads/{branch}" if git(root, "rev-parse", "-q", "--verify", f"refs/heads/{branch}").returncode == 0 else "HEAD"
+    if git(root, "rev-parse", "-q", "--verify", up).returncode == 0:
+        r = relation(root, mine, up)
+        if r and r["b_only"] and r["a_only"]:
+            stop.append(f"{branch} diverged from {c}/{branch}: rebase (unpushed) or merge, never force" if not is_base
+                        else f"{branch} diverged from {c}/{branch}: merge {c}/{branch} in; never force a base branch")
+        elif r and r["b_only"]:
+            steps.append(f"pull: fast-forward {branch} from {c}/{branch} ({r['b_only']} new)")
+    base = next((b for b in t["bases"] if b != branch), None)
+    if not is_base and base:
+        r = relation(root, mine, f"refs/remotes/{c}/{base}")
+        if r and r["b_only"]:
+            steps.append(f"update: {c}/{base} has {r['b_only']} commits this branch lacks; rebase if unpushed, else merge")
+    steps.append("verify: `agent-ship ci` (local CI gate: secret scan, floor guard, project checks; remote CI is a bonus, not the gate)")
+    steps.append("floor: a change may not lower the bar (suppressions, skipped/deleted tests, loosened lint/coverage/strict/CI, stubs); "
+                 "`agent-ship floor` before committing; a deliberate one needs `Floor-Guard-Ack: <rule> <reason>` in the commit message")
+    steps.append(f"push: {c} {branch}" + ("" if is_base else f" (open the PR/MR on {next(r['host'] for r in t['remotes'] if r['name'] == c)})"))
+    if t.get("mirror_all") and t["mirrors"]:
+        for m in t["mirrors"]:
+            steps.append(f"mirror: push the same commit of {branch} to {m['name']} (fast-forward only; skipped if {m['name']} has commits {c} lacks)")
+    elif is_base:
+        for m in t["mirrors"]:
+            if m["state"] == "stale" or not m["mechanism"]:
+                steps.append(f"mirror: fast-forward {m['name']}/{branch} to the same commit (its mirror job is not doing it)")
+            else:
+                steps.append(f"mirror: leave {m['name']} to {m['mechanism'][0]['file']}; confirm it caught up")
+    else:
+        steps.append("mirror: none; feature branches live on the canonical remote only")
+    for kind, how, ask in release_paths(root):
+        steps.append(f"release: {kind}: {how}" + (" - only when the user asks" if ask else " - part of shipping when the user asks to ship"))
+    for rule in t["rules"]:
+        steps.append(f"rule: {rule}")
+    return {**t, "branch": branch, "steps": steps, "stop": stop}
+
+
+def cmd_sync(a):
+    root = toplevel(a.path)
+    p = git(root, "fetch", "--all", "--prune", timeout=600)
+    if p.returncode:
+        print(p.stderr.strip(), file=sys.stderr)
+        return 1
+    t = topology(root)
+    c, cur = t["canonical"], current_branch(root)
+    dirty = bool(out(root, "status", "--porcelain", "--untracked-files=no"))
+    for b in t["bases"]:
+        if git(root, "rev-parse", "-q", "--verify", f"refs/heads/{b}").returncode or not c:
+            continue
+        r = relation(root, f"refs/heads/{b}", f"refs/remotes/{c}/{b}")
+        if not r or not r["b_only"]:
+            continue
+        if r["a_only"]:
+            print(f"{b}: diverged from {c}/{b} (local +{r['a_only']}, remote +{r['b_only']}); left alone")
+        elif b == cur:
+            if dirty:
+                print(f"{b}: {r['b_only']} behind {c}/{b}; working tree dirty, not merging")
+            else:
+                m = git(root, "merge", "--ff-only", "--quiet", f"refs/remotes/{c}/{b}")
+                print(f"{b}: fast-forwarded {r['b_only']} from {c}" if m.returncode == 0 else f"{b}: fast-forward failed: {m.stderr.strip()[-200:]}")
+        elif b not in checked_out(root):
+            u = git(root, "update-ref", f"refs/heads/{b}", f"refs/remotes/{c}/{b}", out(root, "rev-parse", f"refs/heads/{b}"))
+            print(f"{b}: fast-forwarded {r['b_only']} from {c}" if u.returncode == 0 else f"{b}: update failed: {u.stderr.strip()[-200:]}")
+        else:
+            print(f"{b}: {r['b_only']} behind {c}/{b}; checked out in another worktree, left alone")
+    for w in t["warnings"]:
+        print("warning:", w)
+    return 0
+
+
+def checked_out(root):
+    return {l.split("refs/heads/", 1)[1] for l in out(root, "worktree", "list", "--porcelain").splitlines()
+            if l.startswith("branch refs/heads/")}
+
+
+LEARNED = Path(os.environ.get("AGENT_SHIP_LEARNED", HOME / ".agent-os/delivery/learned"))
+
+
+def full_slug(u):
+    """host + full repository path (keeps GitLab subgroups apart)."""
+    u = clean_url(u).lower()
+    m = re.match(r"^(?:[a-z+]+://)?(?:[^@/]+@)?([^/:]+)[:/](.+?)(?:\.git)?/?$", u)
+    return f"{m.group(1)}/{m.group(2)}" if m and not u.startswith(("/", ".", "file:")) else u
+
+
+def repo_key(root):
+    """Stable per-project key shared by every clone and worktree: the GitHub remote if any, else any remote,
+    else the repository's own path (two local folders with the same name never share a key)."""
+    urls = [out(root, "remote", "get-url", n) for n in out(root, "remote").split()]
+    urls.sort(key=lambda u: host_kind(u) != "github")
+    if urls:
+        base = full_slug(urls[0])
+    else:
+        common = out(root, "rev-parse", "--path-format=absolute", "--git-common-dir")
+        base = f"local/{Path(common).parent.name}-{hashlib.sha256(common.encode()).hexdigest()[:10]}"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", base)
+
+
+def learned(root, data=None):
+    path = LEARNED / f"{repo_key(root)}.json"
+    if data is None:
+        try:
+            return json.loads(path.read_text())
+        except (OSError, ValueError):
+            return {}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    tmp.replace(path)
+    return data
+
+
+def has(cmd):
+    return shutil.which(cmd) is not None
+
+
+def _non_posix_shebang(path):
+    try:
+        with open(path, "rb") as fh:
+            first = fh.readline(200).decode("utf-8", "ignore")
+    except OSError:
+        return False
+    return first.startswith("#!") and bool(re.search(r"\b(zsh|fish|t?csh)\b", first))
+
+
+def detect_checks(root):
+    """Candidate (setup, checks) from the project's own files. Setup prepares an environment; checks judge the code."""
+    setup, checks = [], []
+    build = STATE / "build" / hashlib.sha256(str(root).encode()).hexdigest()[:16]
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            scripts = json.loads(pkg.read_text()).get("scripts", {})
+        except ValueError:
+            scripts = {}
+        pm = "pnpm" if (root / "pnpm-lock.yaml").exists() else "yarn" if (root / "yarn.lock").exists() else \
+             "bun" if (root / "bun.lockb").exists() or (root / "bun.lock").exists() else "npm"
+        if not (root / "node_modules").exists():
+            setup.append({"npm": "npm ci" if (root / "package-lock.json").exists() else "npm install",
+                          "pnpm": "pnpm install --frozen-lockfile", "yarn": "yarn install --frozen-lockfile",
+                          "bun": "bun install --frozen-lockfile"}[pm])
+        checks += [f"{pm} run {x}" for x in ("lint", "typecheck", "check", "test", "build") if x in scripts]
+    if (root / "pubspec.yaml").exists():
+        fl = "flutter" if re.search(r"^\s*flutter:", (root / "pubspec.yaml").read_text(errors="ignore"), re.M) else "dart"
+        if not (root / ".dart_tool").exists():
+            setup.append(f"{fl} pub get")
+        checks.append(f"{fl} analyze")
+        if (root / "test").exists():
+            checks.append(f"{fl} test")
+    py = root / "pyproject.toml"
+    if py.exists() or (root / "pytest.ini").exists() or (root / "setup.py").exists():
+        runner = "uv run " if (root / "uv.lock").exists() and has("uv") else "python3 -m "
+        if py.exists() and "ruff" in py.read_text(errors="ignore") and (has("ruff") or runner.startswith("uv")):
+            checks.append(f"{'uv run ' if runner.startswith('uv') else ''}ruff check .")
+        if (root / "tests").exists() or (root / "test").exists():
+            checks.append(f"{runner}pytest -q")
+    if (root / "go.mod").exists():
+        checks += ["go vet ./...", "go test ./..."]
+    if (root / "Cargo.toml").exists():
+        checks.append("cargo test --quiet")
+    if (root / "Package.swift").exists():
+        checks.append("swift test")
+    if (root / "gradlew").exists():
+        checks.append("./gradlew check --console=plain")
+    if (root / "platformio.ini").exists():
+        checks.append("pio run")
+        if (root / "test").exists():
+            checks.append("pio test -e native" if "env:native" in (root / "platformio.ini").read_text(errors="ignore") else "pio test --without-uploading")
+    if (root / "CMakeLists.txt").exists() and not checks:
+        checks.append(f"cmake -S . -B {build} && cmake --build {build} && ctest --test-dir {build} --output-on-failure")
+    for mk, runner in (("Makefile", "make"), ("justfile", "just"), ("Justfile", "just")):
+        f = root / mk
+        if f.exists() and not checks:
+            t = f.read_text(errors="ignore")
+            checks += [f"{runner} {x}" for x in ("lint", "check", "test") if re.search(rf"^{x}\s*:", t, re.M)]
+    lf = git(root, "ls-files", "-z", "--", "*.sh", "*.bash")
+    sh = [f for f in lf.stdout.split("\0") if f] if lf.returncode == 0 else []
+    sh = [f for f in sh if not _non_posix_shebang(root / f)]  # shellcheck can't parse zsh/fish/csh (SC1071)
+    if sh and has("shellcheck"):
+        checks.append("shellcheck -S error -- " + " ".join(shlex.quote(f) for f in sh[:200]))
+    return setup, checks
+
+
+def ci_commands(root, prof):
+    """(setup, checks, source). Profile beats learned beats detected."""
+    if prof.get("ci"):
+        return list(prof.get("setup", [])), list(prof["ci"]), "profile"
+    L = learned(root)
+    det_setup, det = detect_checks(root)
+    if L.get("commands"):
+        return det_setup if not L.get("setup") else list(L["setup"]), list(L["commands"]), "learned"
+    return det_setup, det, "detected"
+
+
+SECRET_PATTERNS = [
+    ("private key", r"-----BEGIN (?:RSA |EC |OPENSSH |DSA |PGP |ENCRYPTED )?PRIVATE KEY"),
+    ("AWS access key", r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
+    ("GitHub token", r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{60,})\b"),
+    ("GitLab token", r"\bglpat-[A-Za-z0-9_-]{20,}\b"),
+    ("Slack token", r"\bxox[abprs]-[A-Za-z0-9-]{10,}\b"),
+    ("Google API key", r"\bAIza[0-9A-Za-z_-]{35}\b"),
+    ("Stripe live key", r"\b[rs]k_live_[0-9A-Za-z]{20,}\b"),
+    ("OpenAI/Anthropic key", r"\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{32,}\b"),
+    ("JWT", r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
+    ("credentials in URL", r"\b[a-z][a-z0-9+.-]*://[^/\s:@'\"]+:[^/\s@'\"]{6,}@[^\s'\"]+"),
+    ("password assignment", r"(?i)\b(?:password|passwd|secret|api_?key|access_?token|auth_?token)\s*[:=]\s*['\"][^'\"\s$<{]{12,}['\"]"),
+    ("dotenv secret", r"(?i)^\s*(?:export\s+)?[A-Z0-9_]*(?:SECRET|TOKEN|PASSWORD|PASSWD|API_?KEY|PRIVATE_?KEY|DATABASE_URL)[A-Z0-9_]*\s*=\s*['\"]?[^\s'\"#$<{]{8,}"),
+]
+SECRET_FILES = re.compile(r"(^|/)(\.env(\.(?!vault$|d\.ts$)[\w.-]+)?|id_[rd]sa|id_ecdsa|id_ed25519|[^/]*\.(p12|pfx|jks)|"
+                          r"[^/]*\.keystore|AuthKey_[A-Z0-9]+\.p8|service-account[^/]*\.json|credentials\.json|[^/]*\.pem)$", re.I)
+KEY_BLOB = re.compile(r"\.(p12|pfx|jks|keystore|p8)$", re.I)  # binary keys: no content scan, so no test-dir pass
+SECRET_FILE_OK = re.compile(r"(^|/)(debug\.keystore)$|(^|/)(test|tests|fixtures?|testdata|__fixtures__|spec)/|\.(example|sample|template)$", re.I)
+PLACEHOLDER = re.compile(r"(?i)example|placeholder|dummy|changeme|your[_-]|xxxx|^<[^>]+>$|^\$\{|redacted|fake|test[_-]?key")
+ALLOW_LINE = re.compile(r"agent-ship:\s*allow-secret")
+
+
+def push_range(root):
+    """Commits a push of HEAD would publish: those not on any canonical remote branch, else the whole history.
+
+    Anything already on the canonical remote (base branches, merged-in main from a `-s ours`
+    release merge, the branch's own pushed commits) is published and is not rescanned."""
+    c = topology(root)["canonical"]
+    if c and out(root, "for-each-ref", "--count=1", f"refs/remotes/{c}/"):
+        return f"HEAD --not --remotes={c}"
+    return "HEAD"
+
+
+def added_lines(diff):
+    """(file, added line) from `git log -p --cc` output, including lines a merge commit introduced."""
+    cur, cc, hdr = "", 1, False
+    for line in diff.splitlines():
+        if line.startswith(("diff --cc ", "diff --combined ")):
+            cur, cc, hdr = line.split(" ", 2)[2], 2, True
+        elif line.startswith("diff --git "):
+            cc, hdr = 1, True
+        elif hdr and line.startswith("+++ "):
+            cur = line[6:] if line.startswith("+++ b/") else cur
+        elif line.startswith("@@"):
+            hdr = False
+        elif not hdr and line[:cc].count("+") and "-" not in line[:cc]:
+            yield cur, line[cc:]
+
+
+def secret_scan(root, rng, allow=()):
+    hits = []
+    if has("gitleaks"):
+        p = subprocess.run(["gitleaks", "git", "--no-banner", "--redact", "--log-opts", rng, str(root)],
+                           capture_output=True, text=True, timeout=600, stdin=subprocess.DEVNULL)
+        if p.returncode == 1:
+            hits.append("gitleaks: " + (p.stdout + p.stderr).strip()[-600:])
+    names = out(root, "log", "--format=", "--name-only", "-M", "--diff-filter=ACR", *rng.split()).splitlines()
+    for f in sorted(set(names)):
+        exempt = SECRET_FILE_OK.search(f) and not (KEY_BLOB.search(f) and not f.endswith("debug.keystore"))
+        if SECRET_FILES.search(f) and not exempt and not any(fnmatch.fnmatch(f, g) for g in allow):
+            hits.append(f"secret-looking file committed: {f}")
+    for f, line in added_lines(out(root, "log", "-p", "--cc", "--format=", "--no-color", "-U0", *rng.split())):
+        if ALLOW_LINE.search(line) or any(fnmatch.fnmatch(f, g) for g in allow):
+            continue
+        for name, rx in SECRET_PATTERNS:
+            if name == "dotenv secret" and not re.search(r"(^|/)\.env", f):
+                continue
+            m = next((m for m in re.finditer(rx, line) if not PLACEHOLDER.search(m.group(0))), None)
+            if m:
+                hits.append(f"{name} in {f}")
+                break
+    return sorted(set(hits))
+
+
+# ---------------------------------------------------------------------------------------------------
+# Floor guard: block changes that lower the quality bar instead of meeting it. Diff-only: it reads
+# the lines a change adds and removes (never the whole codebase, so existing suppressions are not
+# re-litigated), reports rule + file:line, stays silent on tightening and loud on loosening, and a
+# guard that could not run never reads as clean.
+# Adapted from the floor-guard reference in addyosmani/agent-skills
+# (skills/constraint-driven-development/references/floor-guard.md), MIT License,
+# Copyright (c) 2025 Addy Osmani. Re-implemented for agent-ship's push range, with rename
+# detection, an acknowledgement trailer, and Dart/Swift/Kotlin/Go/Rust/config-file rules.
+# ---------------------------------------------------------------------------------------------------
+FLOOR_RULES = {
+    "suppression": "new checker suppression comment",
+    "skip-test": "test skipped or marked expected-to-fail",
+    "focus-test": "focused test (silently skips every other test)",
+    "test-deleted": "test file deleted and its assertions not re-homed",
+    "assert-removed": "assertions removed from tests without replacements",
+    "threshold-lowered": "coverage threshold lowered or removed",
+    "lint-downgraded": "lint rule removed, disabled or downgraded",
+    "strict-off": "strictness flag turned off",
+    "no-verify": "--no-verify added (skips git hooks)",
+    "ci-weakened": "CI step commented out, allowed to fail or disabled",
+    "stub": "unimplemented stub added to non-test code",
+}
+FLOOR_HELP = """floor guard (runs inside `ci`; standalone: `agent-ship floor`):
+  blocks a change that lowers the bar: new suppressions, skipped/focused/deleted tests, stripped
+  assertions, lowered coverage thresholds, downgraded lint, strict flags off, --no-verify, weakened CI
+  steps, unimplemented stubs. Only lines the change adds/removes count; vendored/generated paths and
+  pure renames are ignored.
+  Rules: """ + ", ".join(FLOOR_RULES) + """.
+  A deliberate one needs a trailer in a commit message of the range, with a real reason:
+      Floor-Guard-Ack: <rule>[,<rule>...][@<path-glob>] <reason>
+      e.g. Floor-Guard-Ack: skip-test@test/net/* flaky upstream API, tracked in #123
+  Per project, in ~/.agent-os/delivery/profiles.json: "floor_guard": false (off), "floor_ignore": [path globs],
+  "floor_allow": [regexes for an agreed idiom, e.g. "noqa: TCH00[12]"]; each needs a "why"."""
+FLOOR_ACK = re.compile(r"^[ \t]*Floor-Guard-Ack:[ \t]*(\S+)[ \t]*(.*?)[ \t]*$", re.M | re.I)
+FLOOR_ASSERT_MIN = 3  # net assertions removed from surviving test files before it counts
+FLOOR_SKIP = re.compile(
+    r"(^|/)(build|\.dart_tool|node_modules|Pods|Carthage|vendor|third_party|generated|\.build|DerivedData|dist|"
+    r"\.next|\.nuxt|\.svelte-kit|coverage|\.venv|venv|site-packages|\.gradle|\.git|\.fvm|\.symlinks|ephemeral)/|"
+    r"\.(g|freezed|mocks|gr|config|chopper|pb|pbgrpc|pbjson|pbenum|pbserver)\.dart$|_pb2(_grpc)?\.pyi?$|\.pb\.go$|"
+    r"\.generated\.\w+$|\.min\.(js|css)$|"
+    r"(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|pubspec\.lock|Podfile\.lock|Cargo\.lock|go\.sum|poetry\.lock|uv\.lock)$")
+FLOOR_DOCS = re.compile(r"\.(md|mdx|markdown|txt|rst|adoc|html?|svg)$|(^|/)(CHANGELOG|LICENSE|NOTICE)[^/]*$", re.I)
+FLOOR_GENERATED = re.compile(r"GENERATED CODE|DO NOT (EDIT|MODIFY)|@generated|Code generated .* DO NOT EDIT|auto-?generated", re.I)
+FLOOR_LANG = {
+    "dart": {"dart"}, "js": {"js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts", "vue", "svelte", "astro"},
+    "swift": {"swift"}, "kt": {"kt", "kts"}, "java": {"java"}, "py": {"py", "pyi"}, "go": {"go"}, "rs": {"rs"},
+}
+FLOOR_SRC = set().union(*FLOOR_LANG.values()) | {"m", "mm", "c", "cc", "cpp", "h", "hpp", "rb", "php", "cs", "scala"}
+FLOOR_TEST = re.compile(
+    r"(^|/)(test|tests|__tests__|spec|specs|integration_test|test_driver|androidTest|testFixtures|e2e|cypress)/|"
+    r"(^|/)[^/]*Tests/|(^|/)[^/]*(_test|_spec)\.\w+$|(^|/)test_[^/]*\.py$|(^|/)conftest\.py$|"
+    r"\.(test|spec|cy|e2e)\.[cm]?[jt]sx?$|(^|/)[A-Z]\w*Tests?\.(swift|kt|java|m)$")
+FLOOR_TEST_SUPPORT = re.compile(r"(^|/)(testing|test_?utils?|fakes?|mocks?|stubs?|fixtures?)/|(^|/)[^/]*(fake|mock|stub)[^/]*$", re.I)
+_L = lambda *ks: set().union(*(FLOOR_LANG[k] for k in ks))  # noqa: E731
+# (rule, file extensions or None for any non-doc file, scope: all|test|src, pattern on an added line)
+FLOOR_LINE_RULES = [(r, e, s, re.compile(p)) for r, e, s, p in [
+    ("suppression", _L("dart"), "all", r"//\s*(ignore(_for_file)?\s*:|coverage:ignore)"),
+    ("suppression", _L("js"), "all", r"(//|/\*)\s*(eslint-disable|@ts-(ignore|expect-error|nocheck)\b|biome-ignore|istanbul\s+ignore|[cv]8\s+ignore)"),
+    ("suppression", _L("swift"), "all", r"//\s*swiftlint:disable"),
+    ("suppression", _L("kt", "java"), "all", r"@Suppress(Warnings|Lint)?\b"),
+    ("suppression", _L("go"), "all", r"//\s*nolint\b"),
+    ("suppression", _L("rs"), "all", r"#!?\[allow\s*\("),
+    ("suppression", _L("py"), "all", r"#\s*(noqa\b|type:\s*ignore\b|pyright:\s*ignore\b|pylint:\s*disable\b|pragma:\s*no\s*cover\b)"),
+    ("skip-test", _L("js"), "test", r"\b(it|test|describe|context|suite|specify)\.skip\s*\(\s*['\"`]|(?<![\w.])x(it|describe|test|context|specify)\s*\("),
+    ("skip-test", _L("js"), "test-imp", r"\b(it|test|describe)\.skip\s*\(\s*\)"),
+    ("focus-test", _L("js"), "test", r"\b(it|test|describe|context|suite)\.only\s*\(|(?<![\w.])f(it|describe|context)\s*\("),
+    ("skip-test", _L("dart"), "test", r"\bskip\s*:\s*(true\b|['\"])"),
+    ("focus-test", _L("dart"), "test", r"\bsolo\s*:\s*true\b"),
+    ("skip-test", _L("swift"), "test", r"\bXCTSkipIf\s*\(\s*true\b|\bXCTSkipUnless\s*\(\s*false\b|\.disabled\s*\(\s*[)\"]"),
+    ("skip-test", _L("swift"), "test-imp", r"\bthrow\s+XCTSkip\s*\("),
+    ("skip-test", _L("kt", "java"), "test", r"@(Disabled|Ignore)\b"),
+    ("skip-test", _L("py"), "test", r"@(pytest\.mark\.(skip|xfail)\b|unittest\.skip\b)"),
+    ("skip-test", _L("py"), "test-imp", r"\bpytest\.skip\s*\(|\.skipTest\s*\("),
+    ("skip-test", _L("go"), "test-imp", r"\bt\.Skip(Now|f)?\s*\("),
+    ("skip-test", _L("rs"), "all", r"#\[ignore\b"),
+    ("stub", FLOOR_SRC, "src", r"(?i)(//|#|/\*|\*)\s*TODO\b[\s:(\w@)-]{0,24}?\bimplement(ed)?\b(?!ation)"),
+    ("stub", _L("dart"), "src", r"\bthrow\s+UnimplementedError\b"),
+    ("stub", _L("swift"), "src", r"(?i)\bfatalError\s*\(\s*\"(?![^\"]*init\(coder)[^\"]*(not\s+(yet\s+)?implemented|unimplemented|implement\s+me|\bTODO\b)"),
+    ("stub", _L("py"), "src", r"\braise\s+NotImplementedError\b"),
+    ("stub", _L("rs"), "src", r"\b(unimplemented|todo)!\s*\("),
+    ("stub", _L("js"), "src", r"(?i)\bthrow\s+new\s+Error\s*\(\s*['\"`][^'\"`]*not\s+(yet\s+)?implemented"),
+    ("stub", _L("kt"), "src", r"\bTODO\s*\(\s*\""),
+    ("stub", _L("kt", "java"), "src", r"(?i)\bthrow\s+(new\s+)?(UnsupportedOperationException|NotImplementedError)\s*\(\s*\"[^\"]*not\s+(yet\s+)?implemented"),
+    ("stub", _L("go"), "src", r"(?i)\bpanic\s*\(\s*\"[^\"]*(not\s+(yet\s+)?implemented|unimplemented)"),
+    ("no-verify", None, "all", r"(?<![\w-])--no-verify\b"),
+]]
+FLOOR_ASSERT = re.compile(r"(?<![\w.])(expect|expectLater|assert\w*|XCTAssert\w*|XCTFail|assertThat|check)\s*\(|#(expect|require)\s*\(|"
+                          r"\bassert\s+\S|\bassert\w*!\s*\(|\b(assert|require)\.\w+\s*\(|\bt\.(Error|Fatal)f?\s*\(|\.should\b|\bverify\s*\(")
+FLOOR_CI = re.compile(r"(^|/)(\.github/workflows/[^/]+|\.github/actions/.+/action|\.gitlab-ci|\.gitlab/ci/[^/]+|codemagic|"
+                      r"bitbucket-pipelines|azure-pipelines|\.circleci/config|\.travis)\.ya?ml$")
+FLOOR_CI_LINE = [re.compile(p) for p in (r"^\s*-?\s*continue-on-error\s*:\s*true\b", r"^\s*-?\s*allow_failure\s*:\s*true\b",
+                                          r"^\s*-?\s*if\s*:\s*(false|\$\{\{\s*false\s*\}\})\s*$")]
+FLOOR_CHECK_WORD = re.compile(r"(?i)\b(test|tests|lint|analy[sz]e|check|vet|clippy|tsc|mypy|ruff|eslint|flake8|pytest|jest|vitest|xcodebuild|gradlew|format|coverage)\b")
+FLOOR_SWALLOW = re.compile(r"\|\|\s*(true|exit\s+0|:)\s*($|[;#'\")])")
+FLOOR_LINT_FAMILY = [
+    ("eslint", re.compile(r"(^|/)(\.eslintrc(\.\w+)?|eslint\.config\.[cm]?[jt]s)$")), ("biome", re.compile(r"(^|/)biome\.jsonc?$")),
+    ("dart", re.compile(r"(^|/)analysis_options[\w.-]*\.ya?ml$")), ("swiftlint", re.compile(r"(^|/)\.swiftlint[\w.-]*\.ya?ml$")),
+    ("golangci", re.compile(r"(^|/)\.golangci\.ya?ml$")),
+]
+FLOOR_SEV_LINE = re.compile(r"^\s*[\"']?(@?[\w-]+(?:/[\w-]+)*)[\"']?\s*:\s*\[?\s*[\"']?(error|warn|warning|info|off|[012])[\"']?\s*([,\]}]|$)")
+FLOOR_SEV = {"error": 2, "2": 2, "warn": 1, "warning": 1, "info": 1, "1": 1, "off": 0, "0": 0}
+FLOOR_DART_SEV = {"error": 3, "warning": 2, "info": 1, "ignore": 0, "false": 0, "true": 2}
+# lint families whose YAML lists mean "rule on" when an item is removed (yaml parent key) or "rule off" when added
+FLOOR_YAML_LISTS = {"dart": ({"rules"}, set()), "swiftlint": ({"opt_in_rules", "only_rules", "analyzer_rules"}, {"disabled_rules"}),
+                    "golangci": ({"enable"}, {"disable"})}
+FLOOR_STRICT_FILE = re.compile(r"(^|/)(tsconfig[\w.-]*\.json|jsconfig[\w.-]*\.json|analysis_options[\w.-]*\.ya?ml|pyproject\.toml|\.?mypy\.ini|"
+                               r"setup\.cfg|pyrightconfig\.json|[^/]*\.xcconfig|project\.pbxproj|build\.gradle(\.kts)?|gradle\.properties)$")
+FLOOR_STRICT = re.compile(r"[\"']?\b(strict[\w-]*|noImplicit\w+|noUnused\w+|noUnchecked\w+|exactOptionalPropertyTypes|noFallthroughCasesInSwitch|"
+                          r"noPropertyAccessFromIndexSignature|useUnknownInCatchVariables|alwaysStrict|disallow_\w+|warn_unused_ignores|"
+                          r"\w*[wW]arningsAsErrors|\w*TREAT_WARNINGS_AS_ERRORS|SWIFT_STRICT_CONCURRENCY|typeCheckingMode)\b[\"']?\s*[:=]\s*[\"']?([\w-]+)")
+FLOOR_STRICT_RANK = {"false": 0, "no": 0, "0": 0, "off": 0, "none": 0, "minimal": 0, "basic": 1, "targeted": 1, "standard": 2,
+                     "true": 3, "yes": 3, "1": 3, "on": 3, "complete": 3, "strict": 3, "all": 3}
+FLOOR_COV_FILE = re.compile(r"\.(json|jsonc|ya?ml|toml|ini|cfg|conf|properties|gradle|kts|sh)$|(^|/)(Makefile|justfile|Justfile|\.coveragerc|"
+                            r"\.nycrc[\w.]*|karma\.conf\.[cm]?[jt]s|[^/]*\.config\.[cm]?[jt]s|\.c8rc[\w.]*)$")
+FLOOR_COV = re.compile(r"(?i)((?<![a-z])l?cov(erage)?[\w.\-]*?(fail[_-]?under|thresholds?|min(imum)?([_-]?\w+)?|target|bound)|fail[_-]?under|"
+                       r"min(imum)?[_-]?coverage|minBound)\D{0,40}?(?P<n>\d+(\.\d+)?)")
+FLOOR_COV_WEAK = re.compile(r"^\s*[\"']?(branches|functions|lines|statements)[\"']?\s*:\s*(\d+(\.\d+)?)")
+FLOOR_COV_WEAK_FILE = re.compile(r"(?i)(jest|vitest|vite|nyc|karma|c8|codecov|coverage)[^/]*$|(^|/)package\.json$|\.config\.[cm]?[jt]s$")
+
+
+class FloorError(Exception):
+    pass
+
+
+def _ext(path):
+    b = path.rsplit("/", 1)[-1]
+    return b.rsplit(".", 1)[-1].lower() if "." in b else ""
+
+
+def _norm(s):
+    return " ".join(s.split())
+
+
+def _unq(p, pre):
+    p = p.rstrip("\t")
+    if p.startswith('"') and p.endswith('"'):
+        p = p[1:-1].encode("latin-1", "backslashreplace").decode("unicode_escape").encode("latin-1", "replace").decode("utf-8", "replace")
+    return p[len(pre):] if p.startswith(pre) else p
+
+
+def parse_floor_diff(text):
+    """Files of a `git diff -M -U0` as dicts: old/new path, status A/D/M/R, added/removed (line no, text)."""
+    files, cur, hdr = [], None, False
+    o = n = h = 0
+    for line in text.split("\n"):
+        if line.startswith("diff --git "):
+            m = re.match(r'diff --git "?a/(.*?)"? "?b/(.*?)"?$', line)
+            cur = {"old": m.group(1) if m else "", "new": m.group(2) if m else "", "status": "M", "added": [], "removed": [], "binary": False,
+                   "hunk": {}}
+            files.append(cur)
+            hdr = True
+            continue
+        if cur is None:
+            continue
+        if line.startswith("@@"):
+            hdr, h = False, h + 1
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", line)
+            o, n = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+        elif hdr:
+            if line.startswith("new file mode"):
+                cur["status"] = "A"
+            elif line.startswith("deleted file mode"):
+                cur["status"] = "D"
+            elif line.startswith("rename from "):
+                cur["old"], cur["status"] = line[12:], "R"
+            elif line.startswith("rename to "):
+                cur["new"] = line[10:]
+            elif line.startswith("--- "):
+                if line[4:] != "/dev/null":
+                    cur["old"] = _unq(line[4:], "a/")
+            elif line.startswith("+++ "):
+                if line[4:] != "/dev/null":
+                    cur["new"] = _unq(line[4:], "b/")
+            elif line.startswith("Binary files "):
+                cur["binary"] = True
+        elif line.startswith("+"):
+            cur["added"].append((n, line[1:]))
+            cur["hunk"]["+", n] = h
+            n += 1
+        elif line.startswith("-"):
+            cur["removed"].append((o, line[1:]))
+            cur["hunk"]["-", o] = h
+            o += 1
+    for f in files:
+        if f["status"] == "D":
+            f["new"] = None
+        elif f["status"] == "A":
+            f["old"] = None
+    return files
+
+
+def _yaml_parent(lines, i):
+    """Key of the YAML mapping that holds lines[i] (0-based), '' if none."""
+    if not 0 <= i < len(lines):
+        return ""
+    me = lines[i]
+    ind, item = len(me) - len(me.lstrip()), me.lstrip().startswith("-")
+    for j in range(i - 1, -1, -1):
+        s = lines[j]
+        st = s.strip()
+        if not st or st.startswith("#"):
+            continue
+        k = len(s) - len(s.lstrip())
+        if k < ind or (k == ind and item and not st.startswith("-")):
+            m = re.match(r"^\s*-?\s*[\"']?([\w.-]+)[\"']?\s*:", s)
+            return m.group(1) if m else ""
+    return ""
+
+
+def floor_scope(root, rng=None, explicit=None):
+    """(base, target, message-log args, description) for the diff the guard judges."""
+    if explicit:
+        a, _, b = explicit.partition("..")
+        b = b.lstrip(".") or "HEAD"
+        for r in (a, b):
+            if git(root, "rev-parse", "-q", "--verify", f"{r}^{{commit}}").returncode:
+                raise FloorError(f"unknown revision {r!r}")
+        return a, b, [f"{a}..{b}"], f"{a}..{b}"
+    rng = rng or push_range(root)
+    head_parent = git(root, "rev-parse", "-q", "--verify", "HEAD^").returncode == 0
+    if rng.strip() == "HEAD":
+        # nothing is published yet: judge the last commit, not the whole codebase as "added"
+        return ("HEAD^" if head_parent else None), "HEAD", ["-1", "HEAD"], "last commit (nothing published to compare against)"
+    p = git(root, "rev-list", "--boundary", *rng.split())
+    if p.returncode:
+        raise FloorError(f"could not list {rng}: {p.stderr.strip()[-200:]}")
+    commits = [l for l in p.stdout.split() if not l.startswith("-")]
+    bounds = [l[1:] for l in p.stdout.split() if l.startswith("-")]
+    if not commits:
+        return "HEAD", "HEAD", ["-0"], "no unpublished commits"
+    if not bounds:
+        return ("HEAD^" if head_parent else None), "HEAD", ["-1", "HEAD"], "last commit (no published ancestor)"
+    if len(bounds) > 1:
+        # merged-in published branches: diff from the published commit closest to HEAD (smallest diff),
+        # so lines brought in by merging main are not judged as this change
+        def size(b):
+            s = out(root, "diff", "--shortstat", b, "HEAD")
+            return sum(int(x) for x in re.findall(r"(\d+) (?:insertion|deletion)", s))
+        bounds = sorted(bounds[:12], key=size)
+    return bounds[0], "HEAD", rng.split(), f"{rng} vs {bounds[0][:9]}"
+
+
+def floor_guard(root, rng=None, explicit=None, worktree=False, ignore=(), allow=()):
+    """Findings for changes that lower the bar. worktree=True also judges uncommitted and untracked files."""
+    base, target, msg_args, desc = floor_scope(root, rng, explicit)
+    if base is None and worktree:
+        base = "HEAD"
+    if base is None:
+        return {"desc": "root commit only: nothing to compare", "findings": [], "acks": [], "bad_acks": [], "blocking": 0}
+    if worktree:
+        target, desc = None, desc + " + working tree"
+    args = ["diff", "-M", "--no-color", "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", "-U0", base]
+    p = git(root, *args, *([target] if target else []), "--", timeout=600)
+    if p.returncode:
+        raise FloorError(f"git diff {base} failed: {p.stderr.strip()[-200:]}")
+    files = parse_floor_diff(p.stdout)
+    if worktree:
+        u = git(root, "ls-files", "-z", "--others", "--exclude-standard")
+        for f in [x for x in u.stdout.split("\0") if x]:
+            try:
+                b = (root / f).read_bytes()[:2_000_000]
+            except OSError:
+                continue
+            if b"\0" in b[:8192]:
+                continue
+            files.append({"old": None, "new": f, "status": "A", "binary": False, "removed": [], "hunk": {},
+                          "added": list(enumerate(b.decode("utf-8", "replace").splitlines(), 1))})
+    cache = {}
+
+    def content(rev, path):
+        if not path:
+            return []
+        if (rev, path) not in cache:
+            if rev is None:
+                try:
+                    cache[rev, path] = (root / path).read_text(errors="replace").splitlines()
+                except OSError:
+                    cache[rev, path] = []
+            else:
+                cache[rev, path] = out(root, "cat-file", "blob", f"{rev}:{path}").splitlines()
+        return cache[rev, path]
+
+    new_lines = lambda f: content(target, f["new"])  # noqa: E731
+    old_lines = lambda f: content(base, f["old"])  # noqa: E731
+    generated = {}
+
+    def is_generated(f):
+        k = f["new"] or f["old"]
+        if k not in generated:
+            head = (new_lines(f) if f["new"] else old_lines(f))[:15]
+            generated[k] = any(FLOOR_GENERATED.search(l) for l in head)
+        return generated[k]
+
+    def skipped(path):
+        return (not path or FLOOR_SKIP.search(path) or any(fnmatch.fnmatch(path, g) for g in ignore))
+
+    findings = []
+
+    def flag(rule, path, line, text, note=""):
+        findings.append({"rule": rule, "file": path, "line": line, "text": _norm(text)[:140], "note": note})
+
+    live = [f for f in files if not f["binary"] and not skipped(f["new"] or f["old"])]
+    # 1. added-line rules; an identical line removed elsewhere in the diff (moved code) cancels it
+    hits, gone = [], {}
+    for f in live:
+        for side, path, lines in (("+", f["new"], f["added"]), ("-", f["old"], f["removed"])):
+            if not path or not lines:
+                continue
+            ext, test = _ext(path), bool(FLOOR_TEST.search(path))
+            support = test or bool(FLOOR_TEST_SUPPORT.search(path))
+            for rule, exts, scope, rx in FLOOR_LINE_RULES:
+                if (exts is None and FLOOR_DOCS.search(path)) or (exts is not None and ext not in exts) \
+                        or (scope.startswith("test") and not test) or (scope == "src" and support):
+                    continue
+                for ln, s in lines:
+                    m = rx.search(s)
+                    if m and side == "+":
+                        hits.append((rule, f, ln, s, m.group(0), scope))
+                    elif m:
+                        for k in ((rule, _norm(s)), (id(f), f["hunk"].get(("-", ln)), rule, _norm(m.group(0)))):
+                            gone[k] = gone.get(k, 0) + 1
+    for rule, f, ln, s, tok, scope in hits:
+        # moved line (anywhere in the diff), or an edited line that keeps its marker (same hunk)
+        k = next((k for k in ((rule, _norm(s)), (id(f), f["hunk"].get(("+", ln)), rule, _norm(tok))) if gone.get(k)), None)
+        if k:
+            gone[k] -= 1
+            continue
+        if is_generated(f):
+            continue
+        if rule == "stub" and _stub_exempt(f["new"], new_lines(f), ln):
+            continue
+        if scope == "test-imp" and _conditional(new_lines(f), ln, s):
+            continue  # a skip under a condition (env, platform, availability) is a skipif, not a skipped test
+        flag(rule, f["new"], ln, s)
+    # 2. deleted tests and stripped assertions. Renames are netted out by git; assertions re-homed in other
+    # test files are netted out by count; a test deleted together with the code it tested is feature removal.
+    is_test = lambda p: bool(p and FLOOR_TEST.search(p))  # noqa: E731
+    deleted_src = {_stem(f["old"]) for f in live if f["status"] == "D" and not is_test(f["old"])}
+    count = lambda lines: [(ln, s) for ln, s in lines if FLOOR_ASSERT.search(s)]  # noqa: E731
+    orphans = [(f, count(f["removed"])) for f in live if f["status"] == "D" and is_test(f["old"]) and _stem(f["old"]) not in deleted_src]
+    orphans = [(f, r) for f, r in orphans if r]
+    kept = {f["new"]: (count(f["removed"]), count(f["added"])) for f in live if f["status"] != "D" and is_test(f["new"])}
+    lost = sum(len(r) for _, r in orphans) + sum(len(r) for r, _ in kept.values())
+    net = lost - sum(len(a) for _, a in kept.values())
+    if net > 0:
+        for f, r in orphans:
+            flag("test-deleted", f["old"], 0, f"test file deleted ({len(r)} assertions); net -{net} assertion lines across tests")
+    if net >= FLOOR_ASSERT_MIN:
+        for path, (r, a) in sorted(kept.items()):
+            if len(r) > len(a):
+                flag("assert-removed", path, r[0][0], r[0][1], f"net -{len(r) - len(a)} assertion line(s) here; net -{net} across tests")
+    # 3. config files: CI, lint, strictness, coverage
+    _floor_ci(live, new_lines, flag)
+    _floor_lint(live, new_lines, old_lines, flag)
+    _floor_strict(live, flag)
+    _floor_coverage(live, flag)
+    # acknowledgements: trailers in the range's commit messages
+    msgs = out(root, "log", "--format=%B%x00", *msg_args) if msg_args != ["-0"] else ""
+    acks, bad = [], []
+    for m in FLOOR_ACK.finditer(msgs):
+        spec, reason = m.group(1), m.group(2)
+        rules, _, glob_ = spec.partition("@")
+        rules = [r.strip().lower() for r in rules.split(",") if r.strip()]
+        unknown = [r for r in rules if r not in FLOOR_RULES]
+        if unknown or len(reason) < 10 or len(reason.split()) < 2:
+            bad.append(f"{m.group(0).strip()}  ({'unknown rule ' + ','.join(unknown) if unknown else 'needs a reason of 2+ words'})")
+            continue
+        acks.append({"rules": rules, "glob": glob_ or None, "reason": reason})
+    for x in findings:
+        a = next((a for a in acks if x["rule"] in a["rules"] and (not a["glob"] or fnmatch.fnmatch(x["file"], a["glob"]))), None)
+        x["ack"] = a["reason"] if a else None
+        if not a and any(re.search(rx, x["text"]) for rx in allow):
+            x["ack"] = "project floor_allow"
+    findings.sort(key=lambda x: (x["ack"] is not None, x["file"], x["line"], x["rule"]))
+    return {"desc": desc, "findings": findings, "acks": acks, "bad_acks": bad,
+            "blocking": sum(1 for x in findings if not x["ack"])}
+
+
+def _stem(path):
+    b = (path or "").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    return re.sub(r"(^test_|_test$|_spec$|\.test$|\.spec$|Tests?$|Spec$)", "", b).lower()
+
+
+def _conditional(lines, ln, s):
+    """The imperative skip on line ln runs only under a condition (same line or the two lines above)."""
+    cond = re.compile(r"\b(if|guard|else|elif|unless|when|case|switch)\b")
+    if cond.search(s.split("//")[0].split("#")[0]):
+        return True
+    above = [l for l in (lines[max(0, ln - 6):ln - 1] if lines else []) if l.strip() and not l.strip().startswith(("//", "#"))]
+    return any(cond.search(l) for l in above[-2:])
+
+
+def _stub_exempt(path, lines, ln):
+    """Abstract members and platform interfaces legitimately throw 'not implemented'."""
+    above = lines[max(0, ln - 7):ln - 1] if lines else []
+    if path.endswith(".py") and any(re.search(r"@(abc\.)?abstract\w*|@overload", l) for l in above[-3:]):
+        return True
+    if path.endswith(".dart") and "platform_interface" in path:
+        return True
+    for l in reversed(lines[max(0, ln - 80):ln - 1] if lines else []):
+        m = re.match(r"^\s*(abstract\s+|sealed\s+)*(class|protocol|interface)\s+(\w+)(.*)", l)
+        if m:
+            return bool(m.group(1)) or bool(re.search(r"\b(ABC|Protocol|ABCMeta|PlatformInterface|Interface)\b", m.group(4))) \
+                or bool(re.search(r"(Base|Abstract|Interface|Platform)$", m.group(3)))
+    return False
+
+
+def _floor_ci(live, new_lines, flag):
+    for f in live:
+        if not f["new"] or not FLOOR_CI.search(f["new"]):
+            continue
+        removed = {}
+        for _, s in f["removed"]:
+            removed[_norm(s)] = removed.get(_norm(s), 0) + 1
+        for ln, s in f["added"]:
+            if removed.get(_norm(s)):
+                removed[_norm(s)] -= 1
+                continue
+            if any(rx.search(s) for rx in FLOOR_CI_LINE):
+                flag("ci-weakened", f["new"], ln, s)
+            elif FLOOR_SWALLOW.search(s) and FLOOR_CHECK_WORD.search(s) and not s.lstrip().startswith("#"):
+                flag("ci-weakened", f["new"], ln, s, "failure swallowed")
+            else:
+                m = re.match(r"^\s*#+\s?(.*\S)\s*$", s)
+                if m and len(m.group(1)) > 3 and removed.get(_norm(m.group(1))):
+                    removed[_norm(m.group(1))] -= 1
+                    flag("ci-weakened", f["new"], ln, s, "step commented out")
+
+
+def _floor_lint(live, new_lines, old_lines, flag):
+    fam_of = lambda p: next((n for n, rx in FLOOR_LINT_FAMILY if p and rx.search(p)), None)  # noqa: E731
+    touched = {}
+    for f in live:
+        for p in (f["new"], f["old"]):
+            if fam_of(p):
+                touched.setdefault(fam_of(p), set()).add(f["status"])
+    deleted = set()
+    for f in live:
+        fam = fam_of(f["old"])
+        if f["status"] == "D" and fam and touched[fam] <= {"D"}:
+            flag("lint-downgraded", f["old"], 0, f"{fam} config deleted")
+            deleted.add(id(f))
+    for fam in sorted(touched):
+        fs = [f for f in live if id(f) not in deleted and (fam_of(f["new"]) == fam or fam_of(f["old"]) == fam)]
+        if fam in ("eslint", "biome"):
+            rem, add = {}, {}
+            for f in fs:
+                for ln, s in f["removed"]:
+                    m = FLOOR_SEV_LINE.match(s)
+                    if m:
+                        rem[m.group(1)] = max(rem.get(m.group(1), 0), FLOOR_SEV[m.group(2)])
+                for ln, s in f["added"]:
+                    m = FLOOR_SEV_LINE.match(s)
+                    if m and f["new"]:
+                        v = FLOOR_SEV[m.group(2)]
+                        if (m.group(1) in rem and v < rem[m.group(1)]) or (m.group(1) not in rem and v == 0 and f["status"] != "A"):
+                            flag("lint-downgraded", f["new"], ln, s)
+                        add.setdefault(m.group(1), v)
+            for f in fs:
+                for ln, s in f["removed"]:
+                    m = FLOOR_SEV_LINE.match(s)
+                    if m and FLOOR_SEV[m.group(2)] == 2 and m.group(1) not in add:
+                        flag("lint-downgraded", f["old"], ln, s, "rule removed")
+            continue
+        on_lists, off_lists = FLOOR_YAML_LISTS.get(fam, (set(), set()))
+        item = re.compile(r"^\s*-\s*[\"']?([\w-]+)[\"']?\s*(#.*)?$")
+        sev = re.compile(r"^\s*([\w-]+)\s*:\s*(error|warning|info|ignore|true|false)\s*(#.*)?$")
+        rem_items, add_items, rem_sev = [], set(), {}
+        for f in fs:
+            ol = old_lines(f)
+            for ln, s in f["removed"]:
+                m, parent = item.match(s), _yaml_parent(ol, ln - 1)
+                if m and parent in on_lists:
+                    rem_items.append((f["old"], ln, s, m.group(1)))
+                m = sev.match(s)
+                if m and fam == "dart" and parent in ("errors", "rules"):
+                    rem_sev[m.group(1)] = FLOOR_DART_SEV[m.group(2)]
+                    if m.group(2) == "true":
+                        rem_items.append((f["old"], ln, s, m.group(1)))
+        for f in fs:
+            nl = new_lines(f)
+            for ln, s in f["added"]:
+                m, parent = item.match(s), _yaml_parent(nl, ln - 1)
+                if m and parent in on_lists:
+                    add_items.add(m.group(1))
+                elif m and parent in off_lists and f["status"] != "A":
+                    flag("lint-downgraded", f["new"], ln, s, f"added to {parent}")
+                m = sev.match(s)
+                if m and fam == "dart" and parent in ("errors", "rules"):
+                    add_items.add(m.group(1))
+                    v, was = FLOOR_DART_SEV[m.group(2)], rem_sev.get(m.group(1))
+                    if (was is not None and v < was) or (was is None and m.group(2) in ("ignore", "false") and f["status"] != "A"):
+                        flag("lint-downgraded", f["new"], ln, s)
+        for path, ln, s, name in rem_items:
+            if name not in add_items:
+                flag("lint-downgraded", path, ln, s, "rule removed")
+
+
+def _floor_strict(live, flag):
+    for f in live:
+        path = f["new"] or f["old"]
+        if not FLOOR_STRICT_FILE.search(path or ""):
+            continue
+        rem, add = {}, {}
+        for side, lines in ((rem, f["removed"]), (add, f["added"])):
+            for ln, s in lines:
+                if s.lstrip().startswith(("#", "//", ";")):
+                    continue
+                for m in FLOOR_STRICT.finditer(s):
+                    r = FLOOR_STRICT_RANK.get(m.group(2).lower())
+                    if r is not None:
+                        side.setdefault(m.group(1), []).append((r, ln, s))
+        loose_json = re.search(r"\.(json|ya?ml|toml|ini|cfg)$", path)
+        for k in set(rem) | set(add):
+            r, a = sorted(rem.get(k, []), reverse=True), sorted(add.get(k, []), reverse=True)
+            for i, (rank, ln, s) in enumerate(a):
+                if i < len(r):
+                    if rank < r[i][0]:
+                        flag("strict-off", f["new"], ln, s)
+                elif rank == 0 and f["status"] != "A" and loose_json:
+                    flag("strict-off", f["new"], ln, s)
+            for rank, ln, s in r[len(a):]:
+                if rank == 3 and f["status"] != "D":
+                    flag("strict-off", f["old"], ln, s, "removed")
+
+
+def _floor_coverage(live, flag):
+    for f in live:
+        path = f["new"] or f["old"]
+        if not (FLOOR_COV_FILE.search(path) or FLOOR_CI.search(path)):
+            continue
+        weak_ok = bool(FLOOR_COV_WEAK_FILE.search(path))
+        codecov = "codecov" in path.lower()
+
+        def thresholds(lines):
+            outl = []
+            for ln, s in lines:
+                if s.lstrip().startswith(("#", "//")):
+                    continue
+                m = FLOOR_COV.search(s)
+                if m:
+                    label, num = s[:m.start("n")], float(m.group("n"))
+                elif weak_ok and FLOOR_COV_WEAK.match(s):
+                    m = FLOOR_COV_WEAK.match(s)
+                    label, num = s[:m.start(2)], float(m.group(2))
+                elif codecov and re.match(r"^\s*(target|threshold)\s*:\s*(\d+(\.\d+)?)", s):
+                    m = re.match(r"^\s*(target|threshold)\s*:\s*(\d+(\.\d+)?)", s)
+                    label, num = s[:m.start(2)], float(m.group(2))
+                else:
+                    continue
+                key = re.sub(r"[\s\"']+", "", label).lower()
+                outl.append((key, num, ln, s, codecov and "threshold" in key))
+            return outl
+        added = thresholds(f["added"])
+        for key, old, ln, s, inverse in thresholds(f["removed"]):
+            match = next((x for x in added if x[0] == key), None)
+            if match:
+                added.remove(match)
+                if (match[1] > old) if inverse else (match[1] < old):
+                    flag("threshold-lowered", f["new"], match[2], match[3], f"was {old:g}")
+            elif f["status"] != "D" and not inverse:
+                flag("threshold-lowered", f["old"], ln, s, "removed")
+
+
+def floor_lines(res):
+    """Printable report lines for a floor_guard result."""
+    lines = []
+    for x in res["findings"]:
+        loc = f"{x['file']}:{x['line']}" if x["line"] else x["file"]
+        tag = f"acked ({x['ack']})" if x["ack"] else ""
+        lines.append(f"[{x['rule']}] {loc}: {x['text']}" + (f"  ({x['note']})" if x["note"] else "") + (f"  {tag}" if tag else ""))
+    for b in res["bad_acks"]:
+        lines.append(f"ignored ack: {b}")
+    if res["blocking"]:
+        lines.append("deliberate? add to the commit message: Floor-Guard-Ack: <rule>[@<path-glob>] <reason>  (`agent-ship ci --help`)")
+    return lines
+
+
+# Measurement for tuning the floor guard: one JSON line per evaluation inside `ci`; `floor --stats` reads it.
+FLOOR_LOG = STATE / "floor-log.jsonl"
+FLOOR_LOG_MAX = int(os.environ.get("AGENT_SHIP_FLOOR_LOG_MAX") or 1_000_000)  # bytes; then rotate to .1 (one generation)
+
+
+def floor_log(root, rng, res=None, error=None):
+    """Append one floor evaluation to FLOOR_LOG. Never fails the caller."""
+    try:
+        res = res or {"findings": [], "acks": [], "bad_acks": [], "blocking": 0}
+        rec = {"ts": time.strftime("%FT%T%z"), "epoch": int(time.time()), "repo": repo_key(root), "root": str(root),
+               "branch": current_branch(root), "head": out(root, "rev-parse", "HEAD"), "range": rng,
+               "rules": sorted({x["rule"] for x in res["findings"]}),
+               "findings": [{"rule": x["rule"], "file": x["file"], "ack": x["ack"]} for x in res["findings"]][:200],
+               "acks": res["acks"], "bad_acks": len(res["bad_acks"]),
+               "blocking": res["blocking"], "blocked": bool(error) or res["blocking"] > 0}
+        if error:
+            rec["error"] = str(error)[:300]
+        FLOOR_LOG.parent.mkdir(parents=True, exist_ok=True)
+        if FLOOR_LOG.exists() and FLOOR_LOG.stat().st_size > FLOOR_LOG_MAX:
+            FLOOR_LOG.replace(FLOOR_LOG.with_name(FLOOR_LOG.name + ".1"))
+        with FLOOR_LOG.open("a") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except (Exception, SystemExit) as e:  # noqa: BLE001 - measurement must never change the ci verdict
+        print(f"note: could not record floor evaluation: {e}", file=sys.stderr)
+
+
+def floor_stats(days, as_json=False):
+    cutoff = time.time() - days * 86400
+    recs = {}
+    for p in (FLOOR_LOG.with_name(FLOOR_LOG.name + ".1"), FLOOR_LOG):  # oldest first, so a re-run replaces
+        try:
+            lines = p.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(r, dict) and r.get("epoch", 0) >= cutoff:
+                recs[(r.get("repo"), r.get("head"), r.get("range"))] = r  # re-running ci on one commit counts once
+    rules = {}
+    for r in recs.values():
+        for x in r.get("findings", []):
+            s = rules.setdefault(x.get("rule", "?"), {"findings": 0, "acked": 0, "allowed": 0, "blocked": 0, "evals": set(), "reasons": {}})
+            s["evals"].add((r.get("repo"), r.get("head"), r.get("range")))
+            s["findings"] += 1
+            ack = x.get("ack")
+            if ack is None:
+                s["blocked"] += 1
+            elif ack == "project floor_allow":
+                s["allowed"] += 1
+            else:
+                s["acked"] += 1
+                s["reasons"][ack] = s["reasons"].get(ack, 0) + 1
+    summary = {"days": days, "evaluations": len(recs), "blocked_evaluations": sum(1 for r in recs.values() if r.get("blocked")),
+               "errors": sum(1 for r in recs.values() if r.get("error")), "repos": len({r.get("repo") for r in recs.values()}),
+               "rules": {k: {"findings": s["findings"], "acked": s["acked"], "allowed": s["allowed"], "blocked": s["blocked"],
+                             "evaluations": len(s["evals"]),
+                             "top_ack_reasons": sorted(s["reasons"].items(), key=lambda kv: (-kv[1], kv[0]))[:3]}
+                         for k, s in sorted(rules.items())}}
+    if as_json:
+        print(json.dumps(summary, indent=1))
+        return 0
+    if not recs:
+        print(f"no floor evaluations recorded in the last {days} days ({FLOOR_LOG})")
+        return 0
+    print(f"floor guard, last {days} days: {summary['evaluations']} evaluation(s) in {summary['repos']} repo(s), "
+          f"{summary['blocked_evaluations']} blocked" + (f" ({summary['errors']} could not run)" if summary["errors"] else ""))
+    if not rules:
+        print("no findings")
+        return 0
+    print(f"{'rule':16} {'findings':>8} {'acked':>6} {'allowed':>7} {'blocked':>7} {'evals':>6}  top ack reasons")
+    for k, s in summary["rules"].items():
+        top = "; ".join(f"{n}x {reason[:60]}" for reason, n in s["top_ack_reasons"]) or "-"
+        print(f"{k:16} {s['findings']:>8} {s['acked']:>6} {s['allowed']:>7} {s['blocked']:>7} {s['evaluations']:>6}  {top}")
+    return 0
+
+
+def cmd_floor(a):
+    if a.stats:
+        return floor_stats(a.days, a.json)
+    root = toplevel(a.path)
+    t = topology(root)
+    prof = load_profile(t["remotes"], root)
+    if prof.get("floor_guard") is False:
+        print("floor guard: off for this project (profile \"floor_guard\": false)")
+        return 0
+    L = learned(root)
+    try:
+        res = floor_guard(root, explicit=a.range, worktree=not a.range and not a.committed,
+                          ignore=prof.get("floor_ignore", []) + L.get("floor_ignore", []), allow=prof.get("floor_allow", []) + L.get("floor_allow", []))
+    except FloorError as e:
+        print(f"floor guard could not run: {e}", file=sys.stderr)
+        return 2
+    if a.json:
+        print(json.dumps(res, indent=1))
+    else:
+        print(f"{'FAIL' if res['blocking'] else 'ok  '} floor guard ({res['desc']})" + "".join(f"\n  - {l}" for l in floor_lines(res)))
+    return 1 if res["blocking"] else 0
+
+
+def ci_record(root):
+    sha = out(root, "rev-parse", "HEAD")
+    return sha, STATE / "ci" / f"{hashlib.sha256(f'{root}|{sha}'.encode()).hexdigest()[:24]}.json"
+
+
+def run_cmd(root, c, env):
+    st = time.time()
+    try:
+        p = subprocess.run(c, shell=True, cwd=root, capture_output=True, text=True, timeout=3600, env=env,
+                           stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace")
+        rc, txt = p.returncode, p.stdout + p.stderr
+    except subprocess.TimeoutExpired:
+        rc, txt = 124, "timed out after 3600s"
+    return {"cmd": c, "rc": rc, "secs": round(time.time() - st, 1), "tail": txt[-1500:] if rc else ""}
+
+
+TRIVIAL = re.compile(r"^\s*(true|:|exit 0|echo\b.*|/usr/bin/true)\s*$")
+
+
+def on_base(root, t):
+    """HEAD is exactly a base branch tip of the canonical remote (or, with no remote, a local base branch)."""
+    head = out(root, "rev-parse", "HEAD")
+    if t["canonical"]:
+        return any(out(root, "rev-parse", "-q", "--verify", f"refs/remotes/{t['canonical']}/{b}") == head for b in t["bases"])
+    return current_branch(root) in BASES
+
+
+def known_map(L):
+    k = L.get("known_failing", {})
+    return {c: None for c in k} if isinstance(k, list) else dict(k)
+
+
+def cmd_ci(a):
+    root = toplevel(a.path)
+    t = topology(root)
+    prof = load_profile(t["remotes"], root)
+    setup, cmds, source = ci_commands(root, prof)
+    L = learned(root)
+    if a.set:
+        bad = [c for c in a.set if TRIVIAL.match(c)]
+        if bad:
+            print(f"refused: {bad} check nothing")
+            return 2
+        old = list(L.get("commands", []))
+        L.setdefault("passed", [c for c in old if c not in known_map(L)])  # newly added checks haven't passed yet
+        if a.replace:
+            removed = [c for c in old if c not in a.set]
+            new = list(a.set)
+            L.setdefault("history", []).append({"at": time.strftime("%FT%T"), "removed": removed, "reason": a.replace})
+        else:
+            new = old + [c for c in a.set if c not in old]
+            removed = []
+        L.update(commands=new, set_by="agent", at=time.strftime("%FT%T"),
+                 known_failing={c: rc for c, rc in known_map(L).items() if c in new})
+        learned(root, L)
+        print(f"checks for {repo_key(root)}: {new}" + (f"; removed {removed} ({a.replace})" if removed else ""))
+        return 0
+    if a.list:
+        print(json.dumps({"key": repo_key(root), "source": source, "setup": setup, "checks": cmds,
+                          "known_failing": known_map(L), "history": L.get("history", [])[-5:], "remote_ci": t["ci"]}, indent=1))
+        return 0 if cmds else 1
+    dirty = out(root, "status", "--porcelain")
+    if dirty:
+        print("STOP: uncommitted or untracked files; CI must test exactly the commit you push. Commit or stash first:\n" + dirty[:800])
+        return 5
+    env = {**os.environ, "CI": "1", "GIT_TERMINAL_PROMPT": "0"}
+    base_ok = on_base(root, t)
+    if a.learn and source != "profile":
+        det_setup, det = detect_checks(root)
+        prior = list(L.get("commands", []))
+        cmds = prior + [c for c in det if c not in prior and not L.get("set_by")]
+        setup = L.get("setup") or det_setup
+        if not cmds:
+            print("no checks detected; read the README/remote CI and use `agent-ship ci --set CMD...`")
+            return 1
+    known = known_map(L)
+    results, pre = [], []
+    for c in setup:
+        r = run_cmd(root, c, env)
+        print(f"{'ok  ' if r['rc'] == 0 else 'FAIL'} setup: {c} ({r['secs']}s)")
+        if r["rc"]:
+            print(r["tail"])
+            print("setup failed: this is an environment problem, not a code verdict")
+            return 6
+    if out(root, "status", "--porcelain"):
+        print("STOP: setup changed files in the repository (e.g. a lockfile); commit that first")
+        return 5
+    rng = push_range(root)
+    hits = secret_scan(root, rng, prof.get("secret_allow", []) + L.get("secret_allow", []))
+    results.append({"cmd": f"secret scan {rng}", "rc": 1 if hits else 0, "tail": "\n".join(hits)})
+    print(f"{'FAIL' if hits else 'ok  '} secret scan ({rng})" + ("".join(f"\n  - {h}" for h in hits) if hits else ""))
+    floor_bad = False
+    if prof.get("floor_guard") is False:
+        print("off  floor guard (profile \"floor_guard\": false)")
+    else:
+        try:
+            fg = floor_guard(root, rng, ignore=prof.get("floor_ignore", []) + L.get("floor_ignore", []),
+                             allow=prof.get("floor_allow", []) + L.get("floor_allow", []))
+            frc, ftail, fdesc = (1 if fg["blocking"] else 0), floor_lines(fg), fg["desc"]
+            floor_log(root, rng, fg)
+        except FloorError as e:  # could not judge the change: never reads as clean
+            frc, ftail, fdesc = 2, [f"could not run: {e}"], rng
+            floor_log(root, rng, error=e)
+        floor_bad = frc != 0
+        results.append({"cmd": "floor guard", "rc": frc, "tail": "\n".join(ftail)})
+        print(f"{'FAIL' if frc else 'ok  '} floor guard ({fdesc})" + "".join(f"\n  - {l}" for l in ftail))
+    if git(root, "rev-parse", "-q", "--verify", "HEAD^").returncode == 0:
+        ws = git(root, "diff", "--check", "HEAD^", "HEAD")
+        results.append({"cmd": "git diff --check HEAD^ HEAD", "rc": ws.returncode, "tail": ws.stdout[-800:]})
+        print(f"{'FAIL' if ws.returncode else 'ok  '} whitespace/conflict markers")
+    ran = []
+    for c in cmds:
+        r = run_cmd(root, c, env)
+        if r["rc"] == 127 and a.learn and c not in L.get("commands", []):
+            print(f"skip {c} (tool not installed)")
+            continue
+        ran.append(c)
+        results.append(r)
+        old = c in known and r["rc"] not in (0, 124, 127) and (known[c] is None or known[c] == r["rc"])
+        tag = "ok  " if r["rc"] == 0 else "old " if old else "FAIL"
+        print(f"{tag} {c} ({r['secs']}s)" + (" - failed the same way when learned; not blocking until it passes once" if old else ""))
+        if r["rc"] and not old:
+            print(r["tail"])
+        if old:
+            pre.append(c)
+    changed = out(root, "status", "--porcelain")
+    if changed:
+        results.append({"cmd": "checks left the tree unchanged", "rc": 1, "tail": changed[:800]})
+        print("FAIL checks modified files (formatters with --fix/--write, lockfile syncs); the commit itself was not what passed:\n" + changed[:800])
+    if a.learn and source != "profile":
+        prior = set(L.get("commands", []))
+        failing = {r["cmd"]: r["rc"] for r in results if r["cmd"] in ran and r["rc"]}
+        new_fail = {c: rc for c, rc in failing.items() if c not in set(L.get("passed", prior)) and c not in known}
+        passed_once = set(L.get("passed", prior))
+        regressed = [c for c in failing if c in passed_once and c not in known]
+        if new_fail and not base_ok:
+            print(f"refused: {list(new_fail)} fail here; a failure baseline is only recorded on the base branch tip "
+                  f"(learn on {t['canonical']}/{t['bases'][0] if t['bases'] else 'main'}), never on a working branch")
+            return 1
+        if regressed and not a.rebaseline:
+            print(f"refused: {regressed} passed before and fail now; that is a regression, not a baseline. Fix it "
+                  f"(or, with the user's agreement, --rebaseline REASON)")
+            return 1
+        K = {c: rc for c, rc in known.items() if c in failing or not base_ok}
+        K.update(new_fail)
+        if a.rebaseline:
+            K.update({c: failing[c] for c in regressed})
+            L.setdefault("history", []).append({"at": time.strftime("%FT%T"), "rebaselined": regressed, "reason": a.rebaseline})
+        L.update(setup=setup, commands=ran, known_failing=K,
+                 passed=sorted(set(L.get("passed", [])) | {r["cmd"] for r in results if r["cmd"] in ran and not r["rc"]}), learned_sha=out(root, "rev-parse", "HEAD"),
+                 at=time.strftime("%FT%T"), secs={r["cmd"]: r["secs"] for r in results if r["cmd"] in ran})
+        L.pop("set_by", None)
+        learned(root, L)
+        print(f"learned {len(ran)} check(s) for {repo_key(root)}; failing baseline: {list(K) or 'none'}")
+        if hits or changed or floor_bad:
+            print("fix the problems above before pushing")
+        return 0 if ran else 1
+    fixed = [c for c in known if c in cmds and any(r["cmd"] == c and r["rc"] == 0 for r in results)]
+    green = {r["cmd"] for r in results if r["cmd"] in cmds and r["rc"] == 0}
+    if base_ok and (fixed or not green <= set(L.get("passed", green))):
+        # a check that passed on the base tip is required from now on; a later failure is a regression
+        L["passed"] = sorted(set(L.get("passed", [])) | green)
+        L["known_failing"] = {c: rc for c, rc in known.items() if c not in fixed}
+        learned(root, L)
+        if fixed:
+            print(f"ratchet: {fixed} pass on the base branch now and are required from here on")
+    blocking = [r for r in results if r["rc"] and r["cmd"] not in pre]
+    ok = bool(cmds) and not blocking
+    sha, rec = ci_record(root)
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    rec.write_text(json.dumps({"sha": sha, "repo": str(root), "key": repo_key(root), "ok": ok, "at": time.strftime("%FT%T"),
+                               "source": source, "results": [{k: v for k, v in r.items() if k != "tail"} for r in results]}))
+    if not cmds:
+        print("no checks known for this project: run `agent-ship ci --learn` on the base branch (or `--set CMD...`)")
+    print(f"local CI {'PASSED' if ok else 'FAILED'} for {sha[:9]}" + (f" ({len(pre)} pre-existing failure(s) not blocking)" if pre else ""))
+    if t["canonical"] and git(root, "branch", "-r", "--contains", sha).stdout.strip().startswith(f"{t['canonical']}/"):
+        try:
+            post_status(root, sha)  # already on GitHub (CI run after the push): update the PR's check now
+        except Exception as e:  # noqa: BLE001
+            print(f"could not post local CI result: {e}", file=sys.stderr)
+    return 0 if ok else 1
+
+
+def cmd_push(a):
+    root = toplevel(a.path)
+    f = git(root, "fetch", "--all", "--prune", "--quiet", timeout=300)
+    if f.returncode:
+        print(f"STOP: fetch failed, so the remotes' state is unknown: {f.stderr.strip()[-300:]}", file=sys.stderr)
+        return 3
+    p = plan(root, a.branch, fetch=False)
+    branch, c = p["branch"], p["canonical"]
+    if not branch:
+        print("detached HEAD: name a branch with --branch", file=sys.stderr)
+        return 2
+    if p["stop"]:
+        for s in p["stop"]:
+            print("STOP:", s, file=sys.stderr)
+        return 3
+    local = out(root, "rev-parse", f"refs/heads/{branch}")
+    up = f"refs/remotes/{c}/{branch}"
+    if git(root, "rev-parse", "-q", "--verify", up).returncode == 0:
+        r = relation(root, local, up)
+        if r and r["b_only"]:
+            print(f"STOP: {c}/{branch} has {r['b_only']} commits you lack; run `agent-ship sync` and merge/rebase", file=sys.stderr)
+            return 3
+    if not a.no_ci:
+        _, rec = ci_record(root)
+        try:
+            d = json.loads(rec.read_text())
+            ok = d["ok"] and d["sha"] == local
+        except (OSError, ValueError, KeyError):
+            ok = False
+        if not ok:
+            print("STOP: no passing local CI for this commit; run `agent-ship ci` first (or --no-ci REASON)", file=sys.stderr)
+            return 4
+    targets = [(c, "canonical")]
+    if p.get("mirror_all"):
+        targets += [(m["name"], "mirror") for m in p["mirrors"]]
+    elif branch in BASES:
+        for m in p["mirrors"]:
+            if m["state"] == "stale" or not m["mechanism"]:
+                targets.append((m["name"], "mirror fast-forward"))
+    log = STATE / "pushes.tsv"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    rc = 0
+    for remote, why in targets:
+        if remote != c:
+            mr = f"refs/remotes/{remote}/{branch}"
+            rr = relation(root, mr, local) if git(root, "rev-parse", "-q", "--verify", mr).returncode == 0 else {"a_only": 0}
+            if rr is None or rr["a_only"]:
+                print(f"skip {remote}: it has commits {branch} lacks; not forcing")
+                continue
+        cmd = ["push", remote, f"refs/heads/{branch}:refs/heads/{branch}"] + (["-u"] if remote == c else [])
+        if a.dry_run:
+            print("would run: git", " ".join(cmd), f"  # {why}")
+            continue
+        os.environ["AGENT_SHIP_PUSHING"] = "1"
+        r = git(root, *cmd, timeout=600)
+        got = out(root, "ls-remote", remote, f"refs/heads/{branch}").split("\t")[0]
+        good = r.returncode == 0 and got == local
+        rc = rc or (0 if good else 1)
+        print(f"{'ok  ' if good else 'FAIL'} {remote}/{branch} = {got[:9] or '?'} ({why})" + ("" if good else f": {r.stderr.strip()[-400:]}"))
+        if good and remote == c:
+            try:
+                post_status(root, local)
+            except Exception as e:  # noqa: BLE001
+                print(f"could not post local CI result: {e}", file=sys.stderr)
+        with log.open("a") as f:
+            f.write(f"{time.strftime('%FT%T')}\t{root}\t{remote}\t{branch}\t{local[:12]}\t{'ok' if good else 'fail'}\t{why}{' no-ci:' + a.no_ci if a.no_ci else ''}\n")
+    for s in p["steps"]:
+        if s.startswith("rule:"):
+            print(s)
+    return rc
+
+
+def post_status(root, sha, wait_branch=None):
+    """Publish the local CI result for `sha` as a GitHub commit status (context agent-ship/local-ci), so PRs show
+    it without paid CI. Only the pass/fail counts are sent, never check output. Opt out per profile with
+    "report_status": false. Never fails the caller."""
+    t = topology(root)
+    rem = next((r for r in t["remotes"] if r["name"] == t["canonical"]), None)
+    if not rem or rem["host"] != "github" or t["ambiguous"] or not has("gh") or os.environ.get("AGENT_SHIP_NO_STATUS"):
+        return
+    if load_profile(t["remotes"], root).get("report_status") is False:
+        return
+    try:
+        d = json.loads((STATE / "ci" / f"{hashlib.sha256(f'{root}|{sha}'.encode()).hexdigest()[:24]}.json").read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(d, dict) or d.get("sha") != sha:
+        return
+    if wait_branch:  # called from the pre-push hook: the push hasn't happened yet
+        for _ in range(60):
+            if out(root, "ls-remote", rem["name"], f"refs/heads/{wait_branch}").split("\t")[0] == sha:
+                break
+            time.sleep(3)
+        else:
+            return
+    res = d.get("results", [])
+    bad = sum(1 for r in res if r.get("rc"))
+    desc = (f"local CI {'passed' if d.get('ok') else 'failed'}: {len(res) - bad}/{len(res)} checks ok"
+            + (f", {bad} known failure(s) tolerated" if d.get("ok") and bad else ""))
+    p = subprocess.run(["gh", "api", "-X", "POST", f"repos/{repo_slug(rem['url'])}/statuses/{sha}",
+                        "-f", f"state={'success' if d.get('ok') else 'failure'}", "-f", "context=agent-ship/local-ci",
+                        "-f", f"description={desc[:139]}"], cwd=root, capture_output=True, text=True, timeout=30,
+                       stdin=subprocess.DEVNULL)
+    print(f"{'posted' if p.returncode == 0 else 'could not post'} local CI result to GitHub for {sha[:9]}"
+          + ("" if p.returncode == 0 else f": {p.stderr.strip()[-160:]}"), file=sys.stderr)
+
+
+def cmd_post_status(a):
+    try:
+        post_status(toplevel(a.path), a.sha, a.wait)
+    except Exception as e:  # noqa: BLE001
+        print(f"could not post local CI result: {type(e).__name__}: {e}", file=sys.stderr)
+    return 0
+
+
+def release_paths(root):
+    """Default release path per project type: (kind, how, needs-explicit-ask). Test channels ship with the change;
+    production/store releases only when the user asks, and never with automatic release."""
+    paths = []
+    lanes = release_tooling(root)["fastlane_lanes"]
+    names = [l.split(":")[-1] for l in lanes]
+    ios = [n for n in names if re.search(r"testflight|beta", n, re.I)]
+    android = [n for n in names if re.search(r"internal|android_beta", n, re.I)]
+    if ios or (root / "ios").exists() or glob.glob(str(root / "*.xcodeproj")):
+        paths.append(("ios-test", f"fastlane {ios[0]}" if ios else "archive + upload to TestFlight", False))
+        paths.append(("ios-store", "App Store submission without automatic release", True))
+    if android or (root / "android").exists():
+        paths.append(("android-test", f"fastlane {android[0]}" if android else "upload AAB to the Play internal track", False))
+        paths.append(("android-store", "Play production rollout", True))
+    if (root / "wrangler.toml").exists() or (root / "wrangler.jsonc").exists():
+        paths.append(("web-preview", "wrangler deploy to the staging/preview environment", False))
+        paths.append(("web-prod", "wrangler deploy to production", True))
+    if (root / "vercel.json").exists() or (root / ".vercel").exists():
+        paths.append(("web-preview", "Vercel preview deployment (every pushed branch)", False))
+        paths.append(("web-prod", "promote to Vercel production", True))
+    if (root / "netlify.toml").exists():
+        paths.append(("web-preview", "Netlify deploy preview", False))
+    pkg = root / "package.json"
+    if pkg.exists():
+        try:
+            pj = json.loads(pkg.read_text())
+        except ValueError:
+            pj = {}
+        if not pj.get("private") and pj.get("name") and not paths:
+            paths.append(("npm", "npm publish (dry-run first; tag vX.Y.Z)", True))
+    if (root / "pyproject.toml").exists() and re.search(r"^\[project\]", (root / "pyproject.toml").read_text(errors="ignore"), re.M) and not paths:
+        paths.append(("pypi", "build, upload to TestPyPI, then PyPI on request; tag vX.Y.Z", True))
+    if (root / "Cargo.toml").exists() and "[package]" in (root / "Cargo.toml").read_text(errors="ignore") and not paths:
+        paths.append(("crates", "cargo publish --dry-run, then publish on request", True))
+    if (root / "platformio.ini").exists():
+        paths.append(("firmware", "build firmware artifact; flash/OTA a device only when asked", True))
+    if not paths and glob.glob(str(root / "Dockerfile*")):
+        paths.append(("container", "build and tag the image; push to a registry on request", True))
+    return paths
+
+
+def cmd_release(a):
+    t = topology(a.path)
+    root = Path(t["repo"])
+    print(json.dumps({"repo": t["repo"], "profile": t["profile"], "fastlane": t["release"]["fastlane_lanes"],
+                      "paths": [{"kind": k, "how": h, "only_when_asked": ask} for k, h, ask in release_paths(root)],
+                      "rules": t["rules"]}, indent=1, ensure_ascii=False))
+    return 0
+
+
+PROTECTED = set(BASES) | {"HEAD", "dev", "staging", "stage", "production", "prod", "qa", "uat", "preview", "gh-pages",
+                          "next", "beta", "alpha", "canary", "stable", "integration", "live", "demo", "sandbox"}
+
+
+def protected(b, extra=()):
+    return b in PROTECTED or b.startswith(("release/", "hotfix/", "support/", "env/", "deploy/")) or \
+        any(fnmatch.fnmatch(b, g) for g in extra)
+
+
+def first_parent(root, ref):
+    return set(out(root, "rev-list", "--first-parent", ref).split())
+
+
+def merged_branches(root, remote, base, fp, extra=()):
+    """Branches on `remote` that were merged into remote/base by a merge commit: the tip is in base's history but
+    not on its first-parent line (a branch just cut from base, or fast-forwarded into it, is never claimed).
+    Squash merges are found through gh with an exact head sha."""
+    tip = out(root, "rev-parse", f"refs/remotes/{remote}/{base}")
+    found = {}
+    for line in out(root, "for-each-ref", "--merged", f"refs/remotes/{remote}/{base}",
+                    "--format=%(refname:strip=3) %(objectname)", f"refs/remotes/{remote}/").splitlines():
+        b, _, sha = line.partition(" ")
+        if b and not protected(b, extra) and sha != tip and sha not in fp:
+            found[b] = f"merged into {base}"
+    return found
+
+
+def cmd_tidy(a):
+    root = toplevel(a.path)
+    git(root, "fetch", "--all", "--prune", "--quiet", timeout=300)
+    t = topology(root)
+    c = t["canonical"]
+    if not c or t["ambiguous"]:
+        print("no remote" if not c else "canonical remote is ambiguous; not tidying")
+        return 0
+    keep = load_profile(t["remotes"], root).get("protect_branches", [])
+    gone = {}
+    for b in t["bases"]:
+        gone.update(merged_branches(root, c, b, first_parent(root, f"refs/remotes/{c}/{b}"), keep))
+    open_prs, pr_unknown = set(), ""
+
+    def prs(state):
+        p = subprocess.run(["gh", "pr", "list", "--state", state, "--limit", "500", "--json", "headRefName,headRefOid"],
+                           cwd=root, capture_output=True, text=True, timeout=120)
+        if p.returncode:
+            raise RuntimeError(p.stderr.strip()[-200:])
+        d = json.loads(p.stdout or "[]")
+        return d if isinstance(d, list) else []
+    if next((r["host"] for r in t["remotes"] if r["name"] == c), "") == "github":
+        try:
+            if not has("gh"):
+                raise RuntimeError("gh is not installed")
+            open_prs = {pr["headRefName"] for pr in prs("open")}
+            merged_prs = prs("merged")
+        except (RuntimeError, ValueError, subprocess.TimeoutExpired) as e:
+            pr_unknown, merged_prs = str(e), []
+            print(f"note: can't list PRs ({pr_unknown}); squash merges aren't detected and open PRs aren't checked")
+            if a.apply and not a.without_pr_check:
+                print("refused: --apply needs the open-PR check (or --without-pr-check if the user accepts that)")
+                return 1
+        for pr in merged_prs:
+            b = pr["headRefName"]
+            if not protected(b, keep) and out(root, "rev-parse", "-q", "--verify", f"refs/remotes/{c}/{b}") == pr["headRefOid"]:
+                gone.setdefault(b, "PR merged at this exact commit")
+    busy = checked_out(root)
+    plan_, skipped = [], []
+    for b in sorted(gone):
+        if b in open_prs:
+            skipped.append(f"{b}: has an open PR")
+            continue
+        csha = out(root, "rev-parse", f"refs/remotes/{c}/{b}")
+        plan_.append(("remote", c, b, gone[b], csha))
+        for m in t["mirrors"]:
+            msha = out(root, "rev-parse", "-q", "--verify", f"refs/remotes/{m['name']}/{b}")
+            if not msha:
+                continue
+            mbase_ok = any(git(root, "merge-base", "--is-ancestor", msha, f"refs/remotes/{m['name']}/{x}").returncode == 0
+                           for x in t["bases"] if out(root, "rev-parse", "-q", "--verify", f"refs/remotes/{m['name']}/{x}"))
+            if msha == csha or mbase_ok:
+                plan_.append(("remote", m["name"], b, "same commit as GitHub" if msha == csha else "merged on the mirror", msha))
+            else:
+                skipped.append(f"{m['name']}/{b}: has commits {c} doesn't")
+        lsha = out(root, "rev-parse", "-q", "--verify", f"refs/heads/{b}")
+        if lsha:
+            if b in busy:
+                skipped.append(f"local {b}: checked out")
+            elif lsha == csha or git(root, "merge-base", "--is-ancestor", lsha, csha).returncode == 0:
+                plan_.append(("local", "", b, "contained in the merged branch", lsha))
+            else:
+                skipped.append(f"local {b}: has unpushed commits")
+    for x in skipped:
+        print(f"keep  {x}")
+    if not plan_:
+        print("nothing to tidy: no branches with merge evidence")
+        return 0
+    for kind, remote, b, why, sha in plan_:
+        where = f"{remote}/{b}" if kind == "remote" else f"local {b}"
+        if not a.apply:
+            print(f"would delete {where} ({why})")
+            continue
+        if kind == "remote":  # the lease refuses if someone pushed to the branch since we looked
+            r = git(root, "push", f"--force-with-lease=refs/heads/{b}:{sha}", remote, f":refs/heads/{b}", timeout=120)
+            if r.returncode and not git(root, "ls-remote", "--heads", remote, f"refs/heads/{b}").stdout.strip():
+                print(f"gone    {where} (already deleted)")
+                continue
+        else:
+            r = git(root, "update-ref", "-d", f"refs/heads/{b}", sha)
+            if r.returncode == 0:
+                git(root, "config", "--remove-section", f"branch.{b}")
+        print(f"{'deleted' if r.returncode == 0 else 'FAILED '} {where}" + ("" if r.returncode == 0 else f": {r.stderr.strip()[-200:]}"))
+    if not a.apply:
+        print("(dry run; deleting remote branches needs the user's request, then `agent-ship tidy --apply`)")
+    return 0
+
+
+def cmd_scorecard(a):
+    days = a.days
+    cutoff = time.time() - days * 86400
+    rows = {}
+    for f in (STATE / "ci").glob("*.json"):
+        try:
+            d = json.loads(f.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict) or f.stat().st_mtime < cutoff:
+            continue
+        r = rows.setdefault(d.get("key") or d.get("repo") or "?", {"ci": 0, "ci_ok": 0, "secs": [], "push": 0, "push_fail": 0})
+        r["ci"] += 1
+        r["ci_ok"] += bool(d.get("ok"))
+        r["secs"].append(sum(x.get("secs", 0) for x in d.get("results", [])))
+    log = STATE / "pushes.tsv"
+    if log.exists():
+        for line in log.read_text().splitlines():
+            f = line.split("\t")
+            if len(f) < 6 or not f[1]:
+                continue
+            try:
+                when = time.mktime(time.strptime(f[0], "%Y-%m-%dT%H:%M:%S"))
+            except ValueError:
+                continue
+            if when < cutoff:
+                continue
+            try:
+                key = repo_key(Path(f[1]))
+            except SystemExit:
+                key = Path(f[1]).name
+            r = rows.setdefault(key, {"ci": 0, "ci_ok": 0, "secs": [], "push": 0, "push_fail": 0})
+            r["push"] += 1
+            r["push_fail"] += f[5] != "ok"
+    if not rows:
+        print(f"no CI runs or pushes recorded in the last {days} days")
+        return 0
+    print(f"{'project':40} {'CI runs':>7} {'pass%':>6} {'median CI':>10} {'pushes':>7} {'failed':>6}")
+    for k, r in sorted(rows.items()):
+        med = sorted(r["secs"])[len(r["secs"]) // 2] if r["secs"] else 0
+        pr = f"{100 * r['ci_ok'] // r['ci']}%" if r["ci"] else "-"
+        print(f"{k[:40]:40} {r['ci']:>7} {pr:>6} {str(round(med)) + 's':>10} {r['push']:>7} {r['push_fail']:>6}")
+    return 0
+
+
+GIT_VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
+PUSH_VALUE_OPTS = {"-o", "--push-option", "--repo", "--receive-pack", "--exec"}
+WRAPPERS = {"sudo", "command", "time", "nice", "nohup", "env", "exec", "rtk", "proxy", "xargs"}
+
+
+def _unquoted_newlines_to_semicolons(cmd):
+    out, q, i = [], None, 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if ch == "\\" and q != "'" and i + 1 < len(cmd):
+            out.append(cmd[i:i + 2]); i += 2; continue
+        if q:
+            q = None if ch == q else q
+        elif ch in "'\"":
+            q = ch
+        elif ch == "\n":
+            ch = " ; "
+        out.append(ch); i += 1
+    return "".join(out)
+
+
+def _strip_heredoc_bodies(cmd):
+    lines, keep, end = cmd.split("\n"), [], None
+    for line in lines:
+        if end is not None:
+            if line.strip() == end:
+                end = None
+            continue
+        keep.append(line)
+        m = re.search(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)['\"]?", line)
+        if m:
+            end = m.group(1)
+    return "\n".join(keep)
+
+
+def _tokens(text):
+    lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
+    lex.whitespace_split = True
+    return list(lex)
+
+
+def segments(cmd):
+    """Split a shell command into simple commands (lists of words), dropping redirections.
+    Heredoc bodies are data, not commands. Unparseable lines are skipped, not trusted."""
+    cmd = _strip_heredoc_bodies(cmd)
+    try:
+        toks = _tokens(_unquoted_newlines_to_semicolons(cmd))
+    except ValueError:
+        toks = []
+        for line in cmd.split("\n"):
+            try:
+                toks += _tokens(line) + [";"]
+            except ValueError:
+                continue
+    segs, cur, skip = [], [], False
+    for tok in toks:
+        if skip:
+            skip = False
+            continue
+        if set(tok) <= set("<>&") and ("<" in tok or ">" in tok):
+            skip = True  # the redirection target (file, fd or heredoc word) is not an argument
+            if cur and cur[-1].isdigit():
+                cur.pop()
+            continue
+        if set(tok) <= set(";&|()"):
+            segs.append(cur)
+            cur = []
+        else:
+            cur.append(tok)
+    segs.append(cur)
+    return [x for x in segs if x]
+
+
+def parse_push(w, cwd):
+    """Return (where, args) for a `git ... push ...` command, else None."""
+    i = 0
+    while i < len(w) and (re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", w[i]) or w[i] in WRAPPERS or (i and w[i - 1] == "env" and w[i].startswith("-"))):
+        i += 1
+    if i >= len(w) or os.path.basename(w[i]) != "git":
+        return None
+    i += 1
+    where = cwd
+    while i < len(w) and w[i].startswith("-"):
+        if w[i] == "-C" and i + 1 < len(w):
+            where = os.path.join(where, os.path.expanduser(w[i + 1]))
+        i += 2 if w[i] in GIT_VALUE_OPTS else 1
+    if i >= len(w) or w[i] != "push":
+        return None
+    return where, w[i + 1:]
+
+
+def cmd_guard(a):
+    """Claude PreToolUse hook. Exit 2 blocks the command; anything unclear is allowed, but a guard crash on a
+    command that pushes blocks it (a broken guard must not silently stop guarding)."""
+    try:
+        ev = json.load(sys.stdin)
+    except ValueError:
+        return 0
+    if not isinstance(ev, dict) or not isinstance(ev.get("tool_input") or {}, dict):
+        return 0
+    try:
+        return _guard(ev)
+    except Exception as e:  # noqa: BLE001
+        cmd = (ev.get("tool_input") or {}).get("command", "")
+        if re.search(r"\bgit\b.*\bpush\b", cmd, re.S) and "stash push" not in cmd:
+            return block(f"guard crashed ({type(e).__name__}: {e}); not letting an unchecked push through")
+        return 0
+
+
+def _guard(ev):
+    cmd = (ev.get("tool_input") or {}).get("command", "")
+    if "push" not in cmd or os.environ.get("AGENT_SHIP_GUARD") == "off":
+        return 0
+    cwd = ev.get("cwd") or os.getcwd()
+    try:
+        segs = segments(cmd)
+    except ValueError:
+        return 0
+    for w in segs:
+        if w[:1] == ["cd"] and len(w) > 1:
+            cwd = os.path.join(cwd, os.path.expanduser(w[1]))
+            continue
+        hit = parse_push(w, cwd)
+        if not hit:
+            continue
+        where, args = hit
+        try:
+            t = topology(where)
+        except BaseException:
+            return 0
+        root = Path(t["repo"])
+        names = [r["name"] for r in t["remotes"]]
+        pos, flags, remote, i = [], [], None, 0
+        while i < len(args):
+            x = args[i]
+            if x.split("=", 1)[0] in PUSH_VALUE_OPTS:
+                if x.split("=", 1)[0] == "--repo":
+                    remote = x.split("=", 1)[1] if "=" in x else (args[i + 1] if i + 1 < len(args) else None)
+                i += 1 if "=" in x else 2
+                continue
+            (flags if x.startswith("-") and x != "-" else pos).append(x)
+            i += 1
+        if remote is None and pos and pos[0] in names:
+            remote = pos.pop(0)
+        elif remote is None and pos and ("/" in pos[0] or ":" in pos[0] and "@" in pos[0]):
+            continue  # a URL, not a configured remote: leave to the user
+        br = current_branch(root)
+        if remote is None:
+            remote = out(root, "config", f"branch.{br}.pushRemote") or out(root, "config", "remote.pushDefault") \
+                or out(root, "config", f"branch.{br}.remote") or ("origin" if "origin" in names else None)
+        if remote not in names:
+            continue
+        short = "".join(f[1:] for f in flags if f.startswith("-") and not f.startswith("--"))
+        long_ = {f.split("=", 1)[0] for f in flags if f.startswith("--")}
+        every = bool(long_ & {"--all", "--mirror", "--branches", "--prune"}) or any("*" in r for r in pos)
+        forced = "f" in short or "d" in short or bool(long_ & {"--force", "--force-with-lease", "--delete", "--mirror", "--prune"}) \
+            or any(r.startswith("+") or r.startswith(":") for r in pos)
+        dst = []
+        for r in pos or [br]:
+            d = r.lstrip("+").split(":")[-1].replace("refs/heads/", "")
+            dst.append(br if d in ("HEAD", "@", "") else d)
+        if every:
+            dst = list(BASES)
+        deploy = next((r["host"] == "deploy" for r in t["remotes"] if r["name"] == remote), False)
+        if forced and not deploy and any(d in BASES for d in dst):
+            return block(f"force/delete push touching base branch {sorted(set(dst) & set(BASES))} on {remote}. Base branches are never forced or deleted.")
+        if remote in t["others"]:
+            continue
+        if remote != t["canonical"] and t["canonical"] and not t["ambiguous"]:
+            for r, d in zip(pos or [br], dst):
+                src = r.lstrip("+").split(":")[0] or d
+                local = out(root, "rev-parse", "-q", "--verify", "HEAD" if src in ("HEAD", "@") else src)
+                canon = out(root, "rev-parse", "-q", "--verify", f"refs/remotes/{t['canonical']}/{d}")
+                if every or not ((d in BASES or t.get("mirror_all")) and local and local == canon and not forced):
+                    return block(f"{remote} is a mirror of {t['canonical']} ({t['canonical_reason']}). Push to {t['canonical']}; "
+                                 f"a mirror only gets a base branch fast-forwarded to the exact canonical commit. Use `agent-ship push`.")
+    return 0
+
+
+ZERO = "0" * 40
+
+
+def cmd_prepush(a):
+    """git pre-push hook for every repo (global core.hooksPath): the same rules as the Claude guard, for pushes made
+    by any tool or by hand. A crash warns and lets the push through; `git push --no-verify` skips it on purpose."""
+    lines = sys.stdin.read().splitlines()
+    try:
+        return 3 if _prepush(a.remote, lines, a.url) == 2 else 0  # 3 = rule violation; 2 is argparse's usage error
+    except Exception as e:  # noqa: BLE001
+        print(f"agent-ship pre-push: check crashed ({type(e).__name__}: {e}); push not checked", file=sys.stderr)
+        return 0
+
+
+def url_key(u):
+    """One spelling per repository: ssh/https/trailing slash/.git/case/file:// all compare equal."""
+    u = clean_url(u.strip())
+    if u.startswith("file://"):
+        u = u[7:]
+    if u.startswith(("/", ".", "~")):
+        p = os.path.realpath(os.path.expanduser(u.rstrip("/")))
+        return p[:-4] if p.endswith(".git") else p
+    m = re.search(r"^(?:[\w+]+://)?(?:[^@/]+@)?([^/:]+)(?::\d+)?[:/]", u)
+    return f"{(m.group(1) if m else '').lower()}/{repo_slug(u)}"
+
+
+def _prepush(remote, lines, url=None):
+    if os.environ.get("AGENT_SHIP_GUARD") == "off" or out(".", "rev-parse", "--is-inside-work-tree") != "true":
+        return 0  # bare repos (pushing from a server-side copy) aren't ours to judge
+    root = toplevel(".")
+    t = topology(root)
+    names = [r["name"] for r in t["remotes"]]
+    if remote not in names:  # `git push <url>`: judge it as the configured remote with that URL
+        u = url_key(url or remote)
+        remote = next((r["name"] for r in t["remotes"] if u in {url_key(x) for x in [r["url"], *r["push_urls"]]}), None)
+        if remote is None:
+            return 0
+    host = next(r["host"] for r in t["remotes"] if r["name"] == remote)
+    if host == "deploy":
+        return 0  # deploy hosts are force-pushed by design
+    other = remote in t["others"]  # a fork's upstream, a backup, an unmatched second remote: base rule only
+    canon = t["canonical"] if not t["ambiguous"] else None
+    for line in lines:
+        f = line.split()
+        if len(f) != 4 or not f[2].startswith("refs/heads/"):
+            continue
+        lsha, rref, rsha = f[1], f[2], f[3]
+        b = rref[len("refs/heads/"):]
+        delete = lsha == ZERO
+        ff = rsha == ZERO or (not delete and git(root, "merge-base", "--is-ancestor", rsha, lsha).returncode == 0)
+        if b in BASES and (delete or not ff):
+            return block(f"{'deleting' if delete else 'overwriting commits on'} base branch {b} on {remote} (fetch and rebase if someone else pushed). Base branches are never "
+                         f"forced or deleted. (deliberate, user-approved: git push --no-verify)")
+        if canon and remote != canon and not delete and not other:
+            c = out(root, "rev-parse", "-q", "--verify", f"refs/remotes/{canon}/{b}")
+            if not ff or not c or git(root, "merge-base", "--is-ancestor", lsha, c).returncode:
+                return block(f"{remote} mirrors {canon}: push {b} to {canon} first, then the same commit here "
+                             f"(`agent-ship push` does both, fast-forward only).")
+        if remote == canon and not delete and not other:
+            rec = STATE / "ci" / f"{hashlib.sha256(f'{root}|{lsha}'.encode()).hexdigest()[:24]}.json"
+            try:
+                ok = json.loads(rec.read_text()).get("ok")
+            except (OSError, ValueError, AttributeError):
+                ok = False
+            if not ok:
+                print(f"agent-ship pre-push: note: no local CI pass for {lsha[:9]} ({b}); agents run `agent-ship ci` first",
+                      file=sys.stderr)
+            if rec.exists() and not os.environ.get("AGENT_SHIP_PUSHING"):  # agent-ship push posts it itself
+                subprocess.Popen([sys.argv[0], "post-status", lsha, str(root), "--wait", b], cwd=root,
+                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 start_new_session=True)
+    return 0
+
+
+def block(msg):
+    print(f"agent-ship guard: {msg} (bypass for a deliberate human-approved push: AGENT_SHIP_GUARD=off)", file=sys.stderr)
+    return 2
+
+
+def show(t, as_json):
+    if as_json:
+        print(json.dumps(t, indent=1))
+        return
+    print(f"repo       {t['repo']}")
+    for r in t["remotes"]:
+        tag = " (canonical)" if r["name"] == t["canonical"] else ""
+        print(f"remote     {r['name']:8} {r['host']:7} {r['url']}{tag}")
+    print(f"canonical  {t['canonical']}: {t['canonical_reason']}")
+    for m in t["mirrors"]:
+        d = ", ".join(f"{b} -{x['behind']}/+{x['ahead']}" for b, x in m["drift"].items()) or "no shared base branches"
+        mech = m["mechanism"][0]["file"] if m["mechanism"] else "none"
+        print(f"mirror     {m['name']}: {m['state']} ({d}); mirror job: {mech}")
+    print(f"ci         {', '.join(t['ci']) or 'none'}")
+    if t["release"]["fastlane_lanes"]:
+        print(f"release    fastlane: {', '.join(l.split(':')[-1] for l in t['release']['fastlane_lanes'])}")
+    if t["profile"]:
+        print(f"profile    {t['profile']}")
+    print(f"fetched    {'never' if t['fetch_age_hours'] is None else str(t['fetch_age_hours']) + 'h ago'}"
+          + ("" if t.get("fetched_now") else "  (cached refs: drift is unverified; use --fetch or `plan`)"))
+    for w in t["warnings"]:
+        print(f"warning    {w}")
+    for s in t.get("stop", []):
+        print(f"STOP       {s}")
+    for s in t.get("steps", []):
+        print(f"step       {s}")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    for name in ("topology", "plan", "sync", "ci", "push", "release"):
+        s = sp.add_parser(name, **({"epilog": FLOOR_HELP, "formatter_class": argparse.RawDescriptionHelpFormatter} if name == "ci" else {}))
+        s.add_argument("path", nargs="?", default=".")
+        if name in ("topology", "plan"):
+            s.add_argument("--json", action="store_true")
+        if name == "topology":
+            s.add_argument("--fetch", action="store_true")
+        if name in ("plan", "push"):
+            s.add_argument("--branch")
+        if name == "ci":
+            s.add_argument("--list", action="store_true")
+            s.add_argument("--learn", action="store_true", help="run every detected check and remember the ones that work (failing ones become the ratchet baseline)")
+            s.add_argument("--set", nargs="+", metavar="CMD", help="add these check commands for this project")
+            s.add_argument("--replace", metavar="REASON", help="with --set: replace the list (removals are logged)")
+            s.add_argument("--rebaseline", metavar="REASON", help="with --learn: accept checks that regressed as baseline (user's call)")
+        if name == "push":
+            s.add_argument("--no-ci", metavar="REASON")
+            s.add_argument("--dry-run", action="store_true")
+    sp.add_parser("guard")
+    fl = sp.add_parser("floor", help="does this change lower the quality bar? (read-only; also runs inside ci)",
+                       epilog=FLOOR_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+    fl.add_argument("path", nargs="?", default=".")
+    fl.add_argument("--range", metavar="A..B", help="judge exactly this commit range (default: unpublished commits + working tree)")
+    fl.add_argument("--committed", action="store_true", help="ignore uncommitted and untracked changes")
+    fl.add_argument("--json", action="store_true")
+    fl.add_argument("--stats", action="store_true", help="summarise recorded `ci` floor evaluations per rule: findings, acked, blocked, top ack reasons")
+    fl.add_argument("--days", type=int, default=30, help="with --stats: look back N days (default 30)")
+    ps =sp.add_parser("post-status", help="post the local CI result for SHA to GitHub as a commit status")
+    ps.add_argument("sha")
+    ps.add_argument("path", nargs="?", default=".")
+    ps.add_argument("--wait", metavar="BRANCH", help="first wait until the remote branch is at SHA")
+    pp = sp.add_parser("prepush", help="git pre-push hook (installed globally)")
+    pp.add_argument("remote")
+    pp.add_argument("url", nargs="?")
+    td = sp.add_parser("tidy", help="delete branches already merged (dry run unless --apply)")
+    td.add_argument("path", nargs="?", default=".")
+    td.add_argument("--apply", action="store_true")
+    td.add_argument("--without-pr-check", action="store_true", help="allow --apply when GitHub PRs can't be listed")
+    sc = sp.add_parser("scorecard", help="per-project CI pass rate, CI time, pushes")
+    sc.add_argument("--days", type=int, default=7)
+    a = ap.parse_args()
+    if a.cmd == "topology":
+        show(topology(a.path, a.fetch), a.json)
+    elif a.cmd == "plan":
+        p = plan(a.path, a.branch)
+        show(p, a.json)
+        return 3 if p["stop"] else 0
+    else:
+        return {"sync": cmd_sync, "ci": cmd_ci, "push": cmd_push, "release": cmd_release, "guard": cmd_guard, "prepush": cmd_prepush, "post-status": cmd_post_status,
+                "tidy": cmd_tidy, "scorecard": cmd_scorecard, "floor": cmd_floor}[a.cmd](a)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)

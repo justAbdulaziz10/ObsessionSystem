@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+
+import sys
+import os
+import json
+import hashlib
+import subprocess
+import datetime
+from pathlib import Path
+
+HOME = Path.home()
+BASE = HOME / ".agent-os/team" / "repos"
+
+def run(*args):
+    return subprocess.check_output(args, text=True).strip()
+
+def repo_identity():
+    try:
+        root = Path(run("git", "rev-parse", "--show-toplevel")).resolve()
+        common = run("git", "rev-parse", "--git-common-dir")
+        common_path = Path(common)
+        if not common_path.is_absolute():
+            common_path = (root / common_path).resolve()
+        else:
+            common_path = common_path.resolve()
+        key = hashlib.sha256(str(common_path).encode()).hexdigest()[:16]
+        return root, common_path, key
+    except Exception:
+        print("agent-team must be run inside a Git repository.", file=sys.stderr)
+        sys.exit(1)
+
+def repo_dir():
+    root, common, key = repo_identity()
+    d = BASE / key
+    d.mkdir(parents=True, exist_ok=True)
+    meta = d / "repo.json"
+    if not meta.exists():
+        meta.write_text(json.dumps({
+            "git_common_dir": str(common),
+            "first_seen_root": str(root)
+        }, indent=2) + "\n")
+    return d
+
+def current_dir(require=True):
+    d = repo_dir()
+    pointer = d / "current"
+    if not pointer.exists():
+        if require:
+            print("No active team task. Run: agent-team init <task>", file=sys.stderr)
+            sys.exit(1)
+        return None
+    task_id = pointer.read_text().strip()
+    path = d / "tasks" / task_id
+    if require and not path.exists():
+        print("Current task directory is missing.", file=sys.stderr)
+        sys.exit(1)
+    return path
+
+def cmd_init(args):
+    d = repo_dir()
+    tasks = d / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+
+    if args:
+        task = " ".join(args)
+    elif not sys.stdin.isatty():
+        task = sys.stdin.read().strip()
+    else:
+        print("Usage: agent-team init <task>", file=sys.stderr)
+        sys.exit(1)
+
+    now = datetime.datetime.now()
+    task_id = now.strftime("%Y%m%d-%H%M%S")
+    t = tasks / task_id
+    t.mkdir(parents=True)
+
+    root, common, key = repo_identity()
+
+    (t / "task.md").write_text(
+        "# Task\n\n" + task + "\n"
+    )
+
+    (t / "meta.json").write_text(json.dumps({
+        "task_id": task_id,
+        "created_at": now.isoformat(),
+        "repo_root_when_created": str(root),
+        "git_common_dir": str(common),
+        "status": "active"
+    }, indent=2) + "\n")
+
+    (d / "current").write_text(task_id + "\n")
+
+    print(str(t))
+
+def cmd_current():
+    print(current_dir())
+
+def cmd_task():
+    print((current_dir() / "task.md").read_text(), end="")
+
+def cmd_write(args):
+    if len(args) != 1:
+        print("Usage: agent-team write <name>", file=sys.stderr)
+        sys.exit(1)
+
+    name = args[0]
+    if not all(c.isalnum() or c in "-_" for c in name):
+        print("Invalid document name.", file=sys.stderr)
+        sys.exit(1)
+
+    body = sys.stdin.read()
+    path = current_dir() / f"{name}.md"
+    path.write_text(body)
+    print(path)
+
+def cmd_read(args):
+    if len(args) != 1:
+        print("Usage: agent-team read <name>", file=sys.stderr)
+        sys.exit(1)
+
+    path = current_dir() / f"{args[0]}.md"
+    if not path.exists():
+        print(f"Missing: {path}", file=sys.stderr)
+        sys.exit(1)
+
+    print(path.read_text(), end="")
+
+def cmd_status():
+    path = current_dir()
+    print(f"Task board: {path}")
+    print()
+
+    for f in sorted(path.iterdir()):
+        if f.is_file():
+            print(f"{f.name:24} {f.stat().st_size:8} bytes")
+
+def cmd_done():
+    path = current_dir()
+    meta_path = path / "meta.json"
+    data = json.loads(meta_path.read_text())
+    data["status"] = "done"
+    data["completed_at"] = datetime.datetime.now().isoformat()
+    meta_path.write_text(json.dumps(data, indent=2) + "\n")
+    print("Task marked done.")
+
+def main():
+    if len(sys.argv) < 2:
+        print("""agent-team
+
+Commands:
+  agent-team init <task>
+  agent-team current
+  agent-team task
+  agent-team write <name>
+  agent-team read <name>
+  agent-team status
+  agent-team done
+""")
+        return
+
+    cmd = sys.argv[1]
+    args = sys.argv[2:]
+
+    if cmd == "init":
+        cmd_init(args)
+    elif cmd == "current":
+        cmd_current()
+    elif cmd == "task":
+        cmd_task()
+    elif cmd == "write":
+        cmd_write(args)
+    elif cmd == "read":
+        cmd_read(args)
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "done":
+        cmd_done()
+    else:
+        print(f"Unknown command: {cmd}", file=sys.stderr)
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()

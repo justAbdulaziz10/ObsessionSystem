@@ -1,0 +1,22 @@
+#!/bin/sh
+# AgentOS global git hooks (core.hooksPath). Runs the AgentOS pre-push check, then the repo's own hook from
+# <git-common-dir>/hooks, so per-repo hooks (pre-commit, git-lfs, server hooks in bare repos) keep working.
+# Undo: git config --global --unset core.hooksPath
+name=$(basename "$0")
+repo_hook="$(git rev-parse --git-common-dir 2>/dev/null)/hooks/$name"
+if [ "$name" = pre-push ]; then
+  tmp=$(mktemp "${TMPDIR:-/tmp}/agentos-prepush.XXXXXX") || {
+    [ -x "$repo_hook" ] && exec "$repo_hook" "$@"   # can't buffer stdin: skip our check, never the repo's hook
+    exit 0
+  }
+  trap 'rm -f "$tmp"' EXIT INT TERM HUP
+  cat > "$tmp"
+  if [ -x "$HOME/bin/agent-ship" ]; then
+    "$HOME/bin/agent-ship" prepush "$@" < "$tmp"
+    [ $? -eq 3 ] && exit 1   # 3 = rule violation; any other failure of the tool never blocks
+  fi
+  [ -x "$repo_hook" ] && { "$repo_hook" "$@" < "$tmp"; exit $?; }
+  exit 0
+fi
+[ -x "$repo_hook" ] && exec "$repo_hook" "$@"
+exit 0

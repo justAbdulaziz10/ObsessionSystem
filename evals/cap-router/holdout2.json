@@ -1,0 +1,10 @@
+[
+  {"task": "Push notifications stopped arriving on Android 14 devices, find out why", "domain": "engineering", "skills_any": ["push-notifications", "android"], "mcps_any": []},
+  {"task": "Add Arabic localization and RTL support to the Flutter app", "domain": "engineering", "skills_any": ["flutter-setup-localization", "flutter-"], "mcps_any": ["dart"]},
+  {"task": "Convert this Swift completion-handler networking code to async/await", "domain": "engineering", "skills_any": ["swift-concurrency"], "mcps_any": ["xcode"]},
+  {"task": "Turn the Q3 board report into a short slide deck", "domain": "document", "skills_any": ["report-to-slides", "slide", "presentation"], "mcps_any": []},
+  {"task": "Build a revenue forecast model in Excel for next year", "domain": "data", "skills_any": ["forecast", "excel", "spreadsheet", "three-statement"], "mcps_any": []},
+  {"task": "Review this pull request for security vulnerabilities", "domain": "engineering", "skills_any": ["security", "code-review"], "mcps_any": []},
+  {"task": "What's on my calendar tomorrow?", "domain": "general", "skills_any": [], "mcps_any": ["google-calendar"]},
+  {"task": "Write the App Store description and keywords for our meditation app", "domain": "writing", "skills_any": ["app-store-optimization", "app-store"], "mcps_any": []}
+]

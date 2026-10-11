@@ -1,0 +1,825 @@
+#!/usr/bin/python3
+"""agent-recall: one ranked index over AgentOS memory.
+
+Sources (files stay the source of truth; the index is fully rebuildable):
+  ~/.agent-os/{LESSONS,DECISIONS,IMPROVEMENTS}.md  one entry per "## " heading
+  ~/.agent-os/SYSTEM.md                            one entry per "# N." section
+  ~/.claude*/projects/*/memory/*.md                one entry per memory file
+  agentos.sqlite failures table (agent-fail)       one entry per row
+
+Usage:
+  agent-recall "<query>" [--k 5] [--kind lessons,decisions,...] [--account claude1|claude2]
+               [--project SUBSTR] [--all] [--json] [--no-reindex] [--aliases|--no-aliases]
+  agent-recall index [--aliases|--no-llm] [--aliases-max 300]
+                          rebuild now (also happens automatically when a source changed;
+                          the automatic refresh never calls a model)
+  agent-recall status     show index size, freshness and alias-cache coverage
+
+Write-time aliases (experiment, change 20261010-202747-b8cde9): `index --aliases` asks Haiku
+(`claude -p`, no tools, AGENTOS_DISTILL=1) for 6 alternative search phrasings per entry it has
+not seen (cache ~/.agent-os/recall/aliases.json keyed by entry key + content hash, mode 600),
+at most --aliases-max entries per run, 8 entries per call. The aliases are indexed as an extra
+FTS column. Queries never call a model. Aliases are ON by default (ALIASES_DEFAULT); turn
+them off with --no-aliases / `index --no-llm` or AGENT_RECALL_ALIASES=0. Evidence: evals/recall.
+
+Ranking: FTS5 BM25, porter stemming, query words OR-ed (heading x5, abstract x3, body x1)
+x recency decay (half-life 180 d,
+floor 0.35). Entries whose `Invalid at:` is past, or that a newer entry `Supersedes:`,
+are hidden unless --all. Output is a pointer (path:line, heading, one-line abstract);
+read the file for the full text. Lexical: a query must share (stemmed) words with the entry
+or with its cached write-time aliases (x5). A hand thesaurus was tried and removed: +0 on a
+paraphrase holdout (evals/recall). Aliases: blind paraphrase recall@5 0% -> 28%.
+
+Ranking idea ("eligibility before relevance, then relevance x weight x recency") adapted
+from tigerless-labs/agent-memory core/recall.py (MIT). No code copied.
+"""
+
+import argparse
+import fcntl
+import glob
+import hashlib
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime, timezone
+
+VERSION = "2"  # bump to force a reindex when parsing changes (2: aliases column)
+
+HOME = os.environ.get("AGENT_RECALL_HOME") or os.path.expanduser("~")
+AOS = os.path.join(HOME, ".agent-os")
+DB = os.environ.get("AGENT_RECALL_DB") or os.path.join(AOS, "v2", "db", "agentos.sqlite")
+ALIAS_FILE = os.environ.get("AGENT_RECALL_ALIAS_FILE") or os.path.join(AOS, "recall", "aliases.json")
+ALIAS_LOG = os.path.join(AOS, "recall", "aliases.log")
+
+FILE_KINDS = [
+    ("lessons", "LESSONS.md", "##"),
+    ("decisions", "DECISIONS.md", "##"),
+    ("improvements", "IMPROVEMENTS.md", "##"),
+    ("system", "SYSTEM.md", "#N"),
+]
+ACCOUNTS = [("claude1", ".claude"), ("claude2", ".claude_second")]
+KINDS = ["lessons", "decisions", "improvements", "system", "memory", "failures"]
+
+W_HEADING, W_ABSTRACT, W_BODY = 5.0, 3.0, 1.0
+W_ALIAS = 5.0  # chosen on questions.json only (evals/recall); never tuned on the blind set
+try:
+    W_ALIAS = float(os.environ.get("AGENT_RECALL_W_ALIAS") or W_ALIAS)  # experiments only
+except ValueError:
+    pass
+# Decision rule (change 20261010-202747-b8cde9): ON only if paraphrase-blind recall@5 >= +20pp
+# and no other set drops > 2pp. Env AGENT_RECALL_ALIASES=1/0 or --aliases/--no-aliases override.
+ALIASES_DEFAULT = True  # met: blind recall@5 0 -> 28.1 (+28.1pp), no set dropped
+ALIAS_KINDS = ("lessons", "decisions", "improvements", "system", "memory")
+ALIAS_PROMPT_VERSION = "1"
+ALIAS_BATCH = 8
+ALIAS_WORKERS = 3
+HALF_LIFE_DAYS = 180.0
+RECENCY_FLOOR = 0.35
+ABSTRACT_MAX = 160
+HEADING_MAX = 100
+
+# Fields whose value is a better one-line abstract than the first body line.
+ABSTRACT_FIELDS = ["durable lesson", "hypothesis", "decision"]
+VALIDITY_RE = re.compile(r"^\s*(valid from|invalid at|supersedes)\s*:\s*(.*)$", re.I)
+ID_RE = re.compile(r"^((?:ADR|L|IMP)-[0-9A-Za-z]+)")
+STAMP_RE = re.compile(r"(20\d{2})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})")
+DATE_RE = re.compile(r"(20\d{2})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?")
+FENCE_RE = re.compile(r"^\s*(```|~~~)")
+
+STOP = set("""a an and are as at be been but by can could did do does for from had has have how i if in
+into is it its me my no not of on or our should so than that the their them then there these they this
+to was we were what when where which who why will with would you your about after before again any all
+just also there here use using via vs""".split())
+
+
+def die(msg, code=1):
+    print("agent-recall: " + msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def tilde(p):
+    return "~" + p[len(HOME):] if p.startswith(HOME + os.sep) else p
+
+
+def parse_date(s):
+    """Return epoch seconds for an ISO-ish date/datetime or a 14-digit stamp, else None."""
+    if not s:
+        return None
+    s = str(s).strip()
+    m = DATE_RE.search(s)
+    if m:
+        y, mo, d, hh, mm, ss = m.groups()
+        try:
+            dt = datetime(int(y), int(mo), int(d), int(hh or 0), int(mm or 0), int(ss or 0),
+                          tzinfo=timezone.utc)
+            return dt.timestamp()
+        except ValueError:
+            return None
+    m = STAMP_RE.search(s)
+    if m:
+        try:
+            return datetime(*[int(x) for x in m.groups()], tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d") if ts else ""
+
+
+# ---------------------------------------------------------------- sources
+
+def memory_files():
+    out = []
+    for account, d in ACCOUNTS:
+        for p in sorted(glob.glob(os.path.join(HOME, d, "projects", "*", "memory", "*.md"))):
+            if os.path.basename(p) == "MEMORY.md":  # index of pointers, duplicates the files
+                continue
+            out.append((account, p))
+    return out
+
+
+def source_signature(con):
+    h = hashlib.sha1(VERSION.encode())
+    paths = [os.path.join(AOS, f) for _, f, _ in FILE_KINDS] + [p for _, p in memory_files()]
+    for p in paths:
+        try:
+            st = os.stat(p)
+            h.update(("%s|%d|%d\n" % (p, st.st_mtime_ns, st.st_size)).encode())
+        except OSError:
+            h.update(("%s|missing\n" % p).encode())
+    try:
+        st = os.stat(ALIAS_FILE)
+        h.update(("aliases|%d|%d\n" % (st.st_mtime_ns, st.st_size)).encode())
+    except OSError:
+        h.update(b"aliases|none\n")
+    try:
+        row = con.execute("SELECT count(*), max(updated) FROM failures").fetchone()
+        h.update(("failures|%s|%s" % row).encode())
+    except sqlite3.Error:
+        h.update(b"failures|none")
+    return h.hexdigest()
+
+
+def strip_fences(lines):
+    out, fenced = [], False
+    for ln in lines:
+        if FENCE_RE.match(ln):
+            fenced = not fenced
+            continue
+        if not fenced:
+            out.append(ln)
+    return out
+
+
+def meaningful(ln):
+    s = ln.strip().lstrip(">").strip()
+    if not s or s in ("---", "***") or FENCE_RE.match(s):
+        return ""
+    if re.match(r"^[A-Za-z][\w/()-]*(?: [\w/()-]+){0,2}:$", s):  # bare field label like "Durable lesson:"
+        return ""
+    if re.match(r"^(status|date)\s*:", s, re.I):
+        return ""
+    if VALIDITY_RE.match(s):
+        return ""
+    return s
+
+
+def clip(s, n):
+    s = re.sub(r"\s+", " ", s).strip()
+    return s if len(s) <= n else s[: n - 1].rstrip() + "…"
+
+
+def make_abstract(body_lines):
+    lines = strip_fences(body_lines)
+    lower = [ln.strip().lower().rstrip(":") for ln in lines]
+    for field in ABSTRACT_FIELDS:
+        for i, l in enumerate(lower):
+            if l == field:
+                for ln in lines[i + 1:]:
+                    m = meaningful(ln)
+                    if m:
+                        return clip(m, ABSTRACT_MAX)
+    for ln in lines + body_lines:  # fenced text only as a last resort
+        m = meaningful(ln)
+        if m:
+            return clip(m, ABSTRACT_MAX)
+    return ""
+
+
+def parse_validity(body_lines):
+    vf = ia = None
+    sup = []
+    for ln in strip_fences(body_lines):
+        m = VALIDITY_RE.match(ln)
+        if not m:
+            continue
+        key, val = m.group(1).lower(), m.group(2).strip()
+        if key == "valid from":
+            vf = parse_date(val) or vf
+        elif key == "invalid at":
+            ia = parse_date(val) or ia
+        else:
+            sup += [x for x in re.findall(r"(?:ADR|L|IMP)-[0-9A-Za-z]+", val) if "XXXX" not in x]
+    return vf, ia, sup
+
+
+def entry_date(heading, body_lines, fallback):
+    for ln in body_lines[:12]:
+        m = re.match(r"^\s*date\s*:\s*(.+)$", ln, re.I)
+        if m and parse_date(m.group(1)):
+            return parse_date(m.group(1))
+    m = ID_RE.match(heading)
+    if m and STAMP_RE.search(m.group(1)):
+        return parse_date(m.group(1))
+    return fallback
+
+
+def split_sections(path, mode):
+    """Yield (line_no, heading, body_lines) for each section, ignoring fenced code."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        lines = f.read().splitlines()
+    sections, cur, fenced = [], None, False
+    for i, ln in enumerate(lines, 1):
+        if FENCE_RE.match(ln):
+            fenced = not fenced
+        is_head = False
+        if not fenced:
+            if mode == "##":
+                is_head = ln.startswith("## ")
+            else:
+                is_head = bool(re.match(r"^# \d+\.\s", ln))
+        if is_head:
+            cur = [i, ln.lstrip("#").strip(), []]
+            sections.append(cur)
+        elif cur is not None:
+            cur[2].append(ln)
+    return sections
+
+
+def read_frontmatter(text):
+    meta, body = {}, text
+    if text.startswith("---"):
+        end = text.find("\n---", 3)
+        if end != -1:
+            fm, body = text[3:end], text[end + 4:]
+            for ln in fm.splitlines():
+                m = re.match(r"^\s*([A-Za-z_][\w-]*)\s*:\s*(.*)$", ln)
+                if m and m.group(2).strip():
+                    meta.setdefault(m.group(1).lower(), m.group(2).strip().strip('"').strip("'"))
+    return meta, body
+
+
+def collect(con):
+    docs = []
+    for kind, fname, mode in FILE_KINDS:
+        path = os.path.join(AOS, fname)
+        if not os.path.exists(path):
+            continue
+        mtime = os.stat(path).st_mtime
+        for line, heading, body in split_sections(path, mode):
+            if "XXXX" in heading:
+                continue
+            text = "\n".join(body)
+            m = ID_RE.match(heading)
+            doc = dict(kind=kind, path=path, line=line, anchor=m.group(1) if m else heading[:60],
+                       heading=heading, abstract=make_abstract(body), body=text,
+                       account="", project="", mtime=mtime,
+                       date=entry_date(heading, body, mtime),
+                       valid_from=None, invalid_at=None, supersedes="")
+            if kind != "system":  # SYSTEM templates contain example field lines
+                vf, ia, sup = parse_validity(body)
+                doc.update(valid_from=vf, invalid_at=ia, supersedes=",".join(sup))
+            docs.append(doc)
+
+    for account, path in memory_files():
+        try:
+            text = open(path, encoding="utf-8", errors="replace").read()
+            mtime = os.stat(path).st_mtime
+        except OSError:
+            continue
+        meta, body = read_frontmatter(text)
+        body_lines = body.splitlines()
+        vf, ia, sup = parse_validity(body_lines)
+        vf = parse_date(meta.get("valid_from")) or vf
+        ia = parse_date(meta.get("invalid_at")) or ia
+        project = os.path.basename(os.path.dirname(os.path.dirname(path)))
+        name = meta.get("name") or os.path.splitext(os.path.basename(path))[0]
+        docs.append(dict(kind="memory", path=path, line=1, anchor="", heading=name,
+                         abstract=clip(meta.get("description", ""), ABSTRACT_MAX) or make_abstract(body_lines),
+                         body=body, account=account, project=project, mtime=mtime,
+                         date=parse_date(meta.get("modified")) or mtime,
+                         valid_from=vf, invalid_at=ia, supersedes=",".join(sup)))
+
+    try:
+        rows = con.execute("SELECT signature, normalized, resolution, updated, success, failure "
+                           "FROM failures").fetchall()
+    except sqlite3.Error:
+        rows = []
+    for sig, norm, res, upd, ok, bad in rows:
+        docs.append(dict(kind="failures", path=DB + "#failures", line=0, anchor=str(sig)[:16],
+                         heading=clip(norm or sig, 120), abstract=clip("fix: %s (ok %s / fail %s)" % (res or "-", ok, bad), ABSTRACT_MAX),
+                         body="%s\n%s" % (norm or "", res or ""), account="", project="",
+                         mtime=parse_date(upd) or time.time(), date=parse_date(upd),
+                         valid_from=None, invalid_at=None, supersedes=""))
+
+    # Supersedes: the older entry becomes invalid from the newer entry's start.
+    by_id = {}
+    for d in docs:
+        if d["anchor"] and ID_RE.match(d["anchor"]):
+            by_id.setdefault(d["anchor"], d)
+    for d in docs:
+        for sid in filter(None, d["supersedes"].split(",")):
+            old = by_id.get(sid)
+            if old is not None and old is not d and not old["invalid_at"]:
+                old["invalid_at"] = d["valid_from"] or d["date"] or time.time()
+                old["superseded_by"] = d["anchor"]
+    return docs
+
+
+# ---------------------------------------------------------------- db
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS recall_docs(
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL, path TEXT NOT NULL, line INTEGER, anchor TEXT,
+  heading TEXT, abstract TEXT, account TEXT, project TEXT,
+  mtime REAL, date REAL, valid_from REAL, invalid_at REAL,
+  supersedes TEXT, superseded_by TEXT);
+CREATE VIRTUAL TABLE IF NOT EXISTS recall_fts USING fts5(
+  heading, abstract, body, aliases, tokenize='porter unicode61');
+CREATE TABLE IF NOT EXISTS recall_meta(key TEXT PRIMARY KEY, value TEXT);
+"""
+
+
+def connect():
+    if not os.path.isdir(os.path.dirname(DB)):
+        die("database directory missing: " + os.path.dirname(DB))
+    con = sqlite3.connect(DB, timeout=15, isolation_level=None)  # explicit transactions only
+    con.execute("PRAGMA busy_timeout=15000")
+    return con
+
+
+def ensure_schema(con):
+    have = {r[0] for r in con.execute("SELECT name FROM sqlite_master WHERE name LIKE 'recall_%'")}
+    if "recall_fts" in have:
+        cols = [r[1] for r in con.execute("PRAGMA table_info(recall_fts)")]
+        if "aliases" not in cols:  # pre-alias index: fully rebuildable, so recreate it
+            con.execute("DROP TABLE recall_fts")
+            con.execute("DELETE FROM recall_meta WHERE key='signature'")
+            have.discard("recall_fts")
+    if not {"recall_docs", "recall_fts", "recall_meta"} <= have:
+        con.executescript(SCHEMA)
+
+
+def meta(con, key):
+    try:
+        r = con.execute("SELECT value FROM recall_meta WHERE key=?", (key,)).fetchone()
+        return r[0] if r else None
+    except sqlite3.Error:
+        return None
+
+
+def rebuild(con, sig=None, quiet=False, docs=None):
+    t0 = time.time()
+    docs = docs if docs is not None else collect(con)
+    cache = load_alias_cache()["entries"]
+    t1 = time.time()
+    ensure_schema(con)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        con.execute("DELETE FROM recall_docs")
+        con.execute("DELETE FROM recall_fts")
+        for i, d in enumerate(docs, 1):
+            con.execute("INSERT INTO recall_docs VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (i, d["kind"], d["path"], d["line"], d["anchor"], d["heading"], d["abstract"],
+                         d["account"], d["project"], d["mtime"], d["date"], d["valid_from"],
+                         d["invalid_at"], d["supersedes"], d.get("superseded_by", "")))
+            ent = cache.get(doc_key(d))
+            al = "\n".join(ent["aliases"]) if ent and ent.get("hash") == doc_hash(d) else ""
+            con.execute("INSERT INTO recall_fts(rowid, heading, abstract, body, aliases) VALUES(?,?,?,?,?)",
+                        (i, d["heading"], d["abstract"], d["body"], al))
+        con.execute("INSERT OR REPLACE INTO recall_meta VALUES('signature', ?)", (sig or source_signature(con),))
+        con.execute("INSERT OR REPLACE INTO recall_meta VALUES('indexed_at', ?)", (str(time.time()),))
+        con.execute("COMMIT")
+    except Exception:
+        con.execute("ROLLBACK")
+        raise
+    took = time.time() - t0
+    if not quiet:
+        counts = {}
+        for d in docs:
+            counts[d["kind"]] = counts.get(d["kind"], 0) + 1
+        print("indexed %d entries in %.0f ms (parse %.0f ms): %s" % (
+            len(docs), took * 1000, (t1 - t0) * 1000,
+            ", ".join("%s %d" % (k, counts.get(k, 0)) for k in KINDS)))
+    return took
+
+
+def maybe_reindex(con):
+    sig = source_signature(con)
+    if meta(con, "signature") == sig:
+        return False
+    try:
+        rebuild(con, sig, quiet=True)
+        return True
+    except sqlite3.OperationalError as e:  # locked by a concurrent writer: use the old index
+        print("agent-recall: index refresh skipped (%s); results may be stale" % e, file=sys.stderr)
+        return False
+
+
+# ---------------------------------------------------------------- aliases (write time only)
+
+ALIAS_SYSTEM = (
+    "You help a keyword search index find notes in an engineer's personal knowledge base "
+    "(lessons, decisions, improvement ideas, project memories, an operations manual). "
+    "For each note you get, write 6 different short search queries (3 to 12 words each) that a person "
+    "who remembers the situation but not the note's wording might type when they need this note: "
+    "the problem or symptom they saw, the error they hit, the question they would ask, or the decision "
+    "they want to look up. Use plain everyday words and synonyms; at least 3 of the 6 must avoid the "
+    "note's own distinctive terms and names. Do not include ids, file paths, dates, numbers, secrets "
+    "or personal data. Reply with exactly one JSON object and nothing else, mapping each note id to "
+    "its list of queries, e.g. {\"n1\": [\"...\", \"...\"], \"n2\": [...]}."
+)
+OUT_OF_USAGE = re.compile(r"usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage|"
+                          r"credit balance|not logged in|please run /login|overloaded", re.I)
+CLAUDE_HOMES = [os.path.join(HOME, ".claude"), os.path.join(HOME, ".claude_second")]
+
+
+def aliases_enabled(flag=None):
+    if flag is not None:
+        return flag
+    env = os.environ.get("AGENT_RECALL_ALIASES", "").strip().lower()
+    if env in ("1", "true", "on", "yes"):
+        return True
+    if env in ("0", "false", "off", "no"):
+        return False
+    return ALIASES_DEFAULT
+
+
+def doc_key(d):
+    anchor = d["anchor"] if d["kind"] != "memory" else ""
+    return "%s|%s|%s" % (d["kind"], tilde(d["path"]), anchor or d["heading"][:60])
+
+
+def doc_hash(d):
+    return hashlib.sha1(("%s\n%s\n%s" % (d["heading"], d["abstract"], d["body"])).encode("utf-8", "replace")).hexdigest()
+
+
+def load_alias_cache():
+    try:
+        with open(ALIAS_FILE, encoding="utf-8") as f:
+            c = json.load(f)
+        if isinstance(c, dict) and isinstance(c.get("entries"), dict):
+            return c
+    except (OSError, ValueError):
+        pass
+    return {"version": 1, "entries": {}, "runs": []}
+
+
+def save_alias_cache(c):
+    d = os.path.dirname(ALIAS_FILE)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".aliases-", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(c, f, indent=1, ensure_ascii=False, sort_keys=True)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, ALIAS_FILE)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _redactor():
+    """Reuse agent-session-distill's secret patterns; refuse to call a model without them."""
+    from importlib.machinery import SourceFileLoader
+    import importlib.util
+    path = os.path.join(HOME, "bin", "agent-session-distill")
+    loader = SourceFileLoader("agentos_distill", path)
+    spec = importlib.util.spec_from_loader("agentos_distill", loader)
+    mod = importlib.util.module_from_spec(spec)
+    old, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # no __pycache__ in ~/bin
+    try:
+        loader.exec_module(mod)
+    finally:
+        sys.dont_write_bytecode = old
+    return mod.redact
+
+
+def agent_mode():
+    try:
+        with open(os.path.join(AOS, "mode")) as f:
+            return f.read().strip() or "owner"
+    except OSError:
+        return "owner"
+
+
+def ask_haiku(text):
+    """(result text or None, usage dict, note). Same headless pattern as agent-session-distill."""
+    note = "no Claude account available"
+    with tempfile.TemporaryDirectory(prefix="agentos-recall-") as cwd:
+        for home in CLAUDE_HOMES:
+            if not os.path.isdir(home):
+                continue
+            env = dict(os.environ, CLAUDE_CONFIG_DIR=home, AGENTOS_DISTILL="1", AGENTOS_TELEMETRY_DISABLE="1")
+            cmd = ["claude", "-p", "--model", "haiku", "--output-format", "json", "--tools", "",
+                   "--strict-mcp-config", "--no-session-persistence", "--max-budget-usd", "0.25",
+                   "--system-prompt", ALIAS_SYSTEM]
+            try:
+                p = subprocess.run(cmd, input=text, cwd=cwd, env=env, capture_output=True, text=True, timeout=180)
+            except subprocess.TimeoutExpired:
+                return None, {}, "%s: timeout" % os.path.basename(home)
+            except OSError as e:
+                return None, {}, "claude not runnable: %s" % e
+            try:
+                d = json.loads(p.stdout)
+            except ValueError:
+                d = None
+            result = str(d.get("result") or "") if isinstance(d, dict) else (p.stdout + p.stderr)
+            is_error = bool(d.get("is_error")) if isinstance(d, dict) else p.returncode != 0
+            if is_error and OUT_OF_USAGE.search(result + p.stderr):
+                note = "%s out of usage" % os.path.basename(home)
+                continue
+            usage = {}
+            if isinstance(d, dict):
+                u = d.get("usage") or {}
+                usage = {"in": int(u.get("input_tokens") or 0) + int(u.get("cache_read_input_tokens") or 0)
+                         + int(u.get("cache_creation_input_tokens") or 0),
+                         "out": int(u.get("output_tokens") or 0),
+                         "usd": float(d.get("total_cost_usd") or 0.0)}
+            if is_error:
+                return None, usage, "%s: %s" % (os.path.basename(home), result.strip()[:160])
+            return result, usage, "%s ok" % os.path.basename(home)
+    return None, {}, note
+
+
+def _clean_aliases(lst):
+    out = []
+    for a in lst if isinstance(lst, list) else []:
+        if not isinstance(a, str):
+            continue
+        a = " ".join(a.split())[:160]
+        if a and a.lower() not in [x.lower() for x in out]:
+            out.append(a)
+    return out[:8]
+
+
+def generate_aliases(docs, max_docs=300, quiet=False):
+    """Fill the alias cache for docs missing from it. Returns a run summary dict."""
+    run = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), "calls": 0, "ok_calls": 0,
+           "docs_done": 0, "docs_failed": 0, "in_tokens": 0, "out_tokens": 0, "usd": 0.0, "notes": []}
+    if agent_mode() == "guest":
+        run["notes"].append("guest mode: skipped")
+        return run
+    os.makedirs(os.path.dirname(ALIAS_FILE), mode=0o700, exist_ok=True)
+    lockf = os.fdopen(os.open(os.path.join(os.path.dirname(ALIAS_FILE), "aliases.lock"),
+                              os.O_WRONLY | os.O_CREAT, 0o600), "w")
+    try:
+        fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        run["notes"].append("another alias run is active")
+        return run
+    redact = _redactor()
+    cache = load_alias_cache()
+    ents = cache["entries"]
+    todo = [d for d in docs if d["kind"] in ALIAS_KINDS
+            and (ents.get(doc_key(d)) or {}).get("hash") != doc_hash(d)][:max(0, max_docs)]
+    batches = [todo[i:i + ALIAS_BATCH] for i in range(0, len(todo), ALIAS_BATCH)]
+    mu = threading.Lock()
+
+    def one(batch):
+        parts = []
+        for j, d in enumerate(batch, 1):
+            parts.append("### n%d\nTitle: %s\nSummary: %s\n%s" % (
+                j, d["heading"], d["abstract"], clip(d["body"], 1200)))
+        text = redact("\n\n".join(parts))
+        res, usage, note = ask_haiku(text)
+        got = {}
+        if res:
+            m = re.search(r"\{.*\}", res, re.S)
+            try:
+                got = json.loads(m.group(0)) if m else {}
+            except ValueError:
+                got = {}
+        with mu:
+            run["calls"] += 1
+            run["in_tokens"] += usage.get("in", 0)
+            run["out_tokens"] += usage.get("out", 0)
+            run["usd"] += usage.get("usd", 0.0)
+            if res:
+                run["ok_calls"] += 1
+            elif note not in run["notes"]:
+                run["notes"].append(note)
+            for j, d in enumerate(batch, 1):
+                al = _clean_aliases(got.get("n%d" % j) if isinstance(got, dict) else None)
+                al = [redact(a) for a in al]
+                if len(al) >= 3:
+                    ents[doc_key(d)] = {"hash": doc_hash(d), "aliases": al, "at": run["at"],
+                                        "model": "haiku", "prompt": ALIAS_PROMPT_VERSION}
+                    run["docs_done"] += 1
+                else:
+                    run["docs_failed"] += 1
+            save_alias_cache(cache)  # incremental: a crash keeps finished batches
+        return note
+
+    workers = []
+    queue = list(batches)
+    qlock = threading.Lock()
+
+    def worker():
+        while True:
+            with qlock:
+                if not queue:
+                    return
+                b = queue.pop(0)
+            note = one(b)
+            if "out of usage" in note or "no Claude account" in note or "not runnable" in note:
+                with qlock:
+                    queue.clear()  # every account is out: stop instead of burning calls
+
+    for _ in range(min(ALIAS_WORKERS, len(batches))):
+        t = threading.Thread(target=worker)
+        t.start()
+        workers.append(t)
+    for t in workers:
+        t.join()
+    run["usd"] = round(run["usd"], 4)
+    run["pending_after"] = sum(1 for d in docs if d["kind"] in ALIAS_KINDS
+                               and (ents.get(doc_key(d)) or {}).get("hash") != doc_hash(d))
+    cache.setdefault("runs", []).append(run)
+    cache["runs"] = cache["runs"][-50:]
+    save_alias_cache(cache)
+    try:
+        with open(ALIAS_LOG, "a") as f:
+            f.write(json.dumps(run) + "\n")
+        os.chmod(ALIAS_LOG, 0o600)
+    except OSError:
+        pass
+    if not quiet:
+        print("aliases: %d call(s) (%d ok), %d entr(ies) done, %d failed, %d pending; tokens in %d out %d; $%.4f%s" % (
+            run["calls"], run["ok_calls"], run["docs_done"], run["docs_failed"], run["pending_after"],
+            run["in_tokens"], run["out_tokens"], run["usd"],
+            (" (" + "; ".join(run["notes"]) + ")") if run["notes"] else ""))
+    return run
+
+
+# ---------------------------------------------------------------- query
+
+def query_terms(q):
+    terms = []
+    for t in re.findall(r"[A-Za-z0-9_]+", q.lower()):
+        if (t in STOP and not t.isdigit()) or len(t) < 2 or t in terms:
+            continue
+        terms.append(t)
+    return terms
+
+
+def fts_or(terms):
+    return " OR ".join('"%s"' % t for t in terms)
+
+
+def search(con, query, k=5, kinds=None, account=None, project=None, include_invalid=False, aliases=None):
+    terms = query_terms(query)
+    if not terms:
+        return []
+    if aliases is None:
+        aliases = aliases_enabled()
+    now = time.time()
+    out = []
+    match = fts_or(terms) if aliases else "{heading abstract body} : (%s)" % fts_or(terms)
+    for r in _match(con, match, kinds, account, project, aliases):
+        d = dict(r)
+        invalid = bool((d["invalid_at"] and d["invalid_at"] <= now) or
+                       (d["valid_from"] and d["valid_from"] > now))
+        if invalid and not include_invalid:
+            continue
+        age = max(0.0, (now - (d["date"] or d["mtime"] or now)) / 86400.0)
+        rec = max(RECENCY_FLOOR, 0.5 ** (age / HALF_LIFE_DAYS))
+        d["score"] = d["rel"] * rec
+        d["status"] = "invalid" if invalid else "active"
+        out.append(d)
+    out.sort(key=lambda d: -d["score"])
+    return out[:k]
+
+
+def _match(con, match, kinds, account, project, aliases=False):
+    w = [W_HEADING, W_ABSTRACT, W_BODY, W_ALIAS if aliases else 0.0]
+    sql = ("SELECT d.*, -bm25(recall_fts, ?, ?, ?, ?) AS rel FROM recall_fts "
+           "JOIN recall_docs d ON d.id = recall_fts.rowid WHERE recall_fts MATCH ?")
+    args = w + [match]
+    if kinds:
+        sql += " AND d.kind IN (%s)" % ",".join("?" * len(kinds))
+        args += kinds
+    if account:
+        sql += " AND d.account = ?"
+        args.append(account)
+    if project:
+        sql += " AND d.project LIKE ?"
+        args.append("%" + project + "%")
+    sql += " ORDER BY bm25(recall_fts, ?, ?, ?, ?) LIMIT 300"
+    args += w
+    con.row_factory = sqlite3.Row
+    return con.execute(sql, args).fetchall()
+
+
+def fmt(d):
+    loc = tilde(d["path"]) if d["kind"] != "failures" else "agent-fail"
+    if d["line"]:
+        loc += ":%d" % d["line"]
+    tag = d["kind"]
+    if d["kind"] == "memory":
+        tag += " %s %s" % (d["account"], d["project"].replace(os.path.expanduser("~").replace("/", "-") + "-", ""))
+    if d["status"] != "active":
+        tag += " INVALID" + (" by " + d["superseded_by"] if d.get("superseded_by") else "")
+    return "%s [%s]\n  %s\n  %s" % (loc, tag, clip(d["heading"], HEADING_MAX), d["abstract"] or "")
+
+
+def main(argv):
+    if argv and argv[0] in ("index", "status"):
+        con = connect()
+        if argv[0] == "index":
+            ip = argparse.ArgumentParser(prog="agent-recall index")
+            g = ip.add_mutually_exclusive_group()
+            g.add_argument("--aliases", dest="gen", action="store_true", default=None,
+                           help="generate missing aliases with Haiku before indexing")
+            g.add_argument("--no-llm", dest="gen", action="store_false", help="never call a model")
+            ip.add_argument("--aliases-max", type=int, default=300, help="max entries to alias per run")
+            ia = ip.parse_args(argv[1:])
+            gen = aliases_enabled() if ia.gen is None else ia.gen
+            ensure_schema(con)
+            docs = collect(con)
+            if gen:
+                generate_aliases(docs, ia.aliases_max)
+            rebuild(con, docs=docs)
+        else:
+            ensure_schema(con)
+            n = con.execute("SELECT kind, count(*) FROM recall_docs GROUP BY kind").fetchall()
+            at = meta(con, "indexed_at")
+            fresh = meta(con, "signature") == source_signature(con)
+            withal = con.execute("SELECT count(*) FROM recall_fts WHERE aliases != ''").fetchone()[0]
+            cache = load_alias_cache()
+            runs = cache.get("runs") or []
+            print("db: %s\nindexed_at: %s\nfresh: %s\nentries: %s" % (
+                tilde(DB), datetime.fromtimestamp(float(at)).isoformat(timespec="seconds") if at else "never",
+                fresh, ", ".join("%s %d" % r for r in n) or "0"))
+            print("aliases: %s at query time (default %s); %d indexed entries carry aliases; cache %s (%d entries, "
+                  "%d model calls, $%.4f total)" % (
+                      "ON" if aliases_enabled() else "OFF", "ON" if ALIASES_DEFAULT else "OFF", withal,
+                      tilde(ALIAS_FILE), len(cache["entries"]), sum(r.get("calls", 0) for r in runs),
+                      sum(r.get("usd", 0.0) for r in runs)))
+        return 0
+
+    ap = argparse.ArgumentParser(prog="agent-recall", description="Ranked pointers into AgentOS memory.")
+    ap.add_argument("query", nargs="+")
+    ap.add_argument("--k", type=int, default=5)
+    ap.add_argument("--kind", help="comma list: " + ",".join(KINDS))
+    ap.add_argument("--account", help="claude1 or claude2 (memory entries only)")
+    ap.add_argument("--project", help="substring of the Claude project dir (memory entries only)")
+    ap.add_argument("--all", action="store_true", help="include invalid/superseded entries")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--no-reindex", action="store_true", help="skip the freshness check")
+    ag = ap.add_mutually_exclusive_group()
+    ag.add_argument("--aliases", dest="aliases", action="store_true", default=None,
+                    help="rank with the cached write-time aliases too")
+    ag.add_argument("--no-aliases", dest="aliases", action="store_false")
+    a = ap.parse_args(argv)
+    kinds = [k.strip() for k in a.kind.split(",")] if a.kind else None
+    if kinds:
+        bad = [k for k in kinds if k not in KINDS]
+        if bad:
+            die("unknown kind(s): %s (valid: %s)" % (",".join(bad), ",".join(KINDS)), 2)
+    acct = {"claude": "claude1", "claude_second": "claude2", "1": "claude1", "2": "claude2"}.get(a.account, a.account)
+
+    con = connect()
+    ensure_schema(con)
+    if not a.no_reindex:
+        maybe_reindex(con)
+    res = search(con, " ".join(a.query), a.k, kinds, acct, a.project, a.all, aliases_enabled(a.aliases))
+    if a.json:
+        keep = ["kind", "path", "line", "anchor", "heading", "abstract", "account", "project",
+                "status", "superseded_by", "score"]
+        print(json.dumps([{k: (round(d[k], 3) if k == "score" else d.get(k)) for k in keep} for d in res],
+                         ensure_ascii=False))
+    elif not res:
+        print("no matches")
+    else:
+        print("\n".join(fmt(d) for d in res))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except sqlite3.Error as e:
+        die("sqlite: %s" % e)

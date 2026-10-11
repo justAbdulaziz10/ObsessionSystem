@@ -1,0 +1,24 @@
+name: Improvement proposal
+description: A change to the system, backed by a measurable outcome
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What goes wrong today? Concrete sessions or failures beat hypotheticals.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: How we'd know it's better
+      description: The pass/fail check or before/after number that would prove it.
+    validations:
+      required: true

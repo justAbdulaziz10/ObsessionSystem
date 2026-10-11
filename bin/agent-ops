@@ -1,0 +1,1041 @@
+#!/usr/bin/env python3
+
+import collections
+import datetime
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+HOME = pathlib.Path.home()
+BASE = HOME / ".agent-os/runtime"
+TEAM = HOME / ".agent-os/team"
+CONFIG = BASE / "config.json"
+EVENTS = BASE / "events.jsonl"
+
+DEFAULT_CONFIG = {
+    "version": 1,
+    "codex_model": "gpt-6-luna",
+    "codex_effort": "xhigh",
+    "codex_effort_locked": True,
+    "max_codex_workers": 3,
+    "worktree_gc_min_age_hours": 24,
+    "disk_warn_gb": 20,
+    "disk_critical_gb": 10,
+    "checkpoint_retention_days": 30,
+    "run_log_retention_days": 7,
+    "emergency_command": "",
+    "allow_existing_ollama_model_as_emergency": True,
+}
+
+RISK_WORDS = {
+    "auth", "authentication", "authorization", "permission", "permissions",
+    "security", "secret", "secrets", "credential", "credentials",
+    "payment", "payments", "billing", "stripe", "paddle", "revenuecat",
+    "subscription", "subscriptions", "database", "schema", "migration",
+    "production", "deploy", "deployment", "privacy", "encryption",
+    "token", "tokens", "oauth", "login", "signup", "delete data",
+    "حذف البيانات", "الدفع", "اشتراك", "قاعدة البيانات", "ترحيل",
+    "صلاحيات", "أمان", "خصوصية", "تسجيل الدخول"
+}
+
+BROAD_WORDS = {
+    "audit", "full", "complete", "entire", "end-to-end", "architecture",
+    "performance", "refactor", "optimize", "optimise", "all issues",
+    "all problems", "whole app", "codebase", "migration",
+    "اوديت", "كامل", "كل المشاكل", "كل شيء", "الكودبيس",
+    "الفرونتاند", "الأداء", "السرعة", "معمارية"
+}
+
+TRIVIAL_WORDS = {
+    "typo", "rename", "one line", "single line", "text only",
+    "spelling", "تغيير كلمة", "اسم فقط", "سطر واحد", "خطأ إملائي"
+}
+
+
+def cfg():
+    try:
+        data = json.loads(CONFIG.read_text())
+        out = DEFAULT_CONFIG.copy()
+        out.update(data)
+        return out
+    except Exception:
+        return DEFAULT_CONFIG.copy()
+
+
+def run(args, cwd=None, timeout=120, shell=False):
+    try:
+        p = subprocess.run(
+            args,
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            shell=shell,
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        out = (e.stdout or "") if isinstance(e.stdout, str) else ""
+        return 124, out + "\nTIMEOUT"
+    except FileNotFoundError:
+        return 127, "COMMAND_NOT_FOUND"
+
+
+def repo_info(required=True):
+    rc, root = run(["git", "rev-parse", "--show-toplevel"])
+    if rc != 0:
+        if required:
+            print("Run this inside a Git repository.", file=sys.stderr)
+            sys.exit(2)
+        return None
+
+    root = pathlib.Path(root.strip()).resolve()
+
+    rc, common = run(["git", "rev-parse", "--git-common-dir"], cwd=str(root))
+    if rc != 0:
+        common_path = root / ".git"
+    else:
+        common_path = pathlib.Path(common.strip())
+        if not common_path.is_absolute():
+            common_path = (root / common_path).resolve()
+        else:
+            common_path = common_path.resolve()
+
+    key = hashlib.sha256(str(common_path).encode()).hexdigest()[:16]
+    state = TEAM / "state" / key
+    state.mkdir(parents=True, exist_ok=True)
+
+    meta = state / "repo.json"
+    if not meta.exists():
+        meta.write_text(json.dumps({
+            "key": key,
+            "root_first_seen": str(root),
+            "git_common_dir": str(common_path),
+            "created_at": datetime.datetime.now().astimezone().isoformat(),
+        }, indent=2) + "\n")
+
+    return root, common_path, key, state
+
+
+def git_text(args, root):
+    return run(["git", *args], cwd=str(root))[1].strip()
+
+
+def load_profile(state):
+    p = state / "profile.json"
+    if not p.exists():
+        return None
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return None
+
+
+def detect_profile(root):
+    stack = []
+    checks = []
+
+    def add_check(command):
+        if command and command not in checks:
+            checks.append(command)
+
+    if (root / "pubspec.yaml").exists():
+        stack.append("Flutter/Dart")
+        add_check("flutter analyze")
+        add_check("flutter test")
+
+    package_json = root / "package.json"
+    if package_json.exists():
+        stack.append("Node.js")
+        try:
+            package = json.loads(package_json.read_text())
+            scripts = package.get("scripts", {})
+
+            if (root / "pnpm-lock.yaml").exists():
+                pm = "pnpm"
+            elif (root / "yarn.lock").exists():
+                pm = "yarn"
+            else:
+                pm = "npm"
+
+            for script in ["lint", "typecheck", "test", "build"]:
+                if script in scripts:
+                    if pm == "npm":
+                        add_check(f"npm run {script}")
+                    else:
+                        add_check(f"{pm} {script}")
+        except Exception:
+            pass
+
+    if (root / "pyproject.toml").exists() or (root / "requirements.txt").exists():
+        stack.append("Python")
+        if (root / "tests").exists() or (root / "pytest.ini").exists():
+            add_check("python -m pytest -q")
+
+    if (root / "Cargo.toml").exists():
+        stack.append("Rust")
+        add_check("cargo test")
+
+    if (root / "go.mod").exists():
+        stack.append("Go")
+        add_check("go test ./...")
+
+    if (root / "Package.swift").exists():
+        stack.append("Swift Package")
+        add_check("swift test")
+
+    if list(root.glob("*.xcodeproj")) or list(root.glob("*.xcworkspace")):
+        stack.append("Xcode")
+
+    if (root / "android").exists():
+        stack.append("Android")
+
+    if (root / "ios").exists():
+        stack.append("iOS")
+
+    return {
+        "generated_at": datetime.datetime.now().astimezone().isoformat(),
+        "root": str(root),
+        "stack": stack,
+        "checks": checks,
+        "rules": {
+            "preserve_unrelated_changes": True,
+            "require_git_diff_review": True,
+            "codex_model": cfg()["codex_model"],
+            "codex_effort": cfg()["codex_effort"],
+        }
+    }
+
+
+def ensure_profile():
+    root, _, _, state = repo_info()
+    profile = load_profile(state)
+
+    if profile is None:
+        profile = detect_profile(root)
+        (state / "profile.json").write_text(
+            json.dumps(profile, indent=2) + "\n"
+        )
+
+    print(state / "profile.json")
+    return profile
+
+
+def queue_path(state):
+    return state / "queue.json"
+
+
+def queue_load(state):
+    p = queue_path(state)
+    if not p.exists():
+        return []
+    try:
+        return json.loads(p.read_text())
+    except Exception:
+        return []
+
+
+def queue_save(state, items):
+    queue_path(state).write_text(json.dumps(items, indent=2) + "\n")
+
+
+def queue_list(state, print_output=True):
+    items = queue_load(state)
+
+    if print_output:
+        if not items:
+            print("Queue empty.")
+        else:
+            for x in items:
+                print(
+                    f"{x['id']}  "
+                    f"{x['status']:<9}  "
+                    f"{x.get('owner','-'):<12}  "
+                    f"{x['title']}"
+                )
+
+    return items
+
+
+def queue_add(state, title):
+    items = queue_load(state)
+    item = {
+        "id": uuid.uuid4().hex[:8],
+        "title": title,
+        "status": "READY",
+        "owner": "",
+        "created_at": datetime.datetime.now().astimezone().isoformat(),
+    }
+    items.append(item)
+    queue_save(state, items)
+    print(item["id"])
+
+
+def queue_update(state, item_id, status, owner=None):
+    items = queue_load(state)
+    found = False
+
+    for item in items:
+        if item["id"] == item_id:
+            item["status"] = status
+            if owner is not None:
+                item["owner"] = owner
+            item["updated_at"] = datetime.datetime.now().astimezone().isoformat()
+            found = True
+            break
+
+    if not found:
+        print(f"Unknown queue id: {item_id}", file=sys.stderr)
+        sys.exit(3)
+
+    queue_save(state, items)
+
+
+def event(event_type, detail=""):
+    info = repo_info(required=False)
+    obj = {
+        "ts": datetime.datetime.now().astimezone().isoformat(),
+        "type": event_type,
+        "detail": detail[:2000],
+    }
+
+    if info:
+        root, _, key, _ = info
+        obj["repo"] = key
+        obj["root"] = str(root)
+
+    BASE.mkdir(parents=True, exist_ok=True)
+
+    with EVENTS.open("a") as f:
+        f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def checkpoint(label):
+    root, _, _, state = repo_info()
+    checks = state / "checkpoints"
+    checks.mkdir(parents=True, exist_ok=True)
+
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    safe = "".join(
+        c if c.isalnum() or c in "-_" else "-"
+        for c in label
+    )[:80]
+
+    status = git_text(["status", "--short"], root)
+    diffstat = git_text(["diff", "--stat"], root)
+    staged = git_text(["diff", "--cached", "--stat"], root)
+    branch = git_text(["branch", "--show-current"], root)
+    head = git_text(["rev-parse", "HEAD"], root)
+
+    items = queue_load(state)
+    active = [
+        x for x in items
+        if x.get("status") not in {"DONE", "CANCELLED"}
+    ]
+
+    body = [
+        f"# Checkpoint: {label}",
+        "",
+        f"- time: {datetime.datetime.now().astimezone().isoformat()}",
+        f"- branch: {branch}",
+        f"- HEAD: {head}",
+        "",
+        "## Queue",
+        "```json",
+        json.dumps(active, indent=2, ensure_ascii=False),
+        "```",
+        "",
+        "## Git status",
+        "```text",
+        status or "(clean)",
+        "```",
+        "",
+        "## Unstaged diffstat",
+        "```text",
+        diffstat or "(none)",
+        "```",
+        "",
+        "## Staged diffstat",
+        "```text",
+        staged or "(none)",
+        "```",
+    ]
+
+    path = checks / f"{stamp}-{safe or 'checkpoint'}.md"
+    path.write_text("\n".join(body) + "\n")
+    event("checkpoint", f"{label} -> {path}")
+    print(path)
+
+
+def latest_checkpoint(state):
+    d = state / "checkpoints"
+    if not d.exists():
+        return None
+    items = sorted(d.glob("*.md"), reverse=True)
+    return items[0] if items else None
+
+
+def make_handoff():
+    root, _, _, state = repo_info()
+    profile = load_profile(state) or detect_profile(root)
+    queue = queue_load(state)
+    cp = latest_checkpoint(state)
+
+    status = git_text(["status", "--short"], root)
+    diffstat = git_text(["diff", "--stat"], root)
+    log = git_text(["log", "-5", "--oneline"], root)
+
+    body = [
+        "# AGENT HANDOFF",
+        "",
+        "## Repository",
+        str(root),
+        "",
+        "## Stack",
+        ", ".join(profile.get("stack", [])) or "Unknown",
+        "",
+        "## Active queue",
+        "```json",
+        json.dumps(
+            [x for x in queue if x.get("status") != "DONE"],
+            indent=2,
+            ensure_ascii=False,
+        ),
+        "```",
+        "",
+        "## Current git status",
+        "```text",
+        status or "(clean)",
+        "```",
+        "",
+        "## Current diffstat",
+        "```text",
+        diffstat or "(none)",
+        "```",
+        "",
+        "## Recent commits",
+        "```text",
+        log,
+        "```",
+    ]
+
+    if cp:
+        body += [
+            "",
+            "## Latest checkpoint",
+            str(cp),
+            "",
+            cp.read_text(),
+        ]
+
+    path = state / "HANDOFF.md"
+    path.write_text("\n".join(body) + "\n")
+    event("handoff", str(path))
+    print(path)
+
+
+def route(task):
+    c = cfg()
+    low = task.lower()
+
+    risk_hits = sorted({w for w in RISK_WORDS if w in low})
+    broad_hits = sorted({w for w in BROAD_WORDS if w in low})
+    trivial_hits = sorted({w for w in TRIVIAL_WORDS if w in low})
+
+    score = 0
+
+    if len(task) >= 180:
+        score += 1
+    if len(task) >= 500:
+        score += 1
+
+    score += min(3, len(broad_hits))
+
+    if risk_hits:
+        score += 2
+
+    if trivial_hits and not risk_hits and not broad_hits:
+        workers = 1
+    elif score >= 5:
+        workers = 3
+    elif score >= 2:
+        workers = 2
+    else:
+        workers = 1
+
+    workers = max(1, min(int(c["max_codex_workers"]), workers))
+
+    result = {
+        "codex_model": c["codex_model"],
+        "codex_effort": c["codex_effort"],
+        "effort_locked": bool(c["codex_effort_locked"]),
+        "recommended_codex_workers": workers,
+        "parallelize_only_independent_units": True,
+        "baseline_required": bool(risk_hits or workers >= 2),
+        "independent_review_required": bool(risk_hits or workers >= 3),
+        "checkpointing_required": True,
+        "risk_hits": risk_hits,
+        "broad_hits": broad_hits,
+    }
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def changed_risk(task=""):
+    root, _, _, _ = repo_info()
+    rc, names = run(
+        ["git", "diff", "--name-only", "HEAD"],
+        cwd=str(root),
+    )
+
+    text = (task + "\n" + names).lower()
+    hits = sorted({w for w in RISK_WORDS if w in text})
+
+    result = {
+        "risky": bool(hits),
+        "hits": hits,
+        "changed_files": [
+            x for x in names.splitlines()
+            if x.strip()
+        ],
+    }
+
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+
+
+def baseline(label, run_checks=False):
+    root, _, _, state = repo_info()
+    profile = load_profile(state) or detect_profile(root)
+
+    baselines = state / "baselines"
+    baselines.mkdir(parents=True, exist_ok=True)
+
+    result = {
+        "label": label,
+        "ts": datetime.datetime.now().astimezone().isoformat(),
+        "branch": git_text(["branch", "--show-current"], root),
+        "head": git_text(["rev-parse", "HEAD"], root),
+        "status": git_text(["status", "--short"], root),
+        "diffstat": git_text(["diff", "--stat"], root),
+        "free_disk_gb": round(
+            shutil.disk_usage(HOME).free / (1024 ** 3),
+            2,
+        ),
+        "stack": profile.get("stack", []),
+        "checks": [],
+    }
+
+    if run_checks:
+        for command in profile.get("checks", []):
+            started = time.time()
+            rc, output = run(
+                command,
+                cwd=str(root),
+                timeout=600,
+                shell=True,
+            )
+
+            result["checks"].append({
+                "command": command,
+                "exit_code": rc,
+                "seconds": round(time.time() - started, 2),
+                "output_tail": output[-5000:],
+            })
+
+    path = baselines / (
+        datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        + "-"
+        + "".join(
+            c if c.isalnum() or c in "-_"
+            else "-"
+            for c in label
+        )[:60]
+        + ".json"
+    )
+
+    path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False)
+        + "\n"
+    )
+
+    event("baseline", f"{label} -> {path}")
+    print(path)
+
+
+def choose_base(root):
+    rc, out = run(
+        ["git", "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD"],
+        cwd=str(root),
+    )
+
+    if rc == 0 and out.strip():
+        return out.strip()
+
+    for candidate in ["refs/heads/main", "refs/heads/master"]:
+        rc, _ = run(
+            ["git", "show-ref", "--verify", "--quiet", candidate],
+            cwd=str(root),
+        )
+        if rc == 0:
+            return candidate
+
+    return "HEAD"
+
+
+def gc_worktrees():
+    root, _, _, _ = repo_info()
+    minimum_age = int(cfg()["worktree_gc_min_age_hours"])
+
+    run(["git", "worktree", "prune"], cwd=str(root))
+
+    rc, raw = run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(root),
+    )
+
+    if rc != 0:
+        print(raw, file=sys.stderr)
+        sys.exit(rc)
+
+    blocks = [
+        block for block in raw.strip().split("\n\n")
+        if block.strip()
+    ]
+
+    if not blocks:
+        print("No worktrees.")
+        return
+
+    primary = None
+    parsed = []
+
+    for block in blocks:
+        item = {}
+
+        for line in block.splitlines():
+            if line.startswith("worktree "):
+                item["path"] = line[9:]
+            elif line.startswith("branch "):
+                item["branch"] = line[7:]
+            elif line == "detached":
+                item["detached"] = True
+
+        if "path" in item:
+            parsed.append(item)
+
+    if parsed:
+        primary = pathlib.Path(parsed[0]["path"]).resolve()
+
+    current = pathlib.Path.cwd().resolve()
+    base = choose_base(root)
+    removed = []
+    skipped = []
+
+    for item in parsed[1:]:
+        path = pathlib.Path(item["path"]).resolve()
+
+        if path == current or path == primary:
+            continue
+
+        if item.get("detached") or not item.get("branch"):
+            skipped.append((str(path), "detached"))
+            continue
+
+        if not path.exists():
+            continue
+
+        age_hours = (
+            time.time() - path.stat().st_mtime
+        ) / 3600
+
+        if age_hours < minimum_age:
+            skipped.append((str(path), "too-new"))
+            continue
+
+        rc, status = run(
+            ["git", "-C", str(path), "status", "--porcelain"]
+        )
+
+        if rc != 0 or status.strip():
+            skipped.append((str(path), "dirty"))
+            continue
+
+        rc, _ = run(
+            [
+                "git",
+                "merge-base",
+                "--is-ancestor",
+                item["branch"],
+                base,
+            ],
+            cwd=str(root),
+        )
+
+        if rc != 0:
+            skipped.append((str(path), "not-merged"))
+            continue
+
+        rc, out = run(
+            ["git", "worktree", "remove", str(path)],
+            cwd=str(root),
+        )
+
+        if rc == 0:
+            removed.append(str(path))
+            event("worktree_gc", str(path))
+        else:
+            skipped.append((str(path), "remove-failed"))
+
+    print(f"Removed: {len(removed)}")
+
+    for path in removed:
+        print(f"  ✅ {path}")
+
+    if skipped:
+        print(f"Preserved: {len(skipped)}")
+
+        for path, reason in skipped:
+            print(f"  · {reason:12} {path}")
+
+
+def observe():
+    info = repo_info(required=False)
+    repo_key = info[2] if info else None
+
+    if not EVENTS.exists():
+        print("No observability events yet.")
+        return
+
+    events = []
+
+    for line in EVENTS.read_text().splitlines():
+        try:
+            obj = json.loads(line)
+        except Exception:
+            continue
+
+        if repo_key and obj.get("repo") != repo_key:
+            continue
+
+        events.append(obj)
+
+    if not events:
+        print("No events for this repository.")
+        return
+
+    counts = collections.Counter(
+        x.get("type", "unknown")
+        for x in events
+    )
+
+    print(f"Events: {len(events)}")
+    print()
+
+    for name, count in counts.most_common():
+        print(f"{name:24} {count}")
+
+    print()
+    print("Last 10:")
+
+    for x in events[-10:]:
+        print(
+            f"{x.get('ts','')}  "
+            f"{x.get('type',''):20}  "
+            f"{x.get('detail','')[:100]}"
+        )
+
+
+def emergency(prompt):
+    c = cfg()
+
+    command = os.environ.get(
+        "AGENTOS_EMERGENCY_CMD",
+        c.get("emergency_command", ""),
+    ).strip()
+
+    if command:
+        env = os.environ.copy()
+        env["AGENTOS_PROMPT"] = prompt
+
+        p = subprocess.run(
+            command,
+            shell=True,
+            text=True,
+            input=prompt,
+            env=env,
+        )
+        sys.exit(p.returncode)
+
+    if c.get("allow_existing_ollama_model_as_emergency"):
+        if shutil.which("ollama"):
+            rc, output = run(["ollama", "list"])
+
+            if rc == 0:
+                models = []
+
+                for line in output.splitlines()[1:]:
+                    parts = line.split()
+                    if parts:
+                        models.append(parts[0])
+
+                preferred = [
+                    x for x in models
+                    if any(
+                        word in x.lower()
+                        for word in [
+                            "coder",
+                            "qwen",
+                            "deepseek",
+                            "codestral",
+                        ]
+                    )
+                ]
+
+                model = (
+                    preferred[0]
+                    if preferred
+                    else models[0]
+                    if models
+                    else None
+                )
+
+                if model:
+                    print(
+                        f"Emergency local fallback → Ollama {model}",
+                        file=sys.stderr,
+                    )
+                    p = subprocess.run(
+                        ["ollama", "run", model, prompt],
+                        text=True,
+                    )
+                    sys.exit(p.returncode)
+
+    print(
+        "No fifth emergency provider is configured. "
+        "Set AGENTOS_EMERGENCY_CMD or install an existing local Ollama model.",
+        file=sys.stderr,
+    )
+    sys.exit(78)
+
+
+def doctor():
+    c = cfg()
+    free = shutil.disk_usage(HOME).free / (1024 ** 3)
+
+    print("AgentOS Runtime")
+    print()
+    print(f"✅ Config: {CONFIG}")
+    print(
+        f"✅ Codex workers: "
+        f"{c['codex_model']} / {c['codex_effort']}"
+    )
+    print(
+        "✅ Effort hard-locked"
+        if c["codex_effort_locked"]
+        else "⚠️ Effort not locked"
+    )
+    print(
+        f"✅ Max parallel Codex workers: "
+        f"{c['max_codex_workers']}"
+    )
+
+    icon = (
+        "✅"
+        if free >= c["disk_warn_gb"]
+        else "🟡"
+        if free >= c["disk_critical_gb"]
+        else "🔴"
+    )
+
+    print(f"{icon} Free disk: {free:.1f} GB")
+
+    for name in [
+        "codex-ha",
+        "agent-codex",
+        "agent-storage",
+    ]:
+        path = shutil.which(name)
+        print(
+            f"{'✅' if path else '❌'} {name}: "
+            f"{path or 'missing'}"
+        )
+
+    emergency_cmd = os.environ.get(
+        "AGENTOS_EMERGENCY_CMD",
+        c.get("emergency_command", ""),
+    ).strip()
+
+    if emergency_cmd:
+        print("✅ Emergency fifth layer: configured command")
+    elif shutil.which("ollama"):
+        rc, out = run(["ollama", "list"])
+        has_model = rc == 0 and len(out.splitlines()) > 1
+        print(
+            "✅ Emergency fifth layer: existing Ollama model"
+            if has_model
+            else "🟡 Emergency fifth layer: Ollama has no installed model"
+        )
+    else:
+        print(
+            "🟡 Emergency fifth layer: hook ready, "
+            "no fifth provider configured"
+        )
+
+
+def usage():
+    print("""
+agent-ops
+
+Routing:
+  agent-ops route "TASK"
+  agent-ops risk ["TASK"]
+
+Repository intelligence:
+  agent-ops profile ensure
+  agent-ops profile show
+
+Queue:
+  agent-ops queue add "TITLE"
+  agent-ops queue list
+  agent-ops queue claim <id> [owner]
+  agent-ops queue done <id>
+  agent-ops queue requeue <id>
+
+Continuity:
+  agent-ops checkpoint "LABEL"
+  agent-ops handoff
+
+Regression:
+  agent-ops baseline <before|after> [--checks]
+
+Maintenance:
+  agent-ops gc
+  agent-ops event <type> [detail]
+  agent-ops observe
+  agent-ops doctor
+
+Emergency:
+  agent-ops emergency "TASK"
+""".strip())
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args:
+        usage()
+        return 1
+
+    # A help flag anywhere must never be recorded as event/checkpoint/queue text or run gc/emergency.
+    if "-h" in args or "--help" in args:
+        usage()
+        return 0
+
+    if args[0] == "route" and len(args) >= 2:
+        route(" ".join(args[1:]))
+        return 0
+
+    if args[0] == "risk":
+        changed_risk(" ".join(args[1:]))
+        return 0
+
+    if args[:2] == ["profile", "ensure"]:
+        ensure_profile()
+        return 0
+
+    if args[:2] == ["profile", "show"]:
+        _, _, _, state = repo_info()
+        profile = load_profile(state) or ensure_profile()
+        if isinstance(profile, dict):
+            print(
+                json.dumps(
+                    profile,
+                    indent=2,
+                    ensure_ascii=False,
+                )
+            )
+        return 0
+
+    if args[:2] == ["queue", "list"]:
+        _, _, _, state = repo_info()
+        queue_list(state)
+        return 0
+
+    if args[:2] == ["queue", "add"] and len(args) >= 3:
+        _, _, _, state = repo_info()
+        queue_add(state, " ".join(args[2:]))
+        return 0
+
+    if args[:2] == ["queue", "claim"] and len(args) >= 3:
+        _, _, _, state = repo_info()
+        owner = args[3] if len(args) >= 4 else "worker"
+        queue_update(state, args[2], "RUNNING", owner)
+        return 0
+
+    if args[:2] == ["queue", "done"] and len(args) == 3:
+        _, _, _, state = repo_info()
+        queue_update(state, args[2], "DONE")
+        return 0
+
+    if args[:2] == ["queue", "requeue"] and len(args) == 3:
+        _, _, _, state = repo_info()
+        queue_update(state, args[2], "READY", "")
+        return 0
+
+    if args[0] == "checkpoint":
+        checkpoint(
+            " ".join(args[1:])
+            if len(args) > 1
+            else "checkpoint"
+        )
+        return 0
+
+    if args[0] == "handoff":
+        make_handoff()
+        return 0
+
+    if args[0] == "baseline" and len(args) >= 2:
+        baseline(args[1], "--checks" in args[2:])
+        return 0
+
+    if args[0] == "gc":
+        gc_worktrees()
+        return 0
+
+    if args[0] == "event" and len(args) >= 2:
+        event(
+            args[1],
+            " ".join(args[2:])
+            if len(args) > 2
+            else "",
+        )
+        return 0
+
+    if args[0] == "observe":
+        observe()
+        return 0
+
+    if args[0] == "doctor":
+        doctor()
+        return 0
+
+    if args[0] == "emergency":
+        prompt = (
+            " ".join(args[1:])
+            if len(args) > 1
+            else sys.stdin.read().strip()
+        )
+        emergency(prompt)
+        return 0
+
+    usage()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

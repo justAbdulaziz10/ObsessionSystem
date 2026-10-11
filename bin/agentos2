@@ -1,0 +1,1975 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+import argparse, hashlib, json, os, re, sqlite3, subprocess, time, urllib.request
+from collections import Counter
+from datetime import datetime
+from pathlib import Path
+
+H=Path.home()
+B=H/'.agent-os'/'v2'
+DB=B/'db'/'agentos.sqlite'
+TASKS=B/'tasks'
+PROJECTS=B/'projects'
+EVALS=B/'evals'
+REPORTS=B/'reports'
+MODEL=B/'candidates'/'models.json'
+PLUG=B/'plugin-governor'/'baseline.json'
+ROUTE=B/'routing.json'
+OPENAI='https://raw.githubusercontent.com/openai/codex/main/codex-rs/models-manager/models.json'
+
+def iso():
+    return datetime.now().astimezone().isoformat()
+
+def save(p,x):
+    p=Path(p)
+    p.parent.mkdir(parents=True,exist_ok=True)
+    q=p.with_suffix(p.suffix+'.tmp')
+    q.write_text(json.dumps(x,indent=2,ensure_ascii=False)+'\n')
+    q.replace(p)
+
+def load(p,d=None):
+    try:
+        return json.loads(Path(p).read_text())
+    except:
+        return {} if d is None else d
+
+def sh(cmd,cwd=None,env=None,timeout=60,shell=False):
+    try:
+        p=subprocess.run(
+            cmd,
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+            shell=shell,
+        )
+        return p.returncode,(p.stdout or '')+(p.stderr or '')
+    except subprocess.TimeoutExpired:
+        return 124,'TIMEOUT'
+    except Exception as e:
+        return 1,f'{type(e).__name__}: {e}'
+
+def init():
+    for p in [B,B/'db',TASKS,PROJECTS,EVALS,REPORTS,B/'candidates',B/'plugin-governor',B/'telemetry']:
+        p.mkdir(parents=True,exist_ok=True)
+
+    try:
+        B.chmod(0o700)
+    except:
+        pass
+
+    c=sqlite3.connect(DB)
+    c.executescript('''
+    PRAGMA journal_mode=WAL;
+
+    CREATE TABLE IF NOT EXISTS tasks(
+        id TEXT PRIMARY KEY,
+        created TEXT,
+        updated TEXT,
+        status TEXT,
+        repo TEXT,
+        domain TEXT,
+        complexity TEXT,
+        risk TEXT,
+        request_hash TEXT,
+        request_path TEXT,
+        spec_path TEXT,
+        context_path TEXT,
+        plan_path TEXT,
+        max_workers INTEGER
+    );
+
+    CREATE TABLE IF NOT EXISTS events(
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT,
+        ts TEXT,
+        type TEXT,
+        payload TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS metrics(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id TEXT,
+        ts TEXT,
+        outcome TEXT,
+        quality REAL,
+        duration REAL,
+        human INTEGER,
+        workers INTEGER,
+        tool_calls INTEGER,
+        capabilities TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS failures(
+        signature TEXT PRIMARY KEY,
+        normalized TEXT,
+        resolution TEXT,
+        success INTEGER DEFAULT 0,
+        failure INTEGER DEFAULT 0,
+        updated TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS proof(
+        task_id TEXT,
+        kind TEXT,
+        name TEXT,
+        value TEXT,
+        unit TEXT,
+        ts TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS canaries(
+        model TEXT,
+        task_id TEXT,
+        verdict TEXT,
+        ts TEXT
+    );
+    ''')
+
+    c.commit()
+    c.close()
+
+    if not ROUTE.exists():
+        save(
+            ROUTE,
+            {
+                'workers':{
+                    'simple':0,
+                    'normal':1,
+                    'complex':2
+                },
+                'limits':{
+                    'same_failure':2,
+                    'no_progress':2,
+                    'review_cycles':3
+                }
+            }
+        )
+
+def con():
+    c=sqlite3.connect(DB)
+    c.row_factory=sqlite3.Row
+    return c
+
+def event(t,k,p=None):
+    p=p or {}
+
+    c=con()
+    c.execute(
+        'INSERT INTO events(task_id,ts,type,payload) VALUES(?,?,?,?)',
+        (t,iso(),k,json.dumps(p,ensure_ascii=False))
+    )
+    c.commit()
+    c.close()
+
+    if t:
+        d=TASKS/t
+        d.mkdir(parents=True,exist_ok=True)
+
+        with (d/'events.ndjson').open('a') as f:
+            f.write(
+                json.dumps(
+                    {'ts':iso(),'type':k,'payload':p},
+                    ensure_ascii=False
+                )+'\n'
+            )
+
+def root(path=None):
+    p=Path(path or os.getcwd()).expanduser().resolve()
+
+    rc,o=sh(
+        ['git','rev-parse','--show-toplevel'],
+        str(p)
+    )
+
+    return Path(o.strip()).resolve() if rc==0 and o.strip() else p
+
+def gv(r,*a):
+    rc,o=sh(
+        ['git',*a],
+        str(r),
+        timeout=25
+    )
+
+    return o.strip() if rc==0 else ''
+
+def toks(s):
+    return set(
+        re.findall(
+            r'[A-Za-z][A-Za-z0-9+_.-]{2,}|[\u0600-\u06FF]{3,}',
+            (s or '').lower()
+        )
+    )
+
+def classify(q):
+    t=toks(q)
+    low=q.lower()
+
+    eng={
+        'code','bug','repo','swift','ios','android',
+        'flutter','dart','python','typescript',
+        'frontend','backend','database','api',
+        'كود','برمجة','تطبيق','ريبو','فرونتاند','باكند'
+    }
+
+    des={
+        'design','ui','ux','figma','canva',
+        'تصميم','واجهة'
+    }
+
+    res={
+        'research','compare','benchmark',
+        'بحث','مقارنة','دراسة'
+    }
+
+    domain=(
+        'engineering'
+        if t&eng
+        else 'design'
+        if t&des
+        else 'research'
+        if t&res
+        else 'general'
+    )
+
+    n=len(q)
+
+    comp=(
+        'simple'
+        if n<100
+        else 'normal'
+        if n<550
+        else 'complex'
+    )
+
+    high=[
+        'auth','security','secret','payment','billing',
+        'subscription','production','deploy','privacy',
+        'encryption','delete',
+        'صلاحيات','أمان','دفع','اشتراك','خصوصية','حذف'
+    ]
+
+    med=[
+        'refactor','migration','database',
+        'performance','architecture',
+        'ترحيل','أداء','معمار'
+    ]
+
+    risk=(
+        'high'
+        if any(x in low for x in high)
+        else 'medium'
+        if any(x in low for x in med)
+        else 'low'
+    )
+
+    workers=(
+        load(ROUTE,{})
+        .get('workers',{})
+        .get(comp,1)
+        if domain=='engineering'
+        else 0
+    )
+
+    return domain,comp,risk,workers
+
+def spec(q):
+    d,c,r,w=classify(q)
+    low=q.lower()
+
+    ac=[
+        'Deliver the requested outcome.',
+        'Preserve unrelated behavior and user work.',
+        'Validate proportionally to risk.'
+    ]
+
+    ev=[]
+
+    if any(x in low for x in ['bug','fix','crash','خطأ','مشكلة','انهيار']):
+        ac+= [
+            'Evidence the root cause or reproduction.',
+            'Add relevant regression validation when practical.'
+        ]
+        ev+=['root-cause','regression-check']
+
+    if any(x in low for x in ['performance','slow','faster','latency','speed','سريع','بطيء','أداء']):
+        ac+= [
+            'Back performance claims with comparable before/after metrics.'
+        ]
+        ev+=['performance-before','performance-after']
+
+    if any(x in low for x in ['ui','ux','screen','layout','visual','design','swiftui','flutter','واجهة','تصميم','شكل']):
+        ac+= [
+            'Visually inspect the relevant UI after the change.'
+        ]
+        ev+=['visual-before','visual-after']
+
+    if r=='high':
+        ac+= [
+            'Independent high-risk review must have no unresolved blocker.'
+        ]
+        ev+=['risk-review']
+
+    if d=='engineering':
+        ev+=['diff-or-commit','tests-build-lint']
+
+    return {
+        'objective':q,
+        'domain':d,
+        'complexity':c,
+        'risk':r,
+        'max_workers':w,
+        'acceptance':ac,
+        'evidence':list(dict.fromkeys(ev)),
+        'non_goals':[
+            'No unrelated rewrite.',
+            'No destructive external action just to make progress.'
+        ],
+        'stop':load(ROUTE,{}).get('limits',{})
+    }
+
+def brain(r):
+    pid=hashlib.sha256(str(r).encode()).hexdigest()[:16]
+    p=PROJECTS/pid/'brain.json'
+    head=gv(r,'rev-parse','HEAD')
+    old=load(p,{})
+
+    if old.get('head')==head:
+        return old
+
+    rc,o=sh(
+        ['git','ls-files'],
+        str(r),
+        timeout=30
+    )
+
+    files=o.splitlines() if rc==0 else []
+
+    ext=Counter()
+    tests=[]
+    risky=[]
+
+    mp={
+        '.swift':'Swift',
+        '.dart':'Dart',
+        '.ts':'TypeScript',
+        '.tsx':'TypeScript',
+        '.js':'JavaScript',
+        '.py':'Python',
+        '.rs':'Rust',
+        '.go':'Go',
+        '.kt':'Kotlin',
+        '.java':'Java'
+    }
+
+    for rel in files[:25000]:
+        s=Path(rel).suffix.lower()
+        ext[mp.get(s,s or 'other')]+=1
+        l=rel.lower()
+
+        if any(x in l for x in ['test','spec']):
+            tests.append(rel)
+
+        if any(x in l for x in [
+            'auth','payment','billing','subscription',
+            'migration','schema','security','privacy'
+        ]):
+            risky.append(rel)
+
+    checks=[]
+
+    if (r/'pubspec.yaml').exists():
+        checks+=['flutter analyze','flutter test']
+
+    if (r/'Package.swift').exists():
+        checks+=['swift test']
+
+    if (r/'Cargo.toml').exists():
+        checks+=['cargo test']
+
+    if (r/'go.mod').exists():
+        checks+=['go test ./...']
+
+    if (r/'package.json').exists():
+        x=load(r/'package.json',{})
+
+        scripts=(
+            x.get('scripts',{})
+            if isinstance(x,dict)
+            else {}
+        )
+
+        pm=(
+            'pnpm'
+            if (r/'pnpm-lock.yaml').exists()
+            else 'yarn'
+            if (r/'yarn.lock').exists()
+            else 'npm'
+        )
+
+        for k in [
+            'lint',
+            'typecheck',
+            'test',
+            'build'
+        ]:
+            if k in scripts:
+                checks.append(
+                    f'npm run {k}'
+                    if pm=='npm'
+                    else f'{pm} {k}'
+                )
+
+    b={
+        'generated':iso(),
+        'root':str(r),
+        'project_id':pid,
+        'head':head,
+        'languages':dict(ext.most_common(15)),
+        'tests':tests[:100],
+        'risk_paths':risky[:100],
+        'checks':checks[:8],
+        'status':gv(r,'status','--short'),
+        'recent':gv(r,'log','-8','--oneline')
+    }
+
+    save(p,b)
+    return b
+
+def caps(q):
+    x=H/'bin'/'agent-cap'
+
+    if not x.exists():
+        return {}
+
+    rc,o=sh(
+        [str(x),'recommend',q],
+        timeout=90
+    )
+
+    a=o.find('{')
+
+    if rc==0 and a>=0:
+        try:
+            return json.loads(o[a:])
+        except:
+            return {}
+
+    return {}
+
+def norm(s):
+    s=re.sub(
+        r'/Users/[^/\s]+',
+        '~',
+        s or ''
+    )
+
+    s=re.sub(
+        r'\b[0-9a-f]{7,40}\b',
+        '<HEX>',
+        s,
+        flags=re.I
+    )
+
+    s=re.sub(
+        r'\b\d+\b',
+        '<N>',
+        s
+    )
+
+    return re.sub(
+        r'\s+',
+        ' ',
+        s
+    ).strip()[:8000]
+
+def fsearch(q,limit=5):
+    qt=toks(norm(q))
+
+    c=con()
+    rows=c.execute(
+        'SELECT * FROM failures ORDER BY updated DESC LIMIT 500'
+    ).fetchall()
+    c.close()
+
+    z=[]
+
+    for x in rows:
+        ov=len(
+            qt
+            &
+            toks(
+                x['normalized']
+                +' '+
+                x['resolution']
+            )
+        )
+
+        if ov:
+            z.append(
+                (
+                    ov+min(x['success']*.1,2),
+                    dict(x)
+                )
+            )
+
+    return [
+        x
+        for _,x
+        in sorted(
+            z,
+            key=lambda a:-a[0]
+        )[:limit]
+    ]
+
+def context(t):
+    c=con()
+
+    row=c.execute(
+        'SELECT * FROM tasks WHERE id=?',
+        (t,)
+    ).fetchone()
+
+    c.close()
+
+    if not row:
+        raise SystemExit('Unknown task')
+
+    q=Path(
+        row['request_path']
+    ).read_text()
+
+    r=Path(
+        row['repo']
+    )
+
+    b=brain(r)
+
+    x={
+        'task_id':t,
+        'generated':iso(),
+        'spec':load(
+            row['spec_path'],
+            {}
+        ),
+        'project_brain':str(
+            PROJECTS
+            /b['project_id']
+            /'brain.json'
+        ),
+        'git':{
+            'status':b['status'],
+            'recent':b['recent']
+        },
+        'failure_memory':fsearch(q),
+        'capability_shortlist':caps(q),
+        'rule':'Load full files/references only just-in-time.'
+    }
+
+    p=TASKS/t/'context.json'
+
+    save(p,x)
+
+    c=con()
+
+    c.execute(
+        'UPDATE tasks SET context_path=?,updated=? WHERE id=?',
+        (
+            str(p),
+            iso(),
+            t
+        )
+    )
+
+    c.commit()
+    c.close()
+
+    event(
+        t,
+        'CONTEXT_COMPILED',
+        {'path':str(p)}
+    )
+
+    return p
+
+def start(q,path=None,new=False):
+    r=root(path)
+
+    h=hashlib.sha256(
+        (
+            str(r)
+            +'\n'+
+            q
+        ).encode()
+    ).hexdigest()
+
+    c=con()
+
+    if not new:
+        x=c.execute(
+            """
+            SELECT id
+            FROM tasks
+            WHERE request_hash=?
+              AND repo=?
+              AND status IN (
+                'running',
+                'created',
+                'blocked'
+              )
+            ORDER BY created DESC
+            LIMIT 1
+            """,
+            (
+                h,
+                str(r)
+            )
+        ).fetchone()
+
+        if x:
+            c.close()
+            print(x['id'])
+            return
+
+    c.close()
+
+    t=(
+        datetime.now()
+        .strftime(
+            '%Y%m%d-%H%M%S'
+        )
+        +'-'+
+        h[:8]
+    )
+
+    d=TASKS/t
+    d.mkdir(parents=True)
+
+    rp=d/'request.txt'
+    rp.write_text(q)
+
+    s=spec(q)
+
+    sp=d/'spec.json'
+    save(sp,s)
+
+    plan={
+        'max_workers':s['max_workers'],
+        'nodes':[
+            {
+                'id':'discover',
+                'deps':[],
+                'status':'pending',
+                'files':[]
+            },
+            {
+                'id':'implement',
+                'deps':['discover'],
+                'status':'pending',
+                'files':[]
+            },
+            {
+                'id':'validate',
+                'deps':['implement'],
+                'status':'pending',
+                'files':[]
+            },
+            {
+                'id':'proof',
+                'deps':['validate'],
+                'status':'pending',
+                'files':[]
+            }
+        ]
+    }
+
+    pp=d/'plan.json'
+    save(pp,plan)
+
+    c=con()
+
+    c.execute(
+        'INSERT INTO tasks VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+        (
+            t,
+            iso(),
+            iso(),
+            'created',
+            str(r),
+            s['domain'],
+            s['complexity'],
+            s['risk'],
+            h,
+            str(rp),
+            str(sp),
+            '',
+            str(pp),
+            s['max_workers']
+        )
+    )
+
+    c.commit()
+    c.close()
+
+    event(
+        t,
+        'TASK_CREATED',
+        {
+            'risk':s['risk'],
+            'workers':s['max_workers']
+        }
+    )
+
+    context(t)
+
+    c=con()
+
+    c.execute(
+        "UPDATE tasks SET status='running',updated=? WHERE id=?",
+        (
+            iso(),
+            t
+        )
+    )
+
+    c.commit()
+    c.close()
+
+    event(
+        t,
+        'TASK_STARTED'
+    )
+
+    print(t)
+
+def task(t):
+    c=con()
+
+    x=c.execute(
+        'SELECT * FROM tasks WHERE id=?',
+        (t,)
+    ).fetchone()
+
+    c.close()
+
+    if not x:
+        raise SystemExit(
+            'Unknown task'
+        )
+
+    return dict(x)
+
+def handoff(t):
+    x=task(t)
+    s=load(
+        x['spec_path'],
+        {}
+    )
+    p=load(
+        x['plan_path'],
+        {}
+    )
+
+    c=con()
+
+    e=[
+        dict(r)
+        for r in c.execute(
+            """
+            SELECT ts,type,payload
+            FROM events
+            WHERE task_id=?
+            ORDER BY seq DESC
+            LIMIT 30
+            """,
+            (t,)
+        ).fetchall()
+    ]
+
+    c.close()
+
+    out=TASKS/t/'handoff.md'
+
+    out.write_text(
+        f"# AgentOS Handoff\n\n"
+        f"Task: {t}\n"
+        f"Status: {x['status']}\n"
+        f"Repo: {x['repo']}\n"
+        f"Risk: {x['risk']}\n\n"
+        f"## Objective\n"
+        f"{s.get('objective','')}\n\n"
+        f"## Acceptance\n"
+        +'\n'.join(
+            '- '+z
+            for z
+            in s.get(
+                'acceptance',
+                []
+            )
+        )
+        +f"\n\n## Plan\n"
+        f"```json\n"
+        f"{json.dumps(p,indent=2,ensure_ascii=False)}\n"
+        f"```\n\n"
+        f"## Context\n"
+        f"{x['context_path']}\n\n"
+        f"## Recent events\n"
+        f"```json\n"
+        f"{json.dumps(e,indent=2,ensure_ascii=False)}\n"
+        f"```\n"
+    )
+
+    print(out)
+
+def remember(err,res,ok=True):
+    n=norm(err)
+
+    sig=hashlib.sha256(
+        n.encode()
+    ).hexdigest()[:24]
+
+    c=con()
+
+    x=c.execute(
+        """
+        SELECT success,failure
+        FROM failures
+        WHERE signature=?
+        """,
+        (sig,)
+    ).fetchone()
+
+    a=(
+        x['success']
+        if x
+        else 0
+    )+(1 if ok else 0)
+
+    b=(
+        x['failure']
+        if x
+        else 0
+    )+(0 if ok else 1)
+
+    c.execute(
+        """
+        INSERT INTO failures
+        VALUES(?,?,?,?,?,?)
+        ON CONFLICT(signature)
+        DO UPDATE SET
+            normalized=excluded.normalized,
+            resolution=excluded.resolution,
+            success=excluded.success,
+            failure=excluded.failure,
+            updated=excluded.updated
+        """,
+        (
+            sig,
+            n,
+            res[:12000],
+            a,
+            b,
+            iso()
+        )
+    )
+
+    c.commit()
+    c.close()
+
+    print(sig)
+
+def guard(cmd):
+    l=cmd.lower()
+
+    cat=(
+        'READ'
+        if l.startswith(
+            (
+                'git status',
+                'git diff',
+                'git log',
+                'rg ',
+                'grep ',
+                'cat ',
+                'ls ',
+                'pwd'
+            )
+        )
+        else 'SAFE_WRITE'
+    )
+
+    bad={
+        'SECRETS':[
+            'keychain',
+            'security find-',
+            '.env',
+            'printenv'
+        ],
+        'EXTERNAL_WRITE':[
+            'git push',
+            'gh pr create',
+            'deploy',
+            'slack',
+            'send email',
+            'kubectl apply'
+        ],
+        'DESTRUCTIVE':[
+            'rm -rf',
+            'git reset --hard',
+            'git clean -fd',
+            'drop table',
+            'terraform destroy'
+        ],
+        'PRODUCTION':[
+            '--prod',
+            'production',
+            'release',
+            'app store submit'
+        ]
+    }
+
+    for k,v in bad.items():
+        if any(
+            z in l
+            for z in v
+        ):
+            cat=k
+
+    need=cat in bad
+
+    print(
+        json.dumps(
+            {
+                'category':cat,
+                'requires_confirmation':need,
+                'command':cmd
+            },
+            indent=2
+        )
+    )
+
+    return 10 if need else 0
+
+def proofadd(
+    t,
+    kind,
+    name,
+    value,
+    unit=''
+):
+    task(t)
+
+    c=con()
+
+    c.execute(
+        'INSERT INTO proof VALUES(?,?,?,?,?,?)',
+        (
+            t,
+            kind,
+            name,
+            str(value),
+            unit,
+            iso()
+        )
+    )
+
+    c.commit()
+    c.close()
+
+    event(
+        t,
+        'PROOF_ADDED',
+        {
+            'kind':kind,
+            'name':name
+        }
+    )
+
+def proofcap(t,checks=False):
+    x=task(t)
+    r=Path(x['repo'])
+    s=load(
+        x['spec_path'],
+        {}
+    )
+    b=brain(r)
+
+    results=[]
+
+    if checks:
+        for cmd in b.get(
+            'checks',
+            []
+        )[:6]:
+            st=time.time()
+
+            rc,o=sh(
+                cmd,
+                str(r),
+                timeout=900,
+                shell=True
+            )
+
+            results.append(
+                {
+                    'command':cmd,
+                    'exit':rc,
+                    'seconds':round(
+                        time.time()-st,
+                        2
+                    ),
+                    'tail':o[-3000:]
+                }
+            )
+
+    c=con()
+
+    rows=[
+        dict(z)
+        for z in c.execute(
+            """
+            SELECT kind,name,value,unit,ts
+            FROM proof
+            WHERE task_id=?
+            """,
+            (t,)
+        ).fetchall()
+    ]
+
+    c.close()
+
+    kinds={
+        z['kind']
+        for z in rows
+    }
+
+    miss=[]
+    req=s.get(
+        'evidence',
+        []
+    )
+
+    if (
+        'performance-before'
+        in req
+        and not any(
+            z['kind']=='metric-before'
+            for z in rows
+        )
+    ):
+        miss.append(
+            'performance-before metric'
+        )
+
+    if (
+        'performance-after'
+        in req
+        and not any(
+            z['kind']=='metric-after'
+            for z in rows
+        )
+    ):
+        miss.append(
+            'performance-after metric'
+        )
+
+    if (
+        'visual-before'
+        in req
+        and 'visual-before'
+        not in kinds
+    ):
+        miss.append(
+            'visual-before artifact'
+        )
+
+    if (
+        'visual-after'
+        in req
+        and 'visual-after'
+        not in kinds
+    ):
+        miss.append(
+            'visual-after artifact'
+        )
+
+    # Zero checks and zero evidence proves nothing; without this a repo
+    # with no detected checks (Xcode app, Python) reported complete.
+    if not results and not rows:
+        miss.append(
+            'no verification: no checks ran and no evidence was recorded '
+            '(record one with `agent-proof artifact <task> after <name> <log>` '
+            'or `agent-proof metric <task> after <name> <value> <unit>`)'
+        )
+
+    out={
+        'task':t,
+        'head':gv(
+            r,
+            'rev-parse',
+            'HEAD'
+        ),
+        'diffstat':gv(
+            r,
+            'diff',
+            '--stat',
+            'HEAD'
+        ),
+        'checks':results,
+        'evidence':rows,
+        'missing':miss,
+        'complete':(
+            not miss
+            and all(
+                z['exit']==0
+                for z in results
+            )
+        )
+    }
+
+    save(
+        TASKS/t/'proof.json',
+        out
+    )
+
+    event(
+        t,
+        'PROOF_CAPTURED',
+        {
+            'complete':out['complete'],
+            'missing':miss
+        }
+    )
+
+    print(
+        json.dumps(
+            out,
+            indent=2,
+            ensure_ascii=False
+        )
+    )
+
+    return out
+
+def finish(
+    t,
+    outcome,
+    quality,
+    human,
+    workers,
+    tools,
+    capabilities,
+    checks
+):
+    x=task(t)
+
+    p=proofcap(
+        t,
+        checks
+    )
+
+    created=datetime.fromisoformat(
+        x['created']
+    )
+
+    dur=(
+        datetime.now(
+            created.tzinfo
+        )
+        -created
+    ).total_seconds()
+
+    c=con()
+
+    c.execute(
+        """
+        INSERT INTO metrics(
+            task_id,
+            ts,
+            outcome,
+            quality,
+            duration,
+            human,
+            workers,
+            tool_calls,
+            capabilities
+        )
+        VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        (
+            t,
+            iso(),
+            outcome,
+            quality,
+            dur,
+            human,
+            workers,
+            tools,
+            capabilities
+        )
+    )
+
+    c.execute(
+        """
+        UPDATE tasks
+        SET status=?,updated=?
+        WHERE id=?
+        """,
+        (
+            (
+                'completed'
+                if outcome in (
+                    'success',
+                    'partial'
+                )
+                else 'failed'
+            ),
+            iso(),
+            t
+        )
+    )
+
+    c.commit()
+    c.close()
+
+    event(
+        t,
+        'TASK_COMPLETED',
+        {
+            'outcome':outcome,
+            'quality':quality,
+            'human':human,
+            'proof':p['complete']
+        }
+    )
+
+    if (
+        outcome=='success'
+        and quality>=.8
+    ):
+        save(
+            EVALS/f'{t}.json',
+            {
+                'task':t,
+                'request_path':x[
+                    'request_path'
+                ],
+                'spec_path':x[
+                    'spec_path'
+                ],
+                'proof_path':str(
+                    TASKS
+                    /t
+                    /'proof.json'
+                ),
+                'repo':x['repo'],
+                'quality':quality
+            }
+        )
+
+    print(
+        json.dumps(
+            {
+                'task':t,
+                'duration':round(
+                    dur,
+                    1
+                ),
+                'proof_complete':p[
+                    'complete'
+                ]
+            },
+            indent=2
+        )
+    )
+
+def dashboard():
+    c=con()
+
+    total=c.execute(
+        'SELECT COUNT(*) n FROM metrics'
+    ).fetchone()['n']
+
+    success=c.execute(
+        """
+        SELECT COUNT(*) n
+        FROM metrics
+        WHERE outcome='success'
+        """
+    ).fetchone()['n']
+
+    a=c.execute(
+        """
+        SELECT
+            AVG(quality) q,
+            AVG(duration) d,
+            AVG(human) h,
+            AVG(workers) w
+        FROM metrics
+        """
+    ).fetchone()
+
+    c.close()
+
+    print(
+        f'AgentOS v2\n'
+        f'Tasks: {total}\n'
+        f'Success: {(success/total if total else 0):.1%}\n'
+        f'Quality: {(a["q"] or 0):.3f}\n'
+        f'Avg duration: {(a["d"] or 0):.1f}s\n'
+        f'Human interventions/task: {(a["h"] or 0):.2f}\n'
+        f'Workers/task: {(a["w"] or 0):.2f}'
+    )
+
+def modelscan():
+    cur=load(
+        H/'.agent-os'/'models.json',
+        {}
+    ).get(
+        'codex_luna',
+        'gpt-6-luna'
+    )
+
+    cand=cur
+    source='current'
+
+    try:
+        req=urllib.request.Request(
+            OPENAI,
+            headers={
+                'User-Agent':'AgentOS-v2'
+            }
+        )
+
+        data=json.loads(
+            urllib.request.urlopen(
+                req,
+                timeout=8
+            ).read().decode()
+        )
+
+        ms=[]
+
+        for x in data.get(
+            'models',
+            []
+        ):
+            slug=x.get(
+                'slug',
+                ''
+            )
+
+            efforts={
+                y.get('effort')
+                for y in x.get(
+                    'supported_reasoning_levels',
+                    []
+                )
+                if isinstance(
+                    y,
+                    dict
+                )
+            }
+
+            if (
+                re.fullmatch(
+                    r'gpt-\d+(?:\.\d+)*-luna',
+                    slug
+                )
+                and 'xhigh' in efforts
+            ):
+                ms.append(slug)
+
+        if ms:
+            cand=max(
+                ms,
+                key=lambda x:tuple(
+                    map(
+                        int,
+                        re.findall(
+                            r'\d+',
+                            x
+                        )
+                    )
+                )
+            )
+
+            source='openai-official-catalog'
+
+    except:
+        pass
+
+    state={
+        'checked':iso(),
+        'current':cur,
+        'candidate':cand,
+        'source':source,
+        'policy':'candidate first; promote only after representative canaries'
+    }
+
+    save(
+        MODEL,
+        state
+    )
+
+    print(
+        json.dumps(
+            state,
+            indent=2
+        )
+    )
+
+def modelrecord(m,t,v):
+    c=con()
+
+    c.execute(
+        'INSERT INTO canaries VALUES(?,?,?,?)',
+        (
+            m,
+            t,
+            v,
+            iso()
+        )
+    )
+
+    c.commit()
+    c.close()
+
+def pluginfiles():
+    roots=[
+        H/'.agent-os'/'claude-plugins'/'shared',
+        H/'.claude'/'plugins'/'synced',
+        H/'.claude_second'/'plugins'/'synced',
+        H/'.codex'/'plugins',
+        H/'.codex_second'/'plugins'
+    ]
+
+    out={}
+
+    for r in roots:
+        if not r.exists():
+            continue
+
+        for cur,ds,fs in os.walk(
+            r,
+            followlinks=True
+        ):
+            ds[:]=[
+                d
+                for d in ds
+                if d not in (
+                    '.git',
+                    'node_modules'
+                )
+            ]
+
+            for n in fs:
+                p=Path(cur)/n
+                rel=str(
+                    p.relative_to(r)
+                )
+                low=rel.lower()
+
+                if (
+                    n in (
+                        'plugin.json',
+                        '.mcp.json',
+                        'hooks.json'
+                    )
+                    or 'hooks/' in low
+                    or 'scripts/' in low
+                    or low.endswith(
+                        (
+                            '.sh',
+                            '.py',
+                            '.js',
+                            '.ts',
+                            '.mjs'
+                        )
+                    )
+                ):
+                    try:
+                        out[
+                            str(r)
+                            +'::'+
+                            rel
+                        ]=hashlib.sha256(
+                            p.read_bytes()
+                        ).hexdigest()
+                    except:
+                        pass
+
+    return out
+
+def pluginsnap():
+    save(
+        PLUG,
+        {
+            'accepted':iso(),
+            'files':pluginfiles()
+        }
+    )
+
+    print(
+        'Plugin baseline saved.'
+    )
+
+def pluginscan():
+    old=load(
+        PLUG,
+        {}
+    ).get(
+        'files',
+        {}
+    )
+
+    new=pluginfiles()
+
+    if not old:
+        print(
+            json.dumps(
+                {
+                    'status':'no-baseline',
+                    'action':'run snapshot'
+                },
+                indent=2
+            )
+        )
+        return
+
+    added=sorted(
+        set(new)-set(old)
+    )
+
+    removed=sorted(
+        set(old)-set(new)
+    )
+
+    changed=sorted(
+        k
+        for k in set(old)&set(new)
+        if old[k]!=new[k]
+    )
+
+    risky=[
+        x
+        for x in added+changed
+        if any(
+            z in x.lower()
+            for z in (
+                'hooks',
+                'scripts',
+                '.mcp.json',
+                '.sh',
+                '.py',
+                '.js',
+                '.ts'
+            )
+        )
+    ]
+
+    print(
+        json.dumps(
+            {
+                'status':(
+                    'changed'
+                    if added
+                    or removed
+                    or changed
+                    else 'clean'
+                ),
+                'added':added,
+                'removed':removed,
+                'changed':changed,
+                'high_attention':risky
+            },
+            indent=2
+        )
+    )
+
+def research():
+    c=con()
+
+    rows=[
+        dict(x)
+        for x in c.execute(
+            """
+            SELECT
+                workers,
+                COUNT(*) n,
+                AVG(quality) q,
+                AVG(duration) d,
+                AVG(human) h
+            FROM metrics
+            GROUP BY workers
+            ORDER BY workers
+            """
+        ).fetchall()
+    ]
+
+    c.close()
+
+    rep={
+        'generated':iso(),
+        'worker_observations':rows,
+        'rule':'Treat this as experiment evidence, not automatic truth. Prefer ablation before adding harness.'
+    }
+
+    p=REPORTS/f'research-{datetime.now().strftime("%Y%m%d-%H%M%S")}.json'
+
+    save(
+        p,
+        rep
+    )
+
+    print(
+        json.dumps(
+            rep,
+            indent=2
+        )
+    )
+
+def maintain():
+    modelscan()
+    pluginscan()
+    research()
+
+    x=H/'bin'/'agent-cap'
+
+    if x.exists():
+        sh(
+            [
+                str(x),
+                'refresh',
+                '--quiet'
+            ],
+            timeout=120
+        )
+
+    save(
+        B/'telemetry'/'last-maintenance.json',
+        {
+            'at':iso()
+        }
+    )
+
+def main():
+    init()
+
+    p=argparse.ArgumentParser()
+
+    s=p.add_subparsers(
+        dest='cmd',
+        required=True
+    )
+
+    s.add_parser('init')
+    s.add_parser('dashboard')
+    s.add_parser('maintain')
+
+    a=s.add_parser('start')
+    a.add_argument('request')
+    a.add_argument('--repo')
+    a.add_argument(
+        '--new',
+        action='store_true'
+    )
+
+    a=s.add_parser('status')
+    a.add_argument('task')
+
+    a=s.add_parser('handoff')
+    a.add_argument('task')
+
+    a=s.add_parser('context')
+    a.add_argument('task')
+
+    a=s.add_parser('event')
+    a.add_argument('task')
+    a.add_argument('type')
+    a.add_argument(
+        '--payload',
+        default='{}'
+    )
+
+    a=s.add_parser('guard')
+    a.add_argument('command')
+
+    f=s.add_parser('fail')
+
+    fs=f.add_subparsers(
+        dest='sub',
+        required=True
+    )
+
+    a=fs.add_parser('search')
+    a.add_argument('error')
+
+    a=fs.add_parser('remember')
+    a.add_argument('error')
+    a.add_argument('resolution')
+    a.add_argument(
+        '--failed',
+        action='store_true'
+    )
+
+    pr=s.add_parser('proof')
+
+    ps=pr.add_subparsers(
+        dest='sub',
+        required=True
+    )
+
+    a=ps.add_parser('metric')
+    a.add_argument('task')
+    a.add_argument(
+        'phase',
+        choices=[
+            'before',
+            'after'
+        ]
+    )
+    a.add_argument('name')
+    a.add_argument('value')
+    a.add_argument('unit')
+
+    a=ps.add_parser('artifact')
+    a.add_argument('task')
+    a.add_argument(
+        'phase',
+        choices=[
+            'before',
+            'after'
+        ]
+    )
+    a.add_argument('name')
+    a.add_argument('path')
+
+    a=ps.add_parser('capture')
+    a.add_argument('task')
+    a.add_argument(
+        '--checks',
+        action='store_true'
+    )
+
+    a=s.add_parser('finish')
+    a.add_argument('task')
+    a.add_argument(
+        '--outcome',
+        choices=[
+            'success',
+            'partial',
+            'failure'
+        ],
+        required=True
+    )
+    a.add_argument(
+        '--quality',
+        type=float,
+        default=.8
+    )
+    a.add_argument(
+        '--human',
+        type=int,
+        default=0
+    )
+    a.add_argument(
+        '--workers',
+        type=int,
+        default=0
+    )
+    a.add_argument(
+        '--tools',
+        type=int,
+        default=0
+    )
+    a.add_argument(
+        '--capabilities',
+        default=''
+    )
+    a.add_argument(
+        '--checks',
+        action='store_true'
+    )
+
+    m=s.add_parser('model')
+
+    ms=m.add_subparsers(
+        dest='sub',
+        required=True
+    )
+
+    ms.add_parser('scan')
+    ms.add_parser('status')
+
+    a=ms.add_parser('record')
+    a.add_argument('model')
+    a.add_argument('task')
+    a.add_argument(
+        'verdict',
+        choices=[
+            'candidate',
+            'current',
+            'tie',
+            'reject'
+        ]
+    )
+
+    g=s.add_parser('plugins')
+
+    gs=g.add_subparsers(
+        dest='sub',
+        required=True
+    )
+
+    gs.add_parser('snapshot')
+    gs.add_parser('scan')
+
+    s.add_parser('research')
+
+    a=p.parse_args()
+
+    if a.cmd=='init':
+        print(B)
+
+    elif a.cmd=='start':
+        start(
+            a.request,
+            a.repo,
+            a.new
+        )
+
+    elif a.cmd=='status':
+        print(
+            json.dumps(
+                task(a.task),
+                indent=2,
+                ensure_ascii=False
+            )
+        )
+
+    elif a.cmd=='handoff':
+        handoff(a.task)
+
+    elif a.cmd=='context':
+        print(
+            context(a.task)
+        )
+
+    elif a.cmd=='event':
+        event(
+            a.task,
+            a.type,
+            json.loads(
+                a.payload
+            )
+        )
+        print('ok')
+
+    elif a.cmd=='guard':
+        raise SystemExit(
+            guard(
+                a.command
+            )
+        )
+
+    elif a.cmd=='fail':
+        if a.sub=='search':
+            print(
+                json.dumps(
+                    fsearch(
+                        a.error
+                    ),
+                    indent=2,
+                    ensure_ascii=False
+                )
+            )
+        else:
+            remember(
+                a.error,
+                a.resolution,
+                not a.failed
+            )
+
+    elif a.cmd=='proof':
+        if a.sub=='metric':
+            proofadd(
+                a.task,
+                'metric-'+a.phase,
+                a.name,
+                a.value,
+                a.unit
+            )
+
+        elif a.sub=='artifact':
+            proofadd(
+                a.task,
+                'visual-'+a.phase,
+                a.name,
+                str(
+                    Path(
+                        a.path
+                    )
+                    .expanduser()
+                    .resolve()
+                )
+            )
+
+        else:
+            proofcap(
+                a.task,
+                a.checks
+            )
+
+    elif a.cmd=='finish':
+        finish(
+            a.task,
+            a.outcome,
+            a.quality,
+            a.human,
+            a.workers,
+            a.tools,
+            a.capabilities,
+            a.checks
+        )
+
+    elif a.cmd=='dashboard':
+        dashboard()
+
+    elif a.cmd=='model':
+        if a.sub=='scan':
+            modelscan()
+
+        elif a.sub=='status':
+            print(
+                json.dumps(
+                    load(
+                        MODEL,
+                        {}
+                    ),
+                    indent=2
+                )
+            )
+
+        else:
+            modelrecord(
+                a.model,
+                a.task,
+                a.verdict
+            )
+
+    elif a.cmd=='plugins':
+        if a.sub=='snapshot':
+            pluginsnap()
+        else:
+            pluginscan()
+
+    elif a.cmd=='research':
+        research()
+
+    elif a.cmd=='maintain':
+        maintain()
+
+if __name__=='__main__':
+    main()

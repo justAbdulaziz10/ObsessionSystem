@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "system_name": "AgentOS",
+  "default_mode": "owner",
+  "capability_index_ttl_seconds": 3600,
+  "model_refresh_ttl_seconds": 21600,
+  "codex_family": "luna",
+  "codex_reasoning_effort": "xhigh",
+  "claude_lead_family": "opus",
+  "claude_reviewer_family": "opus",
+  "claude_dispatch_family": "haiku",
+  "max_skills_simple": 1,
+  "max_skills_normal": 3,
+  "max_skills_complex": 5,
+  "max_mcps_normal": 2,
+  "max_mcps_complex": 4,
+  "max_codex_workers": 3,
+  "auto_update_installed_plugins": true,
+  "silent_third_party_plugin_install": false,
+  "codex_model": "gpt-6-luna",
+  "codex_effort": "xhigh"
+}

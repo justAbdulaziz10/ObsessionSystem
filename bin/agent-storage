@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+
+from pathlib import Path
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+
+if any(a in ("-h", "--help") for a in sys.argv[1:]):
+    # Any other invocation cleans caches, so --help must exit before that.
+    print("Usage: agent-storage   (no options) prune regenerable caches when disk is low; prints free space")
+    raise SystemExit(0)
+
+HOME = Path.home()
+CONFIG = HOME / ".agent-os/runtime" / "config.json"
+
+try:
+    cfg = json.loads(CONFIG.read_text())
+except Exception:
+    cfg = {}
+
+WARN = float(cfg.get("disk_warn_gb", 20))
+CRITICAL = float(cfg.get("disk_critical_gb", 10))
+RUN_DAYS = int(cfg.get("run_log_retention_days", 7))
+CHECKPOINT_DAYS = int(cfg.get("checkpoint_retention_days", 30))
+
+
+def free():
+    return shutil.disk_usage(HOME).free / (1024 ** 3)
+
+
+# Long-lived state that tools keep under a .tmp dir: the ChatGPT app installs
+# its bundled plugin marketplace into ~/.codex/.tmp/bundled-marketplaces and
+# config.toml points at it (deleting it disabled browser/visualize/etc.).
+KEEP = {"bundled-marketplaces", "marketplaces", "plugins"}
+
+
+def old_children(path, hours):
+    path = Path(path)
+
+    if not path.exists() or not path.is_dir():
+        return 0
+
+    cutoff = time.time() - (hours * 3600)
+    removed = 0
+
+    for item in list(path.iterdir()):
+        if item.name in KEEP:
+            continue
+        try:
+            if item.stat().st_mtime > cutoff:
+                continue
+
+            if item.is_symlink() or item.is_file():
+                item.unlink(missing_ok=True)
+            elif item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+
+            removed += 1
+        except Exception:
+            pass
+
+    return removed
+
+
+before = free()
+
+for path in [
+    HOME / ".codex-ha" / "runs",
+    HOME / ".agent-os/ha" / "runs",
+    HOME / ".agent-os/runtime" / "codex-jobs",
+]:
+    old_children(path, RUN_DAYS * 24)
+
+for state in (HOME / ".agent-os/team" / "state").glob("*"):
+    old_children(state / "checkpoints", CHECKPOINT_DAYS * 24)
+
+for codex in [
+    HOME / ".codex",
+    HOME / ".codex_second",
+]:
+    old_children(codex / ".tmp", 24)
+    old_children(codex / "shell_snapshots", 24)
+
+if free() < WARN:
+    for codex in [
+        HOME / ".codex",
+        HOME / ".codex_second",
+    ]:
+        # Not plugins/cache: it holds installed plugin code that
+        # config.toml points into (e.g. NODE_REPL_TRUSTED_SERVICES).
+        old_children(codex / "cache", 24)
+
+# Docker in Colima: space freed inside the VM stays allocated on the
+# host until fstrim runs (15 GB on 2026-10-08). Trimming never deletes data.
+# Only under pressure: agent-codex calls this before and after every run.
+if free() < WARN and shutil.which("colima"):
+    try:
+        if subprocess.run(["colima", "status"], capture_output=True, timeout=20).returncode == 0:
+            subprocess.run(["colima", "ssh", "--", "sudo", "fstrim", "-a"], capture_output=True, timeout=300)
+    except Exception:
+        pass
+
+# Pressure tier: only caches that tools rebuild on demand. Never source, worktrees, archives, simulators,
+# package stores (pub-cache, swiftpm, Gradle), logins or agent sessions.
+PRESSURE = float(cfg.get("disk_pressure_gb", 15))
+DD = HOME / "Library" / "Developer" / "Xcode" / "DerivedData"
+
+
+def running(pattern):
+    return subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode == 0
+
+
+def xcode_building():
+    # Xcode 27 builds through SWBBuildService; the open IDE indexes and builds without any xcodebuild process.
+    return running("xcodebuild |XCBBuildService|SWBBuildService|Xcode.app/Contents/MacOS/Xcode")
+
+
+
+
+def orphan_derived_data():
+    """DerivedData folders whose project no longer exists (deleted worktrees leave these behind)."""
+    removed = 0
+    for d in DD.glob("*-*"):
+        try:
+            ws = subprocess.run(["/usr/libexec/PlistBuddy", "-c", "Print :WorkspacePath", str(d / "info.plist")],
+                                capture_output=True, text=True, timeout=10).stdout.strip()
+        except Exception:
+            continue
+        if ws.startswith("/") and not Path(ws).exists():
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+    return removed
+
+
+def run(cmd, timeout=600):
+    if shutil.which(cmd[0]):
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=timeout)
+        except Exception:
+            pass
+
+
+def daily(name):
+    stamp = HOME / ".agent-os/runtime" / f"storage-{name}.stamp"
+    if stamp.exists() and time.time() - stamp.stat().st_mtime < 86400:
+        return False
+    stamp.parent.mkdir(parents=True, exist_ok=True)
+    stamp.touch()
+    return True
+
+
+# A running build only blocks the caches that build uses; a long agent build must not stall all cleanup.
+if free() < PRESSURE:
+    orphan_derived_data()  # its project is gone, so no build can be using it
+    # Not `simctl delete unavailable`: right after an Xcode update every simulator looks unavailable, and deleting
+    # one deletes its apps and data. Not Gradle caches: Gradle prunes them by real use, and IDE builds go through
+    # daemons we can't tell from idle ones.
+    if not xcode_building():
+        old_children(DD, 72)
+    if daily("pressure"):
+        run(["uv", "cache", "prune"])
+        os.environ["HOMEBREW_NO_AUTOREMOVE"] = "1"  # old downloads and kegs only; never uninstall formulae
+        run(["brew", "cleanup", "--prune=30"])
+
+if free() < CRITICAL:
+    if not xcode_building():
+        old_children(DD, 24)  # includes ModuleCache.noindex: rebuilt by the next build
+
+after = free()
+
+print(f"AgentOS storage guard: {before:.1f} GB → {after:.1f} GB free")
+
+if after < CRITICAL:
+    print("🔴 Critical disk pressure")
+elif after < WARN:
+    print("🟡 Low disk space")
+else:
+    print("✅ Disk healthy")

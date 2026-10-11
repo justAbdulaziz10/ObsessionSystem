@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: gitleaks
+        run: |
+          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz | tar -xz gitleaks
+          ./gitleaks git . --no-banner --redact --config .gitleaks.toml
+
+  evals:
+    name: Regression suites (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install into a clean HOME and run every suite
+        run: evals/run-all.sh
+
+  syntax:
+    name: Syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python and shell syntax
+        run: |
+          set -e
+          for f in bin/* evals/*/*.py; do
+            if head -1 "$f" | grep -q python; then python3 -m py_compile "$f"; echo "py  $f"; fi
+          done
+          for f in install.sh uninstall.sh evals/run-all.sh evals/overnight/regression.sh evals/telemetry/regression.sh; do
+            bash -n "$f" && echo "sh  $f"
+          done

@@ -1,0 +1,690 @@
+#!/usr/bin/python3
+"""agent-review-route: recommend at most three reviewers for a change.
+
+Slots (each at most one):
+  general     - a general code reviewer, whenever anything changed
+  risk        - ONE Opus risk reviewer (agent-risk-reviewer) when the change
+                touches auth, payments, secrets, crypto, privacy, schema or
+                migrations, infra/CI/deploy, or webhooks
+  specialist  - at most ONE specialist chosen by change type
+
+Scope (what "the change" is):
+  default     whole branch: commits since the merge-base with the base branch
+              PLUS staged, unstaged, and untracked changes. Base = the upstream
+              tracking branch when it is a different branch, else the nearest of
+              origin/HEAD, main, master, develop. With nothing unpublished
+              (on a base branch), falls back to working tree vs HEAD.
+  --range A..B   committed range only (A...B uses the merge-base of A and B)
+  --base REF     merge-base with REF plus working tree and untracked files
+  --worktree     working tree vs HEAD (the pre-2026-10-10 behaviour)
+
+Output: JSON with scope, files, risk (signals), and reviewers (<= 3).
+Stdlib only; runs under /usr/bin/python3 (3.9).
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+MAX_DIFF_CHARS = 3_000_000
+MAX_UNTRACKED_FILES = 200
+MAX_UNTRACKED_BYTES = 256_000
+MAX_SIGNALS = 12
+
+
+# --------------------------------------------------------------------------- git
+
+
+def git(args, cwd, timeout=60):
+    try:
+        p = subprocess.run(
+            ["git"] + args,
+            cwd=cwd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+    return (
+        p.returncode,
+        p.stdout.decode("utf-8", "replace"),
+        p.stderr.decode("utf-8", "replace"),
+    )
+
+
+def rev(ref, cwd):
+    rc, out, _ = git(["rev-parse", "--verify", "-q", ref + "^{commit}"], cwd)
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def merge_base(a, b, cwd):
+    rc, out, _ = git(["merge-base", a, b], cwd)
+    return out.strip() if rc == 0 and out.strip() else None
+
+
+def count_commits(a, b, cwd):
+    rc, out, _ = git(["rev-list", "--count", "%s..%s" % (a, b)], cwd)
+    try:
+        return int(out.strip()) if rc == 0 else 0
+    except ValueError:
+        return 0
+
+
+def current_branch(cwd):
+    rc, out, _ = git(["symbolic-ref", "-q", "--short", "HEAD"], cwd)
+    return out.strip() if rc == 0 else ""
+
+
+def find_base(cwd, head_sha):
+    """Return (base_ref, how, notes) or (None, None, notes)."""
+    notes = []
+    branch = current_branch(cwd)
+    rc, up, _ = git(
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"], cwd
+    )
+    up = up.strip() if rc == 0 else ""
+    if up:
+        up_branch = up.split("/", 1)[1] if "/" in up else up
+        if up_branch != branch:
+            return up, "upstream", notes
+        notes.append(
+            "upstream %s is this branch's own remote copy; using the default base instead"
+            % up
+        )
+
+    cands = []
+    rc, oh, _ = git(["symbolic-ref", "-q", "--short", "refs/remotes/origin/HEAD"], cwd)
+    if rc == 0 and oh.strip():
+        cands.append((oh.strip(), "origin/HEAD"))
+    for name in ("main", "master", "develop"):
+        for ref in ("origin/" + name, name):
+            if ref == branch:
+                continue  # never compare a base branch with itself
+            if rev(ref, cwd):
+                cands.append((ref, "default-branch"))
+                break
+    seen, best = set(), None
+    for ref, how in cands:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        mb = merge_base(ref, head_sha, cwd)
+        if not mb:
+            continue
+        n = count_commits(mb, head_sha, cwd)
+        if best is None or n < best[2]:
+            best = (ref, how, n)
+    if best:
+        if len(seen) > 1:
+            notes.append("base chosen as nearest of: " + ", ".join(sorted(seen)))
+        return best[0], best[1], notes
+    return None, None, notes
+
+
+# Untracked tool output that is never part of a change under review.
+UNTRACKED_NOISE_RE = re.compile(
+    r"(^|/)(graphify-out|\.worktrees|node_modules|\.dart_tool|DerivedData|\.venv|venv|__pycache__|\.pytest_cache|\.mypy_cache|\.gradle|\.next|\.turbo)/"
+    r"|(^|/)\.agentos[^/]*$|\.(pyc|log)$"
+)
+
+
+def untracked_files(cwd):
+    """Return (kept, ignored_count). Nested repos/worktrees (trailing '/') and tool output are ignored."""
+    rc, out, _ = git(["ls-files", "--others", "--exclude-standard", "-z"], cwd)
+    if rc != 0:
+        return [], 0
+    allf = [x for x in out.split("\0") if x]
+    kept = [x for x in allf if not x.endswith("/") and not UNTRACKED_NOISE_RE.search(x)]
+    return kept, len(allf) - len(kept)
+
+
+def untracked_patch(cwd, files):
+    chunks = []
+    for rel in files[:MAX_UNTRACKED_FILES]:
+        path = os.path.join(cwd, rel)
+        try:
+            if os.path.getsize(path) > MAX_UNTRACKED_BYTES:
+                continue
+            with open(path, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            continue
+        if b"\0" in data:
+            continue
+        text = data.decode("utf-8", "replace")
+        body = "".join("+" + ln + "\n" for ln in text.splitlines())
+        chunks.append(
+            "diff --git a/%s b/%s\nnew file (untracked)\n--- /dev/null\n+++ b/%s\n%s"
+            % (rel, rel, rel, body)
+        )
+    return "".join(chunks)
+
+
+def resolve_scope(cwd, args):
+    """Return (scope dict, diff text, file list)."""
+    head = rev("HEAD", cwd)
+    scope = {"mode": None, "includes_worktree": False}
+
+    if args.range:
+        r = args.range
+        if "..." in r:
+            a, b = r.split("...", 1)
+            b = b or "HEAD"
+            frm = merge_base(a, b, cwd)
+            if not frm:
+                raise SystemExit("agent-review-route: no merge-base for %s" % r)
+        elif ".." in r:
+            a, b = r.split("..", 1)
+            b = b or "HEAD"
+            frm = a
+        else:
+            a, b, frm = r, "HEAD", r
+        if not rev(frm, cwd) or not rev(b, cwd):
+            raise SystemExit("agent-review-route: unknown revision in range %s" % r)
+        scope.update(
+            mode="range",
+            range=r,
+            from_=rev(frm, cwd)[:12],
+            to=rev(b, cwd)[:12],
+            commits=count_commits(frm, b, cwd),
+        )
+        diff_args = [frm, b]
+        untracked = []
+    else:
+        if head is None:
+            # No commits yet: everything staged/unstaged/untracked is the change.
+            frm = EMPTY_TREE
+            scope.update(mode="worktree", note="repository has no commits yet")
+        elif args.worktree:
+            frm = head
+            scope.update(mode="worktree", note="--worktree: working tree vs HEAD")
+        else:
+            notes = []
+            if args.base:
+                base_ref, how = args.base, "--base"
+                if not rev(base_ref, cwd):
+                    raise SystemExit("agent-review-route: unknown base %s" % base_ref)
+            else:
+                base_ref, how, notes = find_base(cwd, head)
+            mb = merge_base(base_ref, head, cwd) if base_ref else None
+            n = count_commits(mb, head, cwd) if mb else 0
+            if mb and (n > 0 or args.base):
+                frm = mb
+                scope.update(
+                    mode="base" if args.base else "branch",
+                    base=base_ref,
+                    base_source=how,
+                    merge_base=mb[:12],
+                    commits=n,
+                )
+            else:
+                frm = head
+                why = (
+                    "no base branch found"
+                    if not base_ref
+                    else "nothing unpublished relative to %s" % base_ref
+                )
+                scope.update(
+                    mode="worktree",
+                    base=base_ref,
+                    note=why + "; using working tree vs HEAD",
+                )
+            if notes:
+                scope["notes"] = notes
+        if head:
+            scope["head"] = head[:12]
+        scope["includes_worktree"] = True
+        diff_args = [frm]
+        untracked, ignored = untracked_files(cwd)
+        scope["untracked"] = len(untracked)
+        if ignored:
+            scope["untracked_ignored"] = ignored
+
+    rc, diff, err = git(["diff", "--no-ext-diff", "--no-color", "-M"] + diff_args, cwd)
+    if rc != 0:
+        raise SystemExit("agent-review-route: git diff failed: " + err.strip())
+    rc, names, _ = git(["diff", "--name-only", "--no-renames"] + diff_args, cwd)
+    files = [x for x in names.splitlines() if x.strip()]
+    if untracked:
+        files += [f for f in untracked if f not in files]
+        diff += untracked_patch(cwd, untracked)
+    if len(diff) > MAX_DIFF_CHARS:
+        scope["diff_truncated"] = True
+        diff = diff[:MAX_DIFF_CHARS]
+    if "from_" in scope:
+        scope["from"] = scope.pop("from_")
+    return scope, diff, files
+
+
+# ------------------------------------------------------------------ classification
+
+TEST_RE = re.compile(
+    r"(^|/)(test|tests|spec|specs|__tests__|__mocks__|integration_test|test_driver|"
+    r"testing|fixtures|goldens|[A-Za-z0-9]*Tests|[A-Za-z0-9]*UITests)/"
+    r"|(_test|_spec|\.test|\.spec|Tests?)\.[A-Za-z0-9]+$|(^|/)test_[^/]+\.py$|(^|/)conftest\.py$"
+)
+DOC_RE = re.compile(
+    r"\.(md|mdx|rst|txt|adoc)$|(^|/)(docs?|documentation)/|(^|/)(LICENSE|CHANGELOG|AUTHORS|NOTICE)[^/]*$",
+    re.I,
+)
+GENERATED_RE = re.compile(
+    r"(^|/)(l10n|i18n|locales?|lproj|[a-z-]+\.lproj|generated|\.dart_tool|build)/"
+    r"|\.(arb|strings|stringsdict|xcstrings|po|pot|lock|resolved|png|jpe?g|gif|webp|svg|ico|pdf|ttf|otf|woff2?|mp4|mov|mp3|wav|zip)$"
+    r"|\.(g|freezed|gr|mocks|pb|pbenum|pbjson|pbserver)\.dart$|_pb2(_grpc)?\.py$"
+    r"|(^|/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|Podfile\.lock|Package\.resolved|pubspec\.lock|poetry\.lock|Cargo\.lock|go\.sum)$"
+    r"|(^|/)app_localizations[^/]*\.dart$",
+    re.I,
+)
+
+
+def file_kind(path):
+    base = path.rsplit("/", 1)[-1].lower()
+    if base.startswith("requirements") or base in ("runtime.txt", "constraints.txt"):
+        return "code"
+    if GENERATED_RE.search(path):
+        return "generated"
+    if TEST_RE.search(path):
+        return "test"
+    if DOC_RE.search(path):
+        return "doc"
+    return "code"
+
+
+def path_tokens(path):
+    spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1 \2", path)
+    spaced = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", spaced)
+    return [t for t in re.split(r"[^A-Za-z0-9]+", spaced.lower()) if t]
+
+
+# Path tokens that mark a high-risk area on their own.
+PATH_TOKENS = {
+    "auth": {
+        "auth", "authn", "authz", "oauth", "oauth2", "oidc", "login", "logout",
+        "signin", "signout", "signup", "sso", "saml", "jwt", "jwks", "password",
+        "passwords", "credential", "credentials", "passkey", "passkeys", "mfa",
+        "otp", "totp", "2fa", "authorization", "authentication", "rbac", "acl",
+        "acls",
+    },
+    "payments": {
+        "payment", "payments", "billing", "subscription", "subscriptions",
+        "purchase", "purchases", "iap", "storekit", "revenuecat", "checkout",
+        "invoice", "invoices", "stripe", "receipt", "receipts", "refund",
+        "refunds",
+    },
+    "migrations": {"migration", "migrations", "alembic", "migrate"},
+    "secrets": {"secret", "secrets", "keystore", "keystores"},
+    "crypto": {
+        "security", "crypto", "cryptography", "encryption", "encrypt",
+        "decrypt", "cipher", "keychain", "hmac", "csrf", "cors", "xss",
+        "sanitize", "sanitizer", "pinning", "certificate", "certificates",
+    },
+    "privacy": {
+        "privacy", "consent", "consents", "gdpr", "pii", "redaction", "redact",
+        "anonymize", "anonymise",
+    },
+    "webhooks": {"webhook", "webhooks"},
+    "infra-ci-deploy": {"deploy", "deployment", "deployments", "terraform", "k8s", "helm", "ci"},
+}
+TOKEN_QUALIFIERS = {
+    "access", "refresh", "auth", "api", "bearer", "id", "session", "storage",
+    "store", "manager", "service", "provider", "refresher", "repository",
+    "vault", "jwt", "csrf", "reset",
+}
+AUTH_BIGRAMS = {("sign", "in"), ("sign", "up"), ("sign", "out"), ("log", "in"), ("log", "out")}
+WEAK_PATH_TOKENS = {
+    "permission": "permissions", "permissions": "permissions", "admin": "admin",
+    "paywall": "paywall", "premium": "entitlement", "entitlement": "entitlement",
+    "session": "session", "sessions": "session", "account": "account",
+    "accounts": "account",
+}
+
+INFRA_RE = re.compile(
+    r"(^|/)\.github/workflows/|(^|/)\.gitlab-ci\.ya?ml$|(^|/)\.gitlab/|(^|/)\.circleci/"
+    r"|(^|/)(bitrise\.ya?ml|codemagic\.ya?ml|azure-pipelines\.ya?ml|Jenkinsfile|cloudbuild\.ya?ml|buildspec\.ya?ml)$"
+    r"|(^|/)Dockerfile[^/]*$|(^|/)docker-compose[^/]*\.ya?ml$|\.tf$|\.tfvars$|\.hcl$"
+    r"|(^|/)(terraform|k8s|kubernetes|helm|infra|infrastructure|deploy|deployment|deployments|ansible|pulumi|cdk|fastlane)/"
+    r"|(^|/)(railway\.toml|Procfile|fly\.toml|render\.ya?ml|vercel\.json|netlify\.toml|wrangler\.(toml|json|jsonc)|app\.ya?ml|serverless\.ya?ml|nginx[^/]*\.conf|firebase\.json|apphosting\.ya?ml)$",
+    re.I,
+)
+RULES_RE = re.compile(
+    r"(^|/)(firestore\.rules|storage\.rules|database\.rules\.json|firestore\.indexes\.json)$"
+    r"|\.sql$|(^|/)schema\.prisma$|(^|/)(schema|structure)\.(rb|sql)$|(^|/)supabase/(migrations|functions)/",
+    re.I,
+)
+SECRET_FILE_RE = re.compile(
+    r"(^|/)\.env(\.[^/]*)?$|\.(pem|key|p8|p12|pfx|jks|keystore|mobileprovision|cer|crt|entitlements)$"
+    r"|(^|/)(google-services\.json|GoogleService-Info\.plist|credentials\.json|service[-_]account[^/]*\.json|key\.properties)$",
+    re.I,
+)
+
+
+def path_signals(path):
+    """Return list of (strength, category, evidence)."""
+    out = []
+    if INFRA_RE.search(path):
+        out.append(("strong", "infra-ci-deploy", path))
+    if RULES_RE.search(path):
+        out.append(("strong", "schema-rules", path))
+    if SECRET_FILE_RE.search(path):
+        out.append(("strong", "secrets", path))
+    toks = path_tokens(path)
+    tset = set(toks)
+    for cat, words in PATH_TOKENS.items():
+        hit = tset & words
+        if hit:
+            out.append(("strong", cat, "%s [%s]" % (path, sorted(hit)[0])))
+    for i, t in enumerate(toks):
+        if t in ("token", "tokens"):
+            near = set(toks[max(0, i - 1): i + 2])
+            if near & TOKEN_QUALIFIERS:
+                out.append(("strong", "auth", "%s [token store]" % path))
+                break
+    for i in range(len(toks) - 1):
+        if (toks[i], toks[i + 1]) in AUTH_BIGRAMS:
+            out.append(("strong", "auth", "%s [%s %s]" % (path, toks[i], toks[i + 1])))
+            break
+    for t in toks:
+        if t in WEAK_PATH_TOKENS:
+            out.append(("weak", WEAK_PATH_TOKENS[t], path))
+            break
+    return out
+
+
+# Content signals: specific patterns on changed (+/-) lines of code files only.
+CONTENT_RULES = [
+    # auth / session tokens
+    ("strong", "auth", re.compile(
+        r"(?i)(?<![a-z])(access|refresh|auth|bearer|session|reset|csrf|jwt|api)[_\-]?tokens?\b"
+        r"|\bid[_\-]?token\b|\bidToken\b|(?i:\bAuthorization\b)\s*['\"]?\s*[:=,\]]|['\"]Authorization['\"]|\bBearer\s"
+    )),
+    ("strong", "auth", re.compile(
+        r"\bjwt\.(encode|decode)|\bjsonwebtoken\b|\bPyJWT\b|\bjose\b|\bJWTError\b|\bjwks\b"
+        r"|\b(FirebaseAuth|signInWith[A-Za-z]*|createUserWithEmailAndPassword|sendPasswordResetEmail|confirmPasswordReset|verifyIdToken|verify_id_token|revoke_refresh_tokens|ASAuthorization[A-Za-z]*|ASWebAuthenticationSession|GoogleSignIn|AppleIDProvider|LocalAuthentication|LAContext)\b"
+        r"|\.signOut\(|\bsign_?out\(|(?i:password_?(hash|reset|digest|salt))|(?i:(hash|reset|verify|change|update|confirm|check)_?password)"
+    )),
+    ("strong", "auth", re.compile(
+        r"Depends\(\s*(get_current_[a-z_]+|require_[a-z_]+|verify_[a-z_]+)|@login_required|permission_classes"
+        r"|\b(has_permission|check_permission|require_(role|admin|scope|permission)s?|is_superuser)\b"
+        r"|\b(session_version|token_version|invalidate_sessions?|revoke_sessions?)\b"
+    )),
+    # crypto / secure storage
+    ("strong", "crypto", re.compile(
+        r"\bhashlib\.[a-z0-9_]+|\bhmac\.|\bHMAC\b|\bbcrypt\b|\bargon2\b|\bscrypt\b|(?i:\bpbkdf2)|\bAES\b|\bRSA\b|\bECDSA\b|\bEd25519\b"
+        r"|\bCryptoKit\b|\bCommonCrypto\b|\bSecKey[A-Za-z]*|\bSecItem[A-Za-z]*|\bkSecAttr[A-Za-z]*|\bcrypto\.subtle\b"
+        r"|\bcreate(Hmac|Cipheriv|Decipheriv|Sign|Verify)\b|\bcryptography\.|\bFernet\b|\bnacl\.|\bsecrets\.token_[a-z]+"
+        r"|\bSecRandomCopyBytes\b|\b(en|de)crypt[A-Za-z]*\(|\bverify_?signature\b|(?i:webhook_?secret)|(?i:x-hub-signature|stripe-signature)"
+    )),
+    ("weak", "secure-storage", re.compile(r"\bFlutterSecureStorage\b|\bKeychain[A-Za-z]*\b|\bEncryptedSharedPreferences\b")),
+    # secrets
+    ("strong", "secrets", re.compile(
+        r"-----BEGIN [A-Z ]*PRIVATE KEY-----|\bAKIA[0-9A-Z]{16}\b|\b(sk|rk)_(live|test)_[0-9A-Za-z]{8,}"
+        r"|(?i:\b[a-z0-9_]*(secret|api_?key|private_?key|client_?secret|signing_?key|password)[a-z0-9_]*\s*[:=]\s*['\"][^'\"\s]{8,}['\"])"
+        r"|(?i:(os\.environ|os\.getenv|process\.env|Platform\.environment|String\.fromEnvironment|dotenv)\W{1,4}['\"]?[a-z0-9_]*(secret|token|api_?key|password|private_?key|credential))"
+        r"|(?i:^\s*[a-z0-9_]*(secret|private_key|api_key|client_secret|signing_key|_password|key_id|team_id)[a-z0-9_]*\s*:\s*(str|SecretStr|Optional|bytes)\b)"
+        r"|\bservice_role\b"
+    )),
+    # payments
+    ("strong", "payments", re.compile(
+        r"\bStoreKit\b|\bSKPayment[A-Za-z]*|\bSKProduct[A-Za-z]*|\bProduct\.products\b|\bTransaction\.(currentEntitlements|updates|unfinished)"
+        r"|\bAppStore\.sync\b|\bPurchases\.(shared|configure|instance)\b|\bRevenueCat\b|\bpurchase(Package|Product|StoreProduct)\b|\brestorePurchases\b"
+        r"|\bgetOfferings\b|\bCustomerInfo\b|\bin_app_purchase\b|\bInAppPurchase\b|\bBillingClient\b|\bPurchasesUpdatedListener\b|\bverifyReceipt\b"
+        r"|\bstripe\.[a-z]+|\bPaymentIntent\b|\bPaymentSheet\b|\bcheckout\.sessions?\b"
+    )),
+    ("weak", "entitlement", re.compile(r"\b(isPremium|is_premium|isSubscribed|is_subscribed|EntitlementInfo|entitlements?\[)")),
+    # schema / migrations / data access control
+    ("strong", "schema-rules", re.compile(
+        r"(?i)\b(create|alter|drop)\s+(table|index|column|schema|type|policy|trigger|function|view|extension)\b|\btruncate\s+table\b"
+        r"|enable\s+row\s+level\s+security|\bauth\.uid\(\)|^\s*(grant|revoke)\s+\w+.*\bon\b"
+        r"|\bop\.(add_column|drop_column|create_table|drop_table|alter_column|create_index|drop_index|execute|create_foreign_key|drop_constraint|create_unique_constraint)\b"
+        r"|\bmigrations\.(AddField|RemoveField|AlterField|CreateModel|DeleteModel|RunSQL|RunPython)\b"
+        r"|^\s*(down_)?revision\s*[:=]\s*['\"]|request\.auth\b|allow\s+(read|write|create|update|delete)\b"
+    )),
+    ("strong", "injection", re.compile(r"\.(execute|raw|text|rawQuery|query)\(\s*f['\"]|\.(execute|rawQuery)\(\s*['\"][^'\"]*['\"]\s*\+")),
+    # privacy
+    ("strong", "privacy", re.compile(
+        r"\bprivacySensitive\b|redacted\(reason:\s*\.privacy|\bNS[A-Za-z]+UsageDescription\b|\bNSPrivacy[A-Za-z]*|\bPrivacyInfo\b"
+        r"|(?i:\b(has|grant|revoke|record|require|check)_?consent|\bconsent_?(version|grant|record|status|scope)s?\b|\bgdpr\b|\bpii\b|anonymi[sz]e)"
+    )),
+    # web security headers / CORS
+    ("strong", "web-security", re.compile(
+        r"\bCORSMiddleware\b|\ballow_origins\b|Access-Control-Allow-Origin|Content-Security-Policy|\bcsrf\b|\bCSRF\b"
+        r"|\bSameSite\b|(?i:\bhttponly\b)|Set-Cookie|X-Frame-Options|Strict-Transport-Security|\bdangerouslySetInnerHTML\b|\binnerHTML\s*="
+    )),
+    ("weak", "redirect", re.compile(r"(?i)\b(redirect_uri|redirect_to|redirectTo|return_?url|returnTo)\b")),
+    ("weak", "deletion", re.compile(r"(?i)\b(delete_?account|delete_?user|account_?deletion|hard_?delete|purge_?user)\b")),
+]
+
+# Task text: specific risk words only (no bare "token", "model", "schema", "catch").
+TASK_RE = re.compile(
+    r"(?i)\b(auth|authn|authz|authenticat\w*|authori[sz]\w*|log[ -]?in|sign[ -]?in|sign[ -]?up|log[ -]?out|sign[ -]?out|passwords?|oauth\w*|jwt|sso|2fa|mfa"
+    r"|security|secrets?|credentials?|encrypt\w*|decrypt\w*|crypto\w*|payments?|billing|subscriptions?|in-app purchases?|purchases?|refunds?|checkout|stripe|revenuecat|storekit"
+    r"|privacy|consent|gdpr|pii|rls|row[- ]level security|access control|rbac|webhooks?|account deletion|delete (my |the |user )?accounts?"
+    r"|(db|database|schema|sql|data|alembic)[- ]migrations?|production|prod deploy|deploy\w*|infra\w*)\b"
+    r"|\((db|migrations?|deploy|infra|security|auth|payments?|billing|ci)\)"
+    r"|صلاحيات|أمان|دفع|اشتراك|قاعدة البيانات|خصوصية|كلمة المرور|تسجيل الدخول"
+)
+
+ERROR_RE = re.compile(
+    r"\bcatch\b|\bexcept\b|\.catchError\(|\bon\s+[A-Z]\w*\s+catch\b|\brescue\b|\bfallback\b|\btry\s*[{:?!]|\bonError\b|\bthrow\b|\braise\b|\bfinally\b"
+)
+TYPE_DECL_RE = re.compile(
+    r"^\s*(export\s+)?(public\s+|private\s+|internal\s+|fileprivate\s+)?(abstract\s+|sealed\s+|final\s+|base\s+|data\s+|open\s+)*"
+    r"(class|struct|enum|interface|protocol|typedef|type|record|mixin)\s+[A-Z]\w*"
+)
+
+
+def parse_diff(diff):
+    """Return {path: {"add": [...], "del": [...]}} for changed lines."""
+    files, cur = {}, None
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            m = re.match(r"diff --git a/(.*?) b/(.*)$", line)
+            cur = m.group(2) if m else None
+            if cur is not None:
+                files.setdefault(cur, {"add": [], "del": []})
+            continue
+        if cur is None or line.startswith("+++ ") or line.startswith("--- "):
+            continue
+        if line.startswith("+"):
+            files[cur]["add"].append(line[1:])
+        elif line.startswith("-"):
+            files[cur]["del"].append(line[1:])
+    return files
+
+
+def analyse(task, files, diff):
+    per_file = parse_diff(diff)
+    kinds = {f: file_kind(f) for f in files}
+    code_files = [f for f in files if kinds[f] == "code"]
+    test_files = [f for f in files if kinds[f] == "test"]
+    doc_files = [f for f in files if kinds[f] == "doc"]
+
+    strong, weak = [], []
+
+    def add(lst, kind, cat, ev):
+        lst.append({"source": kind, "category": cat, "evidence": ev[:160]})
+
+    for f in code_files:
+        for strength, cat, ev in path_signals(f):
+            add(strong if strength == "strong" else weak, "path", cat, ev)
+
+    added_code = removed_code = 0
+    error_lines = new_types = 0
+    content_hits = set()
+    for f in code_files:
+        ch = per_file.get(f, {"add": [], "del": []})
+        added_code += len(ch["add"])
+        removed_code += len(ch["del"])
+        for ln in ch["add"]:
+            if ERROR_RE.search(ln):
+                error_lines += 1
+            if TYPE_DECL_RE.search(ln):
+                new_types += 1
+        for ln in ch["add"] + ch["del"]:
+            if len(ln) > 400:
+                ln = ln[:400]
+            for strength, cat, rx in CONTENT_RULES:
+                key = (f, cat)
+                if key in content_hits:
+                    continue
+                m = rx.search(ln)
+                if m:
+                    content_hits.add(key)
+                    add(
+                        strong if strength == "strong" else weak,
+                        "content",
+                        cat,
+                        "%s: %s" % (f, m.group(0).strip()),
+                    )
+
+    task_hit = TASK_RE.search(task or "")
+    if task_hit:
+        add(strong, "task", "task-declared", "task text: %r" % task_hit.group(0))
+
+    weak_kinds = {s["category"] for s in weak}
+    inert_only = bool(files) and not code_files
+    if inert_only:
+        recommended = False
+        risk_note = "tests/docs/generated files only; no production code changed"
+    else:
+        recommended = bool(strong) or len(weak_kinds) >= 2
+        risk_note = None
+        if not strong and len(weak_kinds) >= 2:
+            risk_note = "two or more weak signals: " + ", ".join(sorted(weak_kinds))
+
+    cats = sorted({s["category"] for s in strong} | (weak_kinds if recommended and not strong else set()))
+    stats = {
+        "code_files": len(code_files),
+        "test_files": len(test_files),
+        "doc_files": len(doc_files),
+        "generated_files": len(files) - len(code_files) - len(test_files) - len(doc_files),
+        "added_code_lines": added_code,
+        "removed_code_lines": removed_code,
+        "error_handling_lines": error_lines,
+        "new_type_decls": new_types,
+    }
+    risk = {
+        "recommended": recommended,
+        "categories": cats,
+        "signals": (strong + weak)[:MAX_SIGNALS],
+        "signal_count": {"strong": len(strong), "weak": len(weak)},
+    }
+    if risk_note:
+        risk["note"] = risk_note
+    return risk, stats, code_files, doc_files
+
+
+SECURITY_CATS = {"auth", "crypto", "secrets", "web-security", "injection", "webhooks"}
+
+
+def pick_specialist(task, files, code_files, doc_files, risk, stats):
+    cands = []
+    if risk["recommended"] and SECURITY_CATS & set(risk["categories"]):
+        cands.append(("security-review", "skill", "security-review",
+                      "auth/crypto/secrets surface: " + ", ".join(sorted(SECURITY_CATS & set(risk["categories"])))))
+    e, a = stats["error_handling_lines"], max(stats["added_code_lines"], 1)
+    if e >= 12 or (e >= 4 and e / a >= 0.04):
+        cands.append(("silent-failure-hunter", "agent", "pr-review-toolkit:silent-failure-hunter",
+                      "%d added error-handling/fallback lines" % e))
+    if stats["added_code_lines"] >= 40 and stats["test_files"] == 0 and code_files:
+        cands.append(("pr-test-analyzer", "agent", "pr-review-toolkit:pr-test-analyzer",
+                      "%d added production lines and no test changes" % stats["added_code_lines"]))
+    if stats["new_type_decls"] >= 3:
+        cands.append(("type-design-analyzer", "agent", "pr-review-toolkit:type-design-analyzer",
+                      "%d new type declarations" % stats["new_type_decls"]))
+    exts = [os.path.splitext(f)[1].lower() for f in code_files]
+    if exts:
+        swift = sum(x == ".swift" for x in exts)
+        react = sum(x in (".tsx", ".jsx") for x in exts)
+        if swift * 2 > len(exts):
+            cands.append(("swiftui-pro", "skill", "swiftui-pro", "mostly Swift/SwiftUI changes"))
+        elif react * 2 > len(exts):
+            cands.append(("vercel-react-best-practices", "skill", "vercel-react-best-practices",
+                          "mostly React component changes"))
+    if re.search(r"(?i)\b(refactor\w*|simplif\w*|clean ?up)\b", task or "") and code_files:
+        cands.append(("code-simplifier", "agent", "pr-review-toolkit:code-simplifier", "refactor/simplification task"))
+    if doc_files and not code_files:
+        cands.append(("comment-analyzer", "agent", "pr-review-toolkit:comment-analyzer", "documentation-only change"))
+    return cands
+
+
+def route(task, scope, files, diff):
+    risk, stats, code_files, doc_files = analyse(task, files, diff)
+    reviewers = []
+    if files:
+        reviewers.append({
+            "slot": "general",
+            "name": "code-reviewer",
+            "agent": "pr-review-toolkit:code-reviewer",
+            "kind": "agent",
+            "model": "opus" if len(files) > 20 and len(code_files) > 10 else "inherit",
+            "reason": "general final review of the whole change",
+        })
+    if risk["recommended"]:
+        reviewers.append({
+            "slot": "risk",
+            "name": "agent-risk-reviewer",
+            "agent": "agent-risk-reviewer",
+            "kind": "agent",
+            "model": "opus",
+            "reason": "high-risk change: " + ", ".join(risk["categories"]),
+        })
+    cands = pick_specialist(task, files, code_files, doc_files, risk, stats) if files else []
+    if cands:
+        name, kind, ident, why = cands[0]
+        reviewers.append({
+            "slot": "specialist",
+            "name": name,
+            "agent": ident,
+            "kind": kind,
+            "model": "inherit",
+            "reason": why,
+        })
+    return {
+        "scope": scope,
+        "file_count": len(files),
+        "files": files,
+        "stats": stats,
+        "risk": risk,
+        "reviewers": reviewers[:3],
+        "specialist_alternates": [c[0] for c in cands[1:]],
+    }
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="agent-review-route",
+        description="Recommend at most 3 reviewers (general, Opus risk, one specialist) for the current change.",
+    )
+    ap.add_argument("task", nargs="*", help="original task / requirement text")
+    ap.add_argument("-C", "--repo", default=None, help="repository directory (default: cwd)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--range", help="committed range A..B or A...B (no working tree)")
+    g.add_argument("--base", help="base ref; judge merge-base(REF, HEAD) plus working tree")
+    g.add_argument("--worktree", action="store_true", help="working tree vs HEAD only")
+    args = ap.parse_intermixed_args(argv)
+
+    cwd = os.path.abspath(args.repo or os.getcwd())
+    rc, top, _ = git(["rev-parse", "--show-toplevel"], cwd)
+    task = " ".join(args.task)
+    if rc != 0 or not top.strip():
+        print(json.dumps({
+            "scope": {"mode": "none", "note": "not a git repository: " + cwd},
+            "file_count": 0, "files": [], "risk": {"recommended": False, "categories": [], "signals": []},
+            "reviewers": [], "specialist_alternates": [],
+        }, indent=2, ensure_ascii=False))
+        return 0
+    root = top.strip()
+    scope, diff, files = resolve_scope(root, args)
+    scope["repo"] = root
+    print(json.dumps(route(task, scope, files, diff), indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

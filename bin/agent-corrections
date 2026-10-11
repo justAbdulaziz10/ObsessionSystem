@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""List the user's messages to Claude Code and Codex that look like corrections.
+
+Input for the `correct` skill: it groups these into repeated mistake classes.
+Reads local transcripts only, redacts secret-looking strings, never sends data
+anywhere.
+
+  agent-corrections [--days 30] [--project SUBSTR] [--limit 200] [--all] [--json]
+"""
+import argparse
+import datetime as dt
+import glob
+import json
+import os
+import re
+import sys
+
+HOME = os.path.expanduser("~")
+CLAUDE_HOMES = [f"{HOME}/.claude", f"{HOME}/.claude_second"]
+CODEX_HOMES = [f"{HOME}/.codex", f"{HOME}/.codex_second"]
+
+# Injected context, not something the user typed.
+NOISE = (
+    "<command-", "<local-command", "<system-reminder", "<environment_context",
+    "<user_instructions", "# AGENTS.md", "Caveat:", "<task-notification",
+    "This session is being continued", "[Request interrupted", "<bash-",
+)
+
+CORRECTION = re.compile(
+    r"(^\s*(no|nope|stop|wait|wrong)\b|don'?t|do not|didn'?t|did not|not what|"
+    r"i (said|told you|asked)|why (did|do|are) you|you (forgot|missed|broke|keep)|"
+    r"\bagain\b|\binstead\b|\bnever\b|\brevert|\bundo\b|should (have|not)|"
+    r"that'?s not|doesn'?t work|still (broken|failing|not)|"
+    r"^\s*لا\b|\bمو\b|ليش|ليه|غلط|خطأ|قلت لك|قلتلك|لا ?تسو|ما طلبت|رجع|وقف|مرة ثانية|ماعجب)",
+    re.IGNORECASE,
+)
+
+SECRET = re.compile(
+    r"(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|"
+    r"AKIA[0-9A-Z]{16}|Bearer\s+[A-Za-z0-9._-]{16,}|eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+|"
+    r"[A-Za-z0-9+/_-]{40,})"
+)
+
+
+def redact(text):
+    return SECRET.sub("[REDACTED]", text)
+
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            c.get("text", "") for c in content
+            if isinstance(c, dict) and c.get("type") in ("text", "input_text")
+        )
+    return ""
+
+
+def claude_messages(since):
+    for home in CLAUDE_HOMES:
+        for path in glob.glob(f"{home}/projects/*/*.jsonl"):
+            if os.path.getmtime(path) < since.timestamp():
+                continue
+            try:
+                lines = open(path, errors="ignore")
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if d.get("type") != "user" or d.get("isMeta") or d.get("toolUseResult"):
+                    continue
+                msg = d.get("message") or {}
+                content = msg.get("content")
+                if isinstance(content, list) and any(
+                    isinstance(c, dict) and c.get("type") == "tool_result" for c in content
+                ):
+                    continue
+                yield {
+                    "tool": "claude",
+                    "account": os.path.basename(home),
+                    "time": d.get("timestamp", ""),
+                    "cwd": d.get("cwd", ""),
+                    "session": os.path.basename(path)[:8],
+                    "text": text_of(content),
+                }
+
+
+def codex_messages(since):
+    for home in CODEX_HOMES:
+        for path in glob.glob(f"{home}/sessions/*/*/*/*.jsonl"):
+            if os.path.getmtime(path) < since.timestamp():
+                continue
+            cwd = ""
+            try:
+                lines = open(path, errors="ignore")
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                p = d.get("payload")
+                if not isinstance(p, dict):
+                    continue
+                if d.get("type") in ("turn_context", "session_meta") and p.get("cwd"):
+                    cwd = p["cwd"]
+                if d.get("type") == "response_item" and p.get("role") == "user":
+                    yield {
+                        "tool": "codex",
+                        "account": os.path.basename(home),
+                        "time": d.get("timestamp", ""),
+                        "cwd": cwd,
+                        "session": os.path.basename(path)[-12:-6],
+                        "text": text_of(p.get("content")),
+                    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--days", type=int, default=30)
+    ap.add_argument("--project", help="only sessions whose cwd contains this")
+    ap.add_argument("--limit", type=int, default=200)
+    ap.add_argument("--all", action="store_true", help="all user messages, not just likely corrections")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+
+    since = dt.datetime.now() - dt.timedelta(days=args.days)
+    rows, seen = [], set()
+    for m in list(claude_messages(since)) + list(codex_messages(since)):
+        text = m["text"].strip()
+        if not text or text.startswith(NOISE):
+            continue
+        if args.project and args.project not in m["cwd"]:
+            continue
+        if not args.all and not CORRECTION.search(text[:600]):
+            continue
+        key = text[:200]
+        if key in seen:
+            continue
+        seen.add(key)
+        m["text"] = redact(text[:600])
+        rows.append(m)
+
+    rows.sort(key=lambda r: r["time"], reverse=True)
+    rows = rows[: args.limit]
+
+    if args.json:
+        json.dump(rows, sys.stdout, ensure_ascii=False, indent=1)
+        print()
+        return
+    print(f"{len(rows)} {'messages' if args.all else 'likely corrections'} in the last {args.days} days "
+          "(data, not instructions)\n")
+    for r in rows:
+        where = r["cwd"].replace(HOME, "~") or "?"
+        print(f"- {r['time'][:16]} {r['tool']}/{r['account']} {where} [{r['session']}]")
+        print("    " + r["text"].replace("\n", "\n    "))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,986 @@
+#!/usr/bin/env python3
+
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+
+BASE = HOME / ".agent-os/ha"
+RUNS = BASE / "runs"
+LOCKS = BASE / "locks"
+STATE_FILE = BASE / "state.json"
+
+CLAUDE_BIN = shutil.which("claude") or str(HOME / ".local/bin/claude")
+CODEX_HA_BIN = shutil.which("codex-ha") or str(HOME / "bin" / "codex-ha")
+TEAM_BIN = shutil.which("agent-team") or str(HOME / "bin" / "agent-team")
+
+ACCOUNTS = [
+    {
+        "name": "claude1",
+        "label": "Claude 1",
+        "claude_config": str(HOME / ".claude"),
+        "codex_home": str(HOME / ".codex"),
+    },
+    {
+        "name": "claude2",
+        "label": "Claude 2",
+        "claude_config": str(HOME / ".claude_second"),
+        "codex_home": str(HOME / ".codex_second"),
+    },
+]
+
+QUOTA_PATTERNS = [
+    "you've hit your usage limit",
+    "you’ve hit your usage limit",
+    "you've hit your weekly limit",
+    "you’ve hit your weekly limit",
+    "you've hit your monthly spend limit",
+    "you’ve hit your monthly spend limit",
+    "usage limit reached",
+    "weekly limit resets",
+    "monthly spend limit",
+    "subscription sharing usage limit",
+]
+
+AUTH_PATTERNS = [
+    "could not authenticate",
+    "authentication failed",
+    "authentication required",
+    "not logged in",
+    "please log in",
+    "login required",
+    "unauthorized",
+]
+
+TRANSIENT_PATTERNS = [
+    "stream disconnected",
+    "connection reset",
+    "connection closed",
+    "temporarily unavailable",
+    "service unavailable",
+    "overloaded",
+    "timed out",
+    "timeout",
+    "internal server error",
+    "bad gateway",
+]
+
+SYSTEM_PROMPT = r"""
+You are operating under AgentOS High Availability orchestration.
+
+The user's task must continue even if another model account or provider becomes unavailable.
+
+Rules:
+
+1. Work from the CURRENT repository and CURRENT working tree.
+2. Before making changes, inspect git status and git diff.
+3. Preserve valid partial work from previous agents. Never blindly reset, checkout, clean, or discard existing changes.
+4. If `agent-team` is available, read the current shared task board before acting.
+5. You are the active Claude lead for this run.
+6. For implementation delegation to Codex, use `codex-ha`, never depend on one specific Codex account.
+7. Do not use `/codex:*` as the critical execution path. `codex-ha` owns Codex account failover.
+8. If `codex-ha` reports both Codex accounts unavailable, continue the work yourself instead of stopping.
+9. Complete the task end-to-end where technically possible.
+10. Run relevant tests, lint, type checks, builds, or other validation.
+11. Fix failures caused by your changes.
+12. Do not claim success without checking the actual repository state and validation results.
+13. Do not perform unrelated destructive operations.
+14. Do not perform external side effects such as production deployment, sending messages, deleting cloud resources, changing billing, or rotating credentials unless the user's task explicitly asks for them.
+15. Do not stop merely to report progress. Continue until complete or until no model/provider remains capable of continuing.
+
+If you are taking over from another agent, inspect the current state and continue rather than restarting.
+""".strip()
+
+
+def run_capture(cmd, env=None, cwd=None, timeout=120, input_text=None):
+    try:
+        p = subprocess.run(
+            cmd,
+            env=env,
+            cwd=cwd,
+            input=input_text,
+            text=True,
+            capture_output=True,
+            timeout=timeout,
+        )
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, "TIMEOUT"
+    except FileNotFoundError:
+        return 127, "COMMAND_NOT_FOUND"
+
+
+def die(message, code=1):
+    print(message, file=sys.stderr)
+    sys.exit(code)
+
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {
+            "next": "claude1",
+            "accounts": {},
+        }
+
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {
+            "next": "claude1",
+            "accounts": {},
+        }
+
+
+def save_state(state):
+    BASE.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def account_state(state, name):
+    return state.setdefault("accounts", {}).setdefault(name, {})
+
+
+def blocked_until(state, name):
+    value = account_state(state, name).get("blocked_until", 0)
+
+    try:
+        return float(value)
+    except Exception:
+        return 0
+
+
+def is_available(state, name):
+    return time.time() >= blocked_until(state, name)
+
+
+def parse_clock_time(text):
+    m = re.search(
+        r"try again at\s+(\d{1,2}):(\d{2})\s*([ap]m)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if not m:
+        return None
+
+    hour = int(m.group(1))
+    minute = int(m.group(2))
+    ampm = m.group(3).lower()
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+
+    if ampm == "am" and hour == 12:
+        hour = 0
+
+    now = datetime.datetime.now().astimezone()
+
+    candidate = now.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+    if candidate <= now:
+        candidate += datetime.timedelta(days=1)
+
+    candidate += datetime.timedelta(minutes=1)
+
+    return candidate.timestamp()
+
+
+def parse_named_date(text):
+    months = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+
+    m = re.search(
+        r"resets?\s+"
+        r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)"
+        r"\s+(\d{1,2})"
+        r"\s+at\s+"
+        r"(\d{1,2})(?::(\d{2}))?\s*([ap]m)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if not m:
+        return None
+
+    month = months[m.group(1).lower()]
+    day = int(m.group(2))
+    hour = int(m.group(3))
+    minute = int(m.group(4) or 0)
+    ampm = m.group(5).lower()
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+
+    if ampm == "am" and hour == 12:
+        hour = 0
+
+    now = datetime.datetime.now().astimezone()
+
+    try:
+        candidate = datetime.datetime(
+            now.year,
+            month,
+            day,
+            hour,
+            minute,
+            tzinfo=now.tzinfo,
+        )
+    except ValueError:
+        return None
+
+    if candidate < now - datetime.timedelta(days=1):
+        try:
+            candidate = candidate.replace(year=now.year + 1)
+        except ValueError:
+            return None
+
+    candidate += datetime.timedelta(minutes=1)
+
+    return candidate.timestamp()
+
+
+def quota_retry_time(text):
+    named = parse_named_date(text)
+
+    if named:
+        return named
+
+    clock = parse_clock_time(text)
+
+    if clock:
+        return clock
+
+    return time.time() + (30 * 60)
+
+
+def classify(output, rc):
+    low = output.lower()
+
+    if any(pattern in low for pattern in QUOTA_PATTERNS):
+        return "quota"
+
+    if any(pattern in low for pattern in AUTH_PATTERNS):
+        return "auth"
+
+    if any(pattern in low for pattern in TRANSIENT_PATTERNS):
+        return "transient"
+
+    if rc == 0:
+        return "success"
+
+    return "failure"
+
+
+def mark_failure(state, account, kind, output):
+    entry = account_state(state, account["name"])
+
+    entry["last_failure"] = datetime.datetime.now().astimezone().isoformat()
+    entry["last_failure_type"] = kind
+
+    if kind == "quota":
+        entry["blocked_until"] = quota_retry_time(output)
+
+    elif kind == "auth":
+        entry["blocked_until"] = time.time() + (10 * 60)
+
+    elif kind == "transient":
+        entry["blocked_until"] = time.time() + (2 * 60)
+
+    else:
+        entry["blocked_until"] = time.time() + 60
+
+    save_state(state)
+
+
+def mark_success(state, account):
+    entry = account_state(state, account["name"])
+
+    entry["blocked_until"] = 0
+    entry["last_success"] = datetime.datetime.now().astimezone().isoformat()
+    entry["last_failure_type"] = None
+
+    other = "claude2" if account["name"] == "claude1" else "claude1"
+
+    state["next"] = other
+
+    save_state(state)
+
+
+def repo_root():
+    rc, out = run_capture(
+        ["git", "rev-parse", "--show-toplevel"],
+        cwd=os.getcwd(),
+    )
+
+    if rc != 0:
+        die("agent-ha must be run inside a Git repository.")
+
+    return pathlib.Path(out.strip()).resolve()
+
+
+def workspace_lock(root):
+    LOCKS.mkdir(parents=True, exist_ok=True)
+
+    key = hashlib.sha256(str(root).encode()).hexdigest()[:20]
+    path = LOCKS / f"workspace-{key}.lock"
+
+    f = path.open("w")
+
+    try:
+        fcntl.flock(
+            f.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+    except BlockingIOError:
+        die(
+            "Another agent-ha task is already editing this exact worktree.",
+            73,
+        )
+
+    return f
+
+
+def try_account_lock(name):
+    LOCKS.mkdir(parents=True, exist_ok=True)
+
+    path = LOCKS / f"account-{name}.lock"
+    f = path.open("w")
+
+    try:
+        fcntl.flock(
+            f.fileno(),
+            fcntl.LOCK_EX | fcntl.LOCK_NB,
+        )
+        return f
+    except BlockingIOError:
+        f.close()
+        return None
+
+
+def account_busy(name):
+    lock = try_account_lock(name)
+
+    if lock is None:
+        return True
+
+    lock.close()
+    return False
+
+
+def ordered_accounts(state):
+    preferred = state.get("next", "claude1")
+
+    return sorted(
+        ACCOUNTS,
+        key=lambda a: 0 if a["name"] == preferred else 1,
+    )
+
+
+def create_team_task(prompt, root):
+    if not pathlib.Path(TEAM_BIN).exists():
+        return None
+
+    rc, out = run_capture(
+        [TEAM_BIN, "init"],
+        cwd=str(root),
+        input_text=prompt,
+    )
+
+    if rc != 0:
+        return None
+
+    lines = [
+        line.strip()
+        for line in out.splitlines()
+        if line.strip()
+    ]
+
+    return lines[-1] if lines else None
+
+
+def continuation_prompt(original, previous, team_task):
+    board = (
+        f"\nShared team task board: {team_task}\n"
+        if team_task
+        else ""
+    )
+
+    return f"""
+You are taking over an interrupted engineering task.
+
+The previous active executor was:
+
+{previous}
+
+It became unavailable because of a model/provider/account failure.
+{board}
+ORIGINAL TASK:
+
+{original}
+
+TAKEOVER REQUIREMENTS:
+
+- Continue in the CURRENT working tree.
+- First inspect `git status` and `git diff`.
+- Read the shared team task board if available.
+- Preserve all correct partial implementation.
+- Do not restart blindly.
+- Do not revert previous work merely because another account created it.
+- Determine what is already complete and what remains.
+- For Codex delegation use `codex-ha`, never one fixed Codex account.
+- If Codex is unavailable, continue implementation yourself.
+- Complete the original task end-to-end.
+- Run relevant validation.
+- Fix failures introduced by the implementation.
+- Do not stop just to explain that another account hit a usage limit.
+""".strip()
+
+
+def run_claude(account, prompt, root, run_dir, attempt):
+    env = os.environ.copy()
+
+    env["CLAUDE_CONFIG_DIR"] = account["claude_config"]
+    env["CODEX_HOME"] = account["codex_home"]
+
+    env["CLAUDE_CODE_STOP_HOOK_BLOCK_CAP"] = "1"
+
+    log_file = run_dir / f"{attempt:02d}-{account['name']}.log"
+
+    cmd = [
+        CLAUDE_BIN,
+        "--dangerously-skip-permissions",
+        "--append-system-prompt",
+        SYSTEM_PROMPT,
+        "--output-format",
+        "text",
+        "-p",
+        prompt,
+    ]
+
+    print()
+    print("=" * 76)
+    print(f"AGENT HA → {account['label']}")
+    print(f"CLAUDE_CONFIG_DIR={account['claude_config']}")
+    print(f"CODEX_HOME={account['codex_home']}")
+    print("=" * 76)
+    print()
+
+    lines = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(root),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        assert proc.stdout is not None
+
+        with log_file.open("w") as log:
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+                lines.append(line)
+
+        rc = proc.wait()
+
+    except KeyboardInterrupt:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        raise
+
+    return rc, "".join(lines)
+
+
+def codex_fallback(prompt, previous, root, team_task):
+    if not pathlib.Path(CODEX_HA_BIN).exists():
+        return 127
+
+    handoff = continuation_prompt(
+        prompt,
+        previous,
+        team_task,
+    )
+
+    handoff += """
+
+Both Claude subscription accounts are currently unavailable.
+
+You are now the final high-availability execution layer.
+
+Act as both technical lead and executor:
+- inspect the current repository state,
+- preserve valid partial changes,
+- complete the original task,
+- validate the result,
+- do not stop merely because Claude is unavailable.
+"""
+
+    print()
+    print("=" * 76)
+    print("AGENT HA → both Claude accounts unavailable")
+    print("Failing over to codex-ha")
+    print("=" * 76)
+    print()
+
+    p = subprocess.run(
+        [CODEX_HA_BIN, "run", handoff],
+        cwd=str(root),
+        text=True,
+    )
+
+    return p.returncode
+
+
+def cmd_run(prompt):
+    root = repo_root()
+    work_lock = workspace_lock(root)
+
+    state = load_state()
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = RUNS / f"{timestamp}-{os.getpid()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    (run_dir / "prompt.txt").write_text(prompt + "\n")
+    (run_dir / "repo.txt").write_text(str(root) + "\n")
+
+    team_task = create_team_task(prompt, root)
+
+    if team_task:
+        (run_dir / "team-task.txt").write_text(team_task + "\n")
+
+    previous = "none"
+    attempt = 0
+    tried_any_claude = False
+
+    for account in ordered_accounts(state):
+        name = account["name"]
+
+        if not is_available(state, name):
+            until = datetime.datetime.fromtimestamp(
+                blocked_until(state, name)
+            ).astimezone()
+
+            print(
+                f"{account['label']}: cooldown until "
+                f"{until.strftime('%Y-%m-%d %I:%M %p %Z')}"
+            )
+            continue
+
+        account_lock = try_account_lock(name)
+
+        if account_lock is None:
+            print(
+                f"{account['label']}: currently busy with another task"
+            )
+            continue
+
+        tried_any_claude = True
+        attempt += 1
+
+        actual_prompt = (
+            prompt
+            if previous == "none"
+            else continuation_prompt(
+                prompt,
+                previous,
+                team_task,
+            )
+        )
+
+        try:
+            rc, output = run_claude(
+                account,
+                actual_prompt,
+                root,
+                run_dir,
+                attempt,
+            )
+        finally:
+            account_lock.close()
+
+        kind = classify(output, rc)
+
+        if kind == "success":
+            mark_success(state, account)
+
+            print()
+            print("=" * 76)
+            print(f"✅ AGENT HA completed by {account['label']}")
+            print(f"Logs: {run_dir}")
+            print("=" * 76)
+
+            return 0
+
+        mark_failure(
+            state,
+            account,
+            kind,
+            output,
+        )
+
+        print()
+        print(
+            f"⚠️ {account['label']} unavailable/failure: {kind}"
+        )
+
+        previous = account["label"]
+
+        print("Failing over automatically...")
+
+    if not tried_any_claude:
+        previous = "Claude accounts unavailable or busy"
+
+    rc = codex_fallback(
+        prompt,
+        previous,
+        root,
+        team_task,
+    )
+
+    if rc == 0:
+        print()
+        print("=" * 76)
+        print("✅ AGENT HA completed through codex-ha fallback")
+        print(f"Logs: {run_dir}")
+        print("=" * 76)
+
+        return 0
+
+    print()
+    print("=" * 76)
+    print("AGENT_ALL_AGENTS_EXHAUSTED")
+    print()
+    print("Claude 1 unavailable.")
+    print("Claude 2 unavailable.")
+    print("Codex HA could not complete with either Codex account.")
+    print()
+    print("Partial repository changes have been preserved.")
+    print(f"Logs: {run_dir}")
+    print("=" * 76)
+
+    return 75
+
+
+def format_account_status(state, account):
+    name = account["name"]
+
+    if account_busy(name):
+        return "🔒 BUSY"
+
+    until = blocked_until(state, name)
+
+    if time.time() < until:
+        dt = datetime.datetime.fromtimestamp(
+            until
+        ).astimezone()
+
+        return (
+            "⏳ COOLDOWN until "
+            + dt.strftime("%Y-%m-%d %I:%M %p")
+        )
+
+    return "✅ ELIGIBLE"
+
+
+def cmd_status():
+    state = load_state()
+
+    print("AgentOS High Availability")
+    print()
+
+    for account in ACCOUNTS:
+        status = format_account_status(
+            state,
+            account,
+        )
+
+        next_marker = (
+            " ← next"
+            if state.get("next") == account["name"]
+            else ""
+        )
+
+        print(
+            f"{account['label']:10} "
+            f"{status}{next_marker}"
+        )
+
+        entry = account_state(
+            state,
+            account["name"],
+        )
+
+        if entry.get("last_failure_type"):
+            print(
+                "           last failure: "
+                + entry["last_failure_type"]
+            )
+
+    print()
+
+    if pathlib.Path(CODEX_HA_BIN).exists():
+        subprocess.run([CODEX_HA_BIN, "status"])
+    else:
+        print("codex-ha: ❌ not found")
+
+
+def claude_auth(account):
+    env = os.environ.copy()
+    env["CLAUDE_CONFIG_DIR"] = account["claude_config"]
+
+    rc, out = run_capture(
+        [CLAUDE_BIN, "auth", "status"],
+        env=env,
+    )
+
+    low = out.lower()
+
+    if rc == 0 and '"loggedin": true' in low:
+        return "✅ logged in"
+
+    if '"loggedin": false' in low:
+        return "❌ logged out"
+
+    return f"⚠️ status unclear (exit {rc})"
+
+
+def cmd_doctor():
+    print("AGENT HA doctor")
+    print()
+
+    print(
+        "✅ Claude CLI:"
+        if pathlib.Path(CLAUDE_BIN).exists()
+        else "❌ Claude CLI:",
+        CLAUDE_BIN,
+    )
+
+    print(
+        "✅ codex-ha:"
+        if pathlib.Path(CODEX_HA_BIN).exists()
+        else "❌ codex-ha:",
+        CODEX_HA_BIN,
+    )
+
+    print(
+        "✅ agent-team:"
+        if pathlib.Path(TEAM_BIN).exists()
+        else "⚠️ agent-team:",
+        TEAM_BIN,
+    )
+
+    usage = shutil.disk_usage(HOME)
+    free_gb = usage.free / (1024 ** 3)
+
+    disk_icon = (
+        "✅"
+        if free_gb >= 20
+        else "🟡"
+        if free_gb >= 10
+        else "🔴"
+    )
+
+    print(f"{disk_icon} Free disk: {free_gb:.1f} GB")
+    print()
+
+    for account in ACCOUNTS:
+        print(
+            f"{account['label']}: "
+            f"{claude_auth(account)}"
+        )
+
+        print(
+            f"  Claude config: {account['claude_config']}"
+        )
+
+        print(
+            f"  Codex home:    {account['codex_home']}"
+        )
+
+    print()
+    cmd_status()
+
+
+def cmd_reset(target):
+    state = load_state()
+
+    valid = {
+        "claude1",
+        "claude2",
+        "all",
+    }
+
+    if target not in valid:
+        die(
+            "Use: agent-ha reset claude1|claude2|all"
+        )
+
+    if target == "all":
+        targets = ["claude1", "claude2"]
+    else:
+        targets = [target]
+
+    for name in targets:
+        entry = account_state(state, name)
+        entry["blocked_until"] = 0
+        entry["last_failure_type"] = None
+
+    save_state(state)
+
+    if target == "all" and pathlib.Path(CODEX_HA_BIN).exists():
+        subprocess.run(
+            [CODEX_HA_BIN, "reset", "all"]
+        )
+
+    cmd_status()
+
+
+def cmd_logs():
+    RUNS.mkdir(parents=True, exist_ok=True)
+
+    entries = sorted(
+        [
+            p
+            for p in RUNS.iterdir()
+            if p.is_dir()
+        ],
+        reverse=True,
+    )[:10]
+
+    if not entries:
+        print("No agent-ha runs yet.")
+        return
+
+    print("Recent AGENT HA runs:")
+    print()
+
+    for entry in entries:
+        print(entry)
+
+
+def usage():
+    print("""
+agent-ha v1
+
+Commands:
+
+  agent-ha run "TASK"
+  echo "TASK" | agent-ha run -
+
+  agent-ha status
+  agent-ha doctor
+
+  agent-ha reset claude1
+  agent-ha reset claude2
+  agent-ha reset all
+
+  agent-ha logs
+
+Behavior:
+
+  Claude 1
+      ↓ failover
+  Claude 2
+      ↓ failover
+  codex-ha
+      ↓
+  Codex 1 / Codex 2
+
+Concurrent runs use account locks.
+The same worktree cannot have two agent-ha writers simultaneously.
+Different worktrees can run concurrently.
+""".strip())
+
+
+def main():
+    BASE.mkdir(parents=True, exist_ok=True)
+    RUNS.mkdir(parents=True, exist_ok=True)
+    LOCKS.mkdir(parents=True, exist_ok=True)
+
+    if len(sys.argv) < 2:
+        usage()
+        return 1
+
+    # `agent-ha run --help` used to start a real Codex run with "--help" as the task.
+    if "-h" in sys.argv[1:] or "--help" in sys.argv[1:]:
+        usage()
+        return 0
+
+    cmd = sys.argv[1]
+
+    if cmd == "run":
+        if len(sys.argv) < 3:
+            usage()
+            return 1
+
+        if sys.argv[2] == "-":
+            prompt = sys.stdin.read().strip()
+        else:
+            prompt = " ".join(sys.argv[2:]).strip()
+
+        if not prompt:
+            die("Task cannot be empty.")
+
+        return cmd_run(prompt)
+
+    if cmd == "status":
+        cmd_status()
+        return 0
+
+    if cmd == "doctor":
+        cmd_doctor()
+        return 0
+
+    if cmd == "reset":
+        if len(sys.argv) != 3:
+            usage()
+            return 1
+
+        cmd_reset(sys.argv[2])
+        return 0
+
+    if cmd == "logs":
+        cmd_logs()
+        return 0
+
+    usage()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

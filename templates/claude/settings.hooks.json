@@ -1,0 +1,64 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/bin/agent-autopilot\" status --hook 2>/dev/null || true"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/bin/agent-ship\" guard"
+          }
+        ]
+      },
+      {
+        "matcher": "^(Skill|Agent|Task|Read)$|^mcp__",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/bin/agent-telemetry-hook\""
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/bin/agent-telemetry-hook\""
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/bin/agent-telemetry-hook\""
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$HOME/bin/agent-telemetry-hook\""
+          }
+        ]
+      }
+    ]
+  }
+}

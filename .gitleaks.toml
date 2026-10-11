@@ -1,0 +1,12 @@
+# Secret-scan config. Default rules stay on; the only exceptions are the exact
+# fake credentials the regression suites plant to prove the scanners catch them.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Deliberate fake secrets in eval fixtures"
+regexTarget = "match"
+regexes = [
+  '''AKIAABCDEFGHIJKLMNOP''',  # agent-ship: allow-secret
+  '''eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0In0\.abcdefghijklmnop''',  # agent-ship: allow-secret
+]

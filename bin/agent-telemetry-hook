@@ -1,0 +1,64 @@
+# AgentOS capability + session telemetry hook: spool writer (change 20261010-202747-b8cde9).
+# Replaces the Python hook of change 20261010-125352-781c6f (backup: agent-telemetry-hook.bak-20261010b).
+#
+# NO SHEBANG ON PURPOSE. Claude Code runs this via `sh -c '"$HOME/bin/agent-telemetry-hook"'`; execve() fails with
+# ENOEXEC and /bin/sh (bash 3.2 in POSIX mode on macOS; zsh and dash hand it to /bin/sh too) interprets the file
+# in-process. That skips a second interpreter exec, the biggest cost left on this machine (~3 ms CPU per exec).
+# It must therefore be started through a shell (as settings.json does), not via a direct execve without one.
+#
+# Registered in ~/.claude/settings.json and ~/.claude_second/settings.json on
+#   PreToolUse (matcher ^(Skill|Agent|Task|Read)$|^mcp__), Stop, StopFailure, SessionEnd.
+# Hot path: no python, no jq, no DB; usually no fork at all (payloads > 8 KiB fork one `cat`).
+# Each kept event becomes one private file (mode 600, created O_EXCL via noclobber; concurrent writers never collide)
+#   <spool>/e.<pid>[.<n>]   line 1: AOS1<TAB>$CLAUDE_CONFIG_DIR<TAB><~/.agent-os/mode>   rest: the hook JSON as received
+# The event time is the file's mtime. ~/bin/agent-telemetry-ingest turns spool files into the usage/sessions rows
+# the Python hook used to write; Stop/StopFailure/SessionEnd start it fully detached (it sleeps ~1 s, then ingests).
+# Plain Reads (no SKILL.md and no /agents/ in the payload) are dropped here, exactly like the old fast path.
+#
+# Contract: never block or alter a tool call. Always exit 0, never write stdout/stderr.
+# Env: AGENTOS_DISTILL=1 or AGENTOS_TELEMETRY_DISABLE=1 -> do nothing.
+#      AGENTOS_TELEMETRY_SPOOL=<dir> / AGENTOS_TELEMETRY_ERRLOG=<path> -> alternate spool / error log (tests).
+exec >/dev/null 2>&1
+set +eu
+[ -n "${AGENTOS_DISTILL-}${AGENTOS_TELEMETRY_DISABLE-}" ] && exit 0
+[ -t 0 ] && exit 0
+if [ -n "${BASH_VERSION-}" ]; then
+	# bash reads pipes byte by byte: cheap for the usual < 8 KiB payload, so fork `cat` only for the rest.
+	ev=
+	if IFS= read -r -n 8192 -d '' ev; then
+		rest=$(cat)
+		ev=$ev$rest
+	fi
+else
+	ev=$(cat)
+fi
+[ -n "$ev" ] || exit 0
+case $ev in
+*'"tool_name":"Read"'* | *'"tool_name": "Read"'*)
+	case $ev in *SKILL.md* | */agents/*) ;; *) exit 0 ;; esac ;;
+esac
+umask 077
+d=${AGENTOS_TELEMETRY_SPOOL:-$HOME/.agent-os/runtime/telemetry-spool}
+m=
+read -r m <"$HOME/.agent-os/mode"
+set -C
+w() { printf 'AOS1\t%s\t%s\n%s\n' "${CLAUDE_CONFIG_DIR-}" "$m" "$ev" >"$1"; }
+if ! w "$d/e.$$"; then
+	[ -d "$d" ] || mkdir -p -m 700 "$d"
+	n=1
+	while ! w "$d/e.$$.$n"; do
+		n=$((n + 1))
+		if [ $n -gt 20 ]; then
+			set +C
+			printf '%s agent-telemetry-hook: cannot write a spool file in %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$d" \
+				>>"${AGENTOS_TELEMETRY_ERRLOG:-$HOME/.agent-os/runtime/telemetry-errors.log}"
+			exit 0
+		fi
+	done
+fi
+case $ev in
+*'"hook_event_name":"Stop'* | *'"hook_event_name": "Stop'* | *'"hook_event_name":"SessionEnd"'* | *'"hook_event_name": "SessionEnd"'*)
+	"$HOME/bin/agent-telemetry-ingest" --detach </dev/null >/dev/null 2>&1 &
+	;;
+esac
+exit 0

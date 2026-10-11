@@ -1,0 +1,467 @@
+#!/usr/bin/python3
+"""Turn yesterday's resolved tool failures into AgentOS failure memories (`agent-fail remember`).
+
+  agent-session-distill [--hours 24] [--max 5] [--dry-run] [--live N] [--json] [--transcript PATH]
+
+1. Candidates: Claude sessions active in the window, from the v2 `sessions` table (written by
+   ~/bin/agent-telemetry-hook) plus transcript files under ~/.claude*/projects modified in the window.
+   Sessions already distilled are skipped.
+2. Each transcript is parsed deterministically: a tool_result error followed later by a successful
+   result of the same tool + command head (Bash) / file (Edit, Write) / tool name is a "resolved
+   failure". Trivial errors (grep no-match, edit-before-read, user rejection) are ignored.
+   StopFailure (API error) counts are reported but are not distilled: there is no fix to learn.
+3. For at most --max sessions (best pair each), a redacted snippet goes to Haiku via `claude -p`
+   with no tools, no MCP servers, no session persistence, and AGENTOS_DISTILL=1 (telemetry hook off).
+   It must answer strict JSON {error_signature, resolution} or {skip: true}.
+4. Accepted answers are written with `agent-fail remember` (max --max per run); sessions are marked
+   distilled in the DB (result label only). No transcript text is stored anywhere: only paths,
+   counts, and the one-line signature/resolution.
+
+--dry-run: list candidates and snippet sizes; no model call, no writes.
+--dry-run --live N: also ask the model for the first N candidates and print the answer; still no writes.
+Guest mode (agent-mode guest): does nothing.
+Env: AGENTOS_TELEMETRY_DB (DB path), AGENTOS_DISTILL_LOG (log file).
+"""
+import argparse
+import fcntl
+import glob
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime, timedelta
+
+HOME = os.path.expanduser("~")
+DB = os.environ.get("AGENTOS_TELEMETRY_DB") or os.path.join(HOME, ".agent-os", "v2", "db", "agentos.sqlite")
+RUNTIME = os.path.join(HOME, ".agent-os", "runtime", "autopilot")
+LOG = os.environ.get("AGENTOS_DISTILL_LOG") or os.path.join(RUNTIME, "distill.log")
+CLAUDE_HOMES = [os.path.join(HOME, ".claude"), os.path.join(HOME, ".claude_second")]
+OUT_OF_USAGE = re.compile(r"usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage|"
+                          r"credit balance|not logged in|please run /login|overloaded", re.I)
+
+# Errors that teach nothing: expected exits, harness guards, user decisions.
+NOISE = re.compile(
+    r"has not been read yet|doesn't want to proceed|was rejected|user rejected|Interrupted by user|"
+    r"String to replace not found|Found \d+ matches of the string|exceeds maximum allowed tokens|"
+    r"File content \(\d+ tokens\)|Request interrupted|permission to use|denied by|hook error|"
+    r"InputValidationError|File does not exist\. Note: your current working directory|Blocked: |"
+    r"Cancelled: parallel tool call|<tool_use_error>Sibling tool call errored", re.I)
+
+SECRETS = [
+    (re.compile(r"-----BEGIN [A-Z0-9 ]*-----.*?(-----END [A-Z0-9 ]*-----|\Z)", re.S), "<PEM-REDACTED>"),
+    (re.compile(r"sk-ant-[A-Za-z0-9_\-]{6,}"), "<KEY-REDACTED>"),
+    (re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}"), "<KEY-REDACTED>"),
+    (re.compile(r"AIza[0-9A-Za-z_\-]{20,}"), "<KEY-REDACTED>"),
+    (re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_\-]{16,}"),
+     "<TOKEN-REDACTED>"),
+    (re.compile(r"xox[abprs]-[A-Za-z0-9\-]{10,}"), "<TOKEN-REDACTED>"),
+    (re.compile(r"\bAKIA[0-9A-Z]{16}\b"), "<KEY-REDACTED>"),
+    (re.compile(r"eyJ[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}\.[A-Za-z0-9_\-]{6,}"), "<JWT-REDACTED>"),
+    (re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/\-]{12,}=*"), "Bearer <TOKEN-REDACTED>"),
+    (re.compile(r"(?i)\b([A-Z0-9_.\-]*(?:api[_-]?key|token|secret|passw(?:or)?d|auth|credential|private[_-]?key)"
+                r"[A-Z0-9_.\-]*)(\"?\s*[=:]\s*\"?)[^\s\"',;]{6,}"), r"\1\2<REDACTED>"),
+    (re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+"), "<EMAIL>"),
+    (re.compile(r"\b[A-Fa-f0-9]{40,}\b"), "<HEX>"),
+    (re.compile(r"[A-Za-z0-9+/_\-]{48,}={0,2}"), "<BLOB-REDACTED>"),
+]
+
+SYSTEM = (
+    "You turn one failed tool call from an AI coding session, and the later call that succeeded, into a reusable "
+    "failure memory for future agents. Reply with exactly one JSON object and nothing else.\n"
+    "Either {\"error_signature\": \"...\", \"resolution\": \"...\"} or {\"skip\": true}.\n"
+    "error_signature: the stable error text a future agent would see, max 160 chars; keep the tool/command name "
+    "and the error message; drop machine-specific paths, ids, timestamps, project, company or customer names.\n"
+    "resolution: the concrete fix that made the later call succeed, one imperative sentence, max 300 chars, "
+    "generic enough to reuse in another repository.\n"
+    "Answer {\"skip\": true} when the error is trivial or expected (no match, typo, missing file the agent then "
+    "created), the fix is not visible in the input, the lesson is specific to one project's business logic, or "
+    "it would need private data. Never include secrets, credentials, emails or personal data."
+)
+
+
+def redact(s):
+    s = s or ""
+    for rx, rep in SECRETS:
+        s = rx.sub(rep, s)
+    return s
+
+
+def now():
+    return datetime.now().astimezone()
+
+
+def log(msg):
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    with open(LOG, "a") as f:
+        f.write("[%s] %s\n" % (now().strftime("%Y-%m-%d %H:%M:%S"), msg))
+
+
+def mode():
+    try:
+        with open(os.path.join(HOME, ".agent-os", "mode")) as f:
+            return f.read().strip() or "owner"
+    except OSError:
+        return "owner"
+
+
+def account_of(path):
+    return "claude2" if "/.claude_second/" in path else "claude1"
+
+
+# ---------------------------------------------------------------- transcript parsing
+
+def text_of(content):
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        out = []
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                out.append(str(b.get("text") or ""))
+            elif isinstance(b, str):
+                out.append(b)
+        return "\n".join(out)
+    return ""
+
+
+SKIP_HEADS = ("cd", "export", "set", "source", ".", "echo", "printf", "true", "sleep", "unset", "ulimit")
+# Exploration commands: a failed look followed by another look is not a fix worth remembering.
+LOOKUP_HEADS = {"ls", "cat", "head", "tail", "grep", "egrep", "rg", "find", "fd", "sed", "awk", "wc", "which", "file",
+                "stat", "du", "df", "pgrep", "ps", "for", "while", "if", "test", "[", "[[", "diff", "sort", "uniq",
+                "cut", "tr", "xargs", "jq", "open", "less", "tree", "realpath", "readlink", "basename", "dirname",
+                "date", "whoami", "type", "command", "env", "printenv", "lsof", "mdfind", "plutil", "defaults",
+                "sqlite3", "curl", "tar", "unzip", "shasum", "md5", "git log", "git show", "git status", "git diff",
+                "git branch", "git rev-parse", "git ls-files", "git grep", "git remote"}
+
+
+def bash_head(cmd):
+    """'cd x && FOO=1 flutter test --x' -> 'flutter test'."""
+    for seg in re.split(r"&&|\|\||;|\||\n", cmd or ""):
+        toks = seg.strip().split()
+        while toks and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", toks[0]):
+            toks = toks[1:]
+        if toks and toks[0] in ("sudo", "env", "time", "command", "exec", "rtk"):
+            toks = toks[1:]
+        if not toks or toks[0] in SKIP_HEADS:
+            continue
+        head = [os.path.basename(toks[0])]
+        if len(toks) > 1 and not toks[1].startswith("-") and "/" not in toks[1] and "." not in toks[1] \
+                and len(toks[1]) < 30:
+            head.append(toks[1])
+        return " ".join(head)
+    return ""
+
+
+def call_key(name, inp):
+    inp = inp if isinstance(inp, dict) else {}
+    if name in ("Bash", "PowerShell"):
+        h = bash_head(str(inp.get("command") or ""))
+        if not h or h in LOOKUP_HEADS or h.split(" ")[0] in LOOKUP_HEADS:
+            return None
+        return (name, h)
+    if name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):
+        return (name, str(inp.get("file_path") or inp.get("notebook_path") or ""))
+    if name in ("Read", "Glob", "Grep", "TodoWrite", "ToolSearch"):
+        return None  # lookups: a failed lookup followed by another lookup is not a fix
+    return (name, "")
+
+
+def describe_input(name, inp):
+    inp = inp if isinstance(inp, dict) else {}
+    if name in ("Bash", "PowerShell"):
+        return str(inp.get("command") or "")
+    if name in ("Edit", "Write", "MultiEdit"):
+        return "%s %s" % (name, inp.get("file_path") or "")
+    try:
+        return json.dumps(inp, ensure_ascii=False)[:600]
+    except (TypeError, ValueError):
+        return ""
+
+
+def parse(path):
+    """Return dict(pairs=[...], errors=n, api_errors=n, cwd=str)."""
+    uses = {}
+    results = []  # (idx, tool_use_id, is_error, text)
+    notes = []  # (idx, assistant text)
+    api_errors = 0
+    cwd = ""
+    idx = 0
+    with open(path, errors="replace") as f:
+        for line in f:
+            idx += 1
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(d, dict):
+                continue
+            if not cwd and d.get("cwd"):
+                cwd = str(d.get("cwd"))
+            if d.get("isApiErrorMessage"):
+                api_errors += 1
+            if d.get("isSidechain"):
+                continue
+            m = d.get("message")
+            if not isinstance(m, dict) or not isinstance(m.get("content"), list):
+                continue
+            for b in m["content"]:
+                if not isinstance(b, dict):
+                    continue
+                t = b.get("type")
+                if t == "tool_use":
+                    uses[b.get("id")] = (str(b.get("name") or ""), b.get("input"))
+                elif t == "tool_result":
+                    results.append((idx, b.get("tool_use_id"), bool(b.get("is_error")), text_of(b.get("content"))))
+                elif t == "text" and d.get("type") == "assistant":
+                    notes.append((idx, str(b.get("text") or "")))
+    pairs, errors, open_err = [], 0, {}
+    for i, tid, is_err, text in results:
+        if tid not in uses:
+            continue
+        name, inp = uses[tid]
+        key = call_key(name, inp)
+        if is_err:
+            errors += 1
+            body = re.sub(r"^Exit code \d+\s*", "", text.strip())
+            if key is None or not body.strip() or NOISE.search(text):
+                continue
+            e = open_err.setdefault(key, {"first": (i, name, inp, text), "count": 0})
+            e["count"] += 1
+            e["last"] = (i, name, inp, text)
+        elif key in open_err:
+            e = open_err.pop(key)
+            pairs.append({"key": list(key), "tries": e["count"], "error": e["last"], "fix": (i, name, inp, text)})
+    return {"pairs": pairs, "errors": errors, "api_errors": api_errors, "cwd": cwd, "notes": notes}
+
+
+def snippet(pair, notes):
+    ei, ename, einp, etext = pair["error"]
+    fi, fname, finp, ftext = pair["fix"]
+    between = " ".join(t for i, t in notes if ei < i < fi)[-700:]
+    s = ("Tool: %s\nFailed %d time(s). Last failing call:\n%s\n\nError output:\n%s\n\n"
+         "Agent notes between failure and success:\n%s\n\nSucceeding call:\n%s\n\nSuccess output (start):\n%s\n") % (
+        ename, pair["tries"], describe_input(ename, einp)[:600], etext.strip()[:1500], between or "(none)",
+        describe_input(fname, finp)[:600], ftext.strip()[:400])
+    return redact(s)
+
+
+# ---------------------------------------------------------------- candidates
+
+def db():
+    c = sqlite3.connect(DB, timeout=5)
+    c.row_factory = sqlite3.Row
+    c.executescript(
+        """CREATE TABLE IF NOT EXISTS sessions(
+            session_id TEXT PRIMARY KEY, account TEXT, mode TEXT, cwd TEXT, repo TEXT, transcript_path TEXT,
+            first_seen TEXT, last_seen TEXT, end_reason TEXT, stops INTEGER DEFAULT 0,
+            stop_failures INTEGER DEFAULT 0, last_error TEXT, tool_counts TEXT, distilled_at TEXT, distill_result TEXT);""")
+    return c
+
+
+def candidates(c, hours, only=None):
+    cutoff = now() - timedelta(hours=hours)
+    found = {}
+    for r in c.execute("SELECT * FROM sessions WHERE last_seen >= ?", (cutoff.isoformat(timespec="milliseconds"),)):
+        found[r["session_id"]] = dict(r)
+    for p in glob.glob(os.path.join(HOME, ".claude*", "projects", "*", "*.jsonl")):
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        if mt < cutoff.timestamp():
+            continue
+        sid = os.path.basename(p)[:-6]
+        row = found.get(sid)
+        if row is None:
+            prev = c.execute("SELECT * FROM sessions WHERE session_id=?", (sid,)).fetchone()
+            row = dict(prev) if prev else {"session_id": sid, "account": account_of(p), "stop_failures": 0,
+                                           "distilled_at": None, "transcript_path": p, "_new": True}
+            found[sid] = row
+        if not row.get("transcript_path"):
+            row["transcript_path"] = p
+    out = []
+    for sid, row in found.items():
+        tp = row.get("transcript_path") or ""
+        if only and os.path.realpath(tp) != os.path.realpath(only):
+            continue
+        if not only and row.get("distilled_at"):
+            continue
+        if not tp or not os.path.exists(tp):
+            continue
+        out.append(row)
+    return out
+
+
+def ask_model(text):
+    """(answer dict or None, note). Tries each Claude account like agent-overnight does."""
+    note = "no Claude account available"
+    with tempfile.TemporaryDirectory(prefix="agentos-distill-") as cwd:
+        for home in CLAUDE_HOMES:
+            if not os.path.isdir(home):
+                continue
+            env = dict(os.environ, CLAUDE_CONFIG_DIR=home, AGENTOS_DISTILL="1", AGENTOS_TELEMETRY_DISABLE="1")
+            cmd = ["claude", "-p", "--model", "haiku", "--output-format", "json", "--tools", "",
+                   "--strict-mcp-config", "--no-session-persistence", "--max-budget-usd", "0.25",
+                   "--system-prompt", SYSTEM]
+            try:
+                p = subprocess.run(cmd, input=text, cwd=cwd, env=env, capture_output=True, text=True, timeout=180)
+                raw, rc = p.stdout, p.returncode
+                err = p.stderr
+            except subprocess.TimeoutExpired:
+                return None, "%s: timeout" % os.path.basename(home)
+            except OSError as e:
+                return None, "claude not runnable: %s" % e
+            try:
+                d = json.loads(raw)
+            except ValueError:
+                d = None
+            result = str(d.get("result") or "") if isinstance(d, dict) else (raw + err)
+            is_error = bool(d.get("is_error")) if isinstance(d, dict) else rc != 0
+            if is_error and OUT_OF_USAGE.search(result + err):
+                note = "%s out of usage" % os.path.basename(home)
+                continue
+            if is_error:
+                return None, "%s: %s" % (os.path.basename(home), result.strip()[:160])
+            return extract(result), "%s ok" % os.path.basename(home)
+    return None, note
+
+
+def extract(result):
+    m = re.search(r"\{.*\}", result or "", re.S)
+    if not m:
+        return None
+    try:
+        d = json.loads(m.group(0))
+    except ValueError:
+        return None
+    if not isinstance(d, dict):
+        return None
+    if d.get("skip") is True:
+        return {"skip": True}
+    sig, res = d.get("error_signature"), d.get("resolution")
+    if isinstance(sig, str) and isinstance(res, str) and sig.strip() and res.strip():
+        return {"error_signature": redact(" ".join(sig.split()))[:200],
+                "resolution": redact(" ".join(res.split()))[:400]}
+    return None
+
+
+def mark(c, row, label):
+    ts = now().isoformat(timespec="milliseconds")
+    if row.get("_new"):
+        c.execute("INSERT OR IGNORE INTO sessions(session_id,account,cwd,transcript_path,last_seen,stops,stop_failures) "
+                  "VALUES(?,?,?,?,?,0,0)", (row["session_id"], row.get("account"), row.get("cwd") or "",
+                                            row.get("transcript_path"), row.get("last_seen") or ts))
+    c.execute("UPDATE sessions SET distilled_at=?, distill_result=? WHERE session_id=?", (ts, label[:200], row["session_id"]))
+    c.commit()
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--hours", type=float, default=24)
+    ap.add_argument("--max", type=int, default=5)
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--live", type=int, default=0, help="with --dry-run: ask the model for the first N candidates")
+    ap.add_argument("--json", action="store_true")
+    ap.add_argument("--transcript", help="only this transcript (ignores the distilled mark)")
+    ap.add_argument("--show-snippet", action="store_true", help="print the redacted snippets (dry-run)")
+    a = ap.parse_args()
+    a.max = max(0, min(a.max, 5))
+
+    if mode() == "guest":
+        print("distill: skipped (guest mode)")
+        return
+    os.makedirs(RUNTIME, exist_ok=True)
+    lock = open(os.path.join(RUNTIME, "distill.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("distill: another run is active")
+        return
+
+    c = db()
+    rows = candidates(c, a.hours, a.transcript)
+    scored = []
+    for row in rows:
+        try:
+            info = parse(row["transcript_path"])
+        except OSError as e:
+            info = {"pairs": [], "errors": 0, "api_errors": 0, "cwd": "", "notes": [], "err": str(e)}
+        row.setdefault("cwd", info["cwd"])
+        if not row.get("cwd"):
+            row["cwd"] = info["cwd"]
+        sf = int(row.get("stop_failures") or 0)
+        if not info["pairs"] and not sf and not info["api_errors"]:
+            continue
+        best = max(info["pairs"], key=lambda p: (p["tries"], len(p["error"][3]))) if info["pairs"] else None
+        scored.append((len(info["pairs"]), sf + info["api_errors"], row, info, best))
+    scored.sort(key=lambda x: (-x[0], -x[1]))
+    listing = [{"session_id": r["session_id"], "account": r.get("account"), "cwd": r.get("cwd"),
+                "transcript": r["transcript_path"], "resolved_pairs": n, "stop_failures": int(r.get("stop_failures") or 0),
+                "api_errors": info["api_errors"], "tool_errors": info["errors"],
+                "best": (best["key"] if best else None), "best_tries": (best["tries"] if best else 0)}
+               for n, _, r, info, best in scored]
+
+    distillable = [x for x in scored if x[4] is not None][:a.max]
+    results = []
+    remembered = 0
+    live_left = a.live if a.dry_run else len(distillable)
+    for n, _, row, info, best in distillable:
+        snip = snippet(best, info["notes"])
+        entry = {"session_id": row["session_id"], "snippet_chars": len(snip), "key": best["key"]}
+        if a.dry_run and a.show_snippet:
+            entry["snippet"] = snip
+        if live_left <= 0:
+            entry["result"] = "not-asked (dry-run)"
+            results.append(entry)
+            continue
+        live_left -= 1
+        ans, note = ask_model(snip)
+        entry["model"] = note
+        entry["answer"] = ans
+        if ans is None:
+            entry["result"] = "error"
+        elif ans.get("skip"):
+            entry["result"] = "skip"
+        elif a.dry_run:
+            entry["result"] = "would-remember"
+        else:
+            p = subprocess.run([os.path.join(HOME, "bin", "agent-fail"), "remember", ans["error_signature"],
+                                ans["resolution"]], capture_output=True, text=True, timeout=60)
+            entry["result"] = "remembered" if p.returncode == 0 else "agent-fail rc=%d" % p.returncode
+            remembered += p.returncode == 0
+        if not a.dry_run:
+            label = entry["result"] if entry["result"] != "error" else "error: " + note
+            mark(c, row, label)
+            log("session %s (%s) %s%s" % (row["session_id"], row.get("account"), entry["result"],
+                                          (": " + ans["error_signature"]) if ans and not ans.get("skip") else ""))
+        results.append(entry)
+    if not a.dry_run:
+        for n, _, row, info, best in scored:
+            if best is None:  # API-error-only sessions: nothing to learn, do not look again
+                mark(c, row, "no-resolved-pair")
+    summary = "distill: %d session(s) in %gh, %d with failure signals, %d distillable, %d asked, %d remembered%s" % (
+        len(rows), a.hours, len(scored), len([x for x in scored if x[4]]),
+        sum(1 for r in results if "model" in r), remembered, " (dry-run)" if a.dry_run else "")
+    if not a.dry_run:
+        log(summary)
+    if a.json:
+        print(json.dumps({"summary": summary, "candidates": listing, "results": results}, indent=1, ensure_ascii=False))
+    else:
+        for x in listing:
+            print("%s %-7s pairs=%-2d stopfail=%-2d apierr=%-2d toolerr=%-3d best=%s  %s" % (
+                x["session_id"][:8], x["account"], x["resolved_pairs"], x["stop_failures"], x["api_errors"],
+                x["tool_errors"], x["best"], x["cwd"]))
+        for r in results:
+            print("-> %s %s %s" % (r["session_id"][:8], r["result"], json.dumps(r.get("answer"), ensure_ascii=False)
+                                   if r.get("answer") else ""))
+            if r.get("snippet"):
+                print(r["snippet"])
+        print(summary)
+
+
+if __name__ == "__main__":
+    main()

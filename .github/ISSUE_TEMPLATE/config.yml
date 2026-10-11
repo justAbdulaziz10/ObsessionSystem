@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/justAbdulaziz10/ObsessionSystem/security/advisories/new
+    about: Report privately, never in a public issue.
+  - name: Questions and ideas
+    url: https://github.com/justAbdulaziz10/ObsessionSystem/discussions
+    about: Ask how to use it, share setups, discuss direction.

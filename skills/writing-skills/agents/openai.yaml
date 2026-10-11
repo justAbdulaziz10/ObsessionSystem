@@ -1,0 +1,6 @@
+interface:
+  display_name: "Writing Skills"
+  short_description: "Write and review skills to the AgentOS standard"
+  default_prompt: "Use $writing-skills to review this skill's description, body, layout, and provenance, then run agent-skill-lint and the trigger eval."
+policy:
+  allow_implicit_invocation: true

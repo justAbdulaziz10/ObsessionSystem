@@ -1,0 +1,865 @@
+#!/usr/bin/env python3
+"""Keep the user's projects improving without anyone typing a command.
+
+  agent-autopilot tick          one pass (launchd runs this every hour)
+  agent-autopilot status [--hook]   what is waiting for the user (--hook: only
+                                text for a session-start hook, silent if nothing)
+  agent-autopilot repos         the repos it would work on, and why others are skipped
+  agent-autopilot worktrees [--apply]   finished worktrees that can go (--apply: after the user's OK)
+  agent-autopilot enable | disable
+  agent-autopilot allow PATTERN | deny PATTERN   edit the repo filter
+
+A tick finds repos the user worked in recently (from Claude and Codex session
+logs), queues checkable upkeep into agent-overnight, runs at most a few tasks,
+and notifies the user when something finishes:
+
+  - a repo with no verify-<app> skill gets one (create-verification-skill)
+  - a repo whose verify skill is older than maintain_days is re-proved
+    (maintain-verification-skill)
+  - a repo where the user corrected agents correct_min+ times in 14 days gets
+    a `correct` pass that turns the repeated mistake into a check
+  - once a day after 03:00, resolved tool failures from the last 24h of Claude
+    sessions become failure memories (agent-session-distill; skipped in guest mode)
+
+Work stays on overnight/* branches in separate worktrees. Nothing is merged or
+pushed; the next agent session sees `status --hook` and offers the merge.
+A repo is picked up only from sessions after `active_since`, so it wakes up the
+next time the user works in it; any new project joins the same way. Repos
+matching a deny pattern are never touched.
+"""
+import argparse
+import collections
+import datetime as dt
+import fcntl
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG = Path(os.environ.get("AGENT_AUTOPILOT_CONFIG") or HOME / ".agent-os" / "autopilot.json")
+ROOT = Path(os.environ.get("AGENT_AUTOPILOT_DIR") or HOME / ".agent-os" / "runtime" / "autopilot")
+STATE = ROOT / "state.json"
+OVERNIGHT_QUEUE = Path(os.environ.get("AGENT_OVERNIGHT_DIR") or HOME / ".agent-os" / "runtime" / "overnight") / "queue.json"
+DEFAULTS = {
+    "enabled": True,
+    "deny": [],
+    # Only sessions after this moment count; a repo wakes up the first time the user works in it again.
+    "active_since": None,
+    "allow": [],
+    "repos": [],  # always considered (even in scratch paths), unless denied
+    "lookback_days": 14,
+    "max_tasks_per_tick": 2,
+    "maintain_days": 7,
+    "correct_min": 3,
+    "retry_failed_days": 7,
+    "min_free_gb": 10,
+    "clean_below_gb": 15,
+}
+# Never real projects: scratch dirs, temp dirs, app data, AgentOS runtime.
+SKIP = re.compile(r"/\.t3/scratch/|/var/folders/|^/private/tmp|^/tmp/|/Library/|/\.agent-os/|/runtime/overnight/|"
+                  r"/\.claude[^/]*/|/\.codex[^/]*/")
+VERIFY_DONE = "ls .agents/skills/verify-*/SKILL.md >/dev/null 2>&1 && ls -d .claude/skills/verify-* >/dev/null 2>&1"
+
+
+def now():
+    return dt.datetime.now()
+
+
+def config():
+    try:
+        return {**DEFAULTS, **json.loads(CONFIG.read_text())}
+    except (OSError, ValueError):
+        return dict(DEFAULTS)
+
+
+def save_config(c):
+    CONFIG.write_text(json.dumps(c, indent=2) + "\n")
+
+
+def load_state():
+    try:
+        return json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        return {"repos": {}, "notified": []}
+
+
+def save_state(s):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(s, indent=1))
+    os.replace(tmp, STATE)
+
+
+def git(repo, *args):
+    if args and args[0] == "--no-optional-locks":
+        return subprocess.run(["git", "--no-optional-locks", "-C", str(repo), *args[1:]], capture_output=True, text=True)
+    return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
+
+
+def log(msg):
+    ROOT.mkdir(parents=True, exist_ok=True)
+    with open(ROOT / "autopilot.log", "a") as f:
+        f.write(f"[{now():%Y-%m-%d %H:%M:%S}] {msg}\n")
+    print(msg, flush=True)
+
+
+def session_cwds(days, active_since=None):
+    since = time.time() - days * 86400
+    if active_since:
+        since = max(since, dt.datetime.fromisoformat(active_since).timestamp())
+    counts = collections.Counter()
+    paths = glob.glob(str(HOME / ".claude*/projects/*/*.jsonl")) + glob.glob(str(HOME / ".codex*/sessions/*/*/*/*.jsonl"))
+    for p in paths:
+        try:
+            if os.path.getmtime(p) < since:
+                continue
+            with open(p, errors="ignore") as f:
+                m = re.search(r'"cwd":\s*"([^"]+)"', f.read(200_000))
+        except OSError:
+            continue
+        if m:
+            counts[m.group(1)] += 1
+    return counts
+
+
+def main_repo(path):
+    """Top level of the main checkout for a path inside any of its worktrees."""
+    if not os.path.isdir(path):
+        return None
+    common = git(path, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip()
+    if not common:
+        return None
+    common = Path(common)
+    return str(common.parent if common.name == ".git" else common)
+
+
+def base_branch(repo):
+    """The integration branch work should start from: of main/master/develop, the one with the newest
+    commit (a repo whose main sits untouched for months while develop moves works on develop).
+    Returns the remote-tracking ref (fetched, read-only) when the local branch is missing or strictly behind."""
+    remotes = git(repo, "remote").stdout.split()
+    remote = "origin" if "origin" in remotes else (remotes or [None])[0]
+    best = None
+    for b in ("main", "master", "develop"):
+        local = git(repo, "rev-parse", "--verify", "-q", f"refs/heads/{b}").returncode == 0
+        tracked = remote and git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{b}").returncode == 0
+        if not (local or tracked):
+            continue
+        if tracked:
+            try:
+                subprocess.run(["git", "-C", repo, "fetch", "-q", remote, b], capture_output=True, timeout=90,
+                               env={**os.environ, "GIT_TERMINAL_PROMPT": "0"})
+            except subprocess.TimeoutExpired:
+                pass
+        ref = f"{remote}/{b}" if tracked else b
+        when = int(git(repo, "log", "-1", "--format=%ct", ref).stdout.strip() or 0)
+        if best is None or when > best[0]:
+            best = (when, b, local, tracked, ref)
+    if not best:
+        return git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip() or None
+    _, b, local, tracked, ref = best
+    if not local:
+        return ref
+    if tracked and git(repo, "rev-list", "--count", f"{b}..{ref}").stdout.strip() not in ("", "0") \
+            and git(repo, "merge-base", "--is-ancestor", b, ref).returncode == 0:
+        return ref
+    return b
+
+
+def repos_for(cwd, days):
+    """The repo containing cwd, or, for a folder of repos, the children committed to recently."""
+    repo = main_repo(cwd)
+    if repo:
+        return [repo]
+    if not os.path.isdir(cwd) or str(HOME) == cwd.rstrip("/"):
+        return []
+    out = []
+    for child in sorted(Path(cwd).iterdir()):
+        if (child / ".git").exists() and git(child, "log", "-1", f"--since={days} days ago", "--format=%h").stdout.strip():
+            r = main_repo(str(child))
+            if r:
+                out.append(r)
+    return out
+
+
+def discover(c):
+    """Return ([(repo, sessions, base)], {repo: skip reason})."""
+    picked, skipped = {}, {}
+    cwds = session_cwds(c["lookback_days"], c.get("active_since"))
+    explicit = {os.path.realpath(os.path.expanduser(r)) for r in c["repos"]}
+    for r in explicit:
+        cwds[r] += 1
+    for cwd, n in cwds.items():
+        for repo in repos_for(cwd, c["lookback_days"]):
+            low = repo.lower()
+            if str(HOME) == repo:
+                reason = "home directory"
+            elif any(p.lower() in low for p in c["deny"] if p) and not any(p.lower() in low for p in c["allow"] if len(p) >= 4):
+                reason = "denied by config"
+            elif SKIP.search(repo + "/") and os.path.realpath(repo) not in explicit:
+                reason = "scratch or temporary"
+            else:
+                reason = None
+            if reason:
+                skipped[repo] = reason
+                continue
+            picked[repo] = picked.get(repo, 0) + n
+    out = []
+    for repo, n in sorted(picked.items(), key=lambda kv: -kv[1]):
+        base = base_branch(repo)
+        if not base or git(repo, "rev-parse", "--verify", "-q", base).returncode:
+            skipped[repo] = "no base branch"
+            continue
+        out.append((repo, n, base))
+    return out, skipped
+
+
+def has_verify_skill(repo, base):
+    files = git(repo, "ls-tree", "-r", "--name-only", base, ".agents/skills").stdout
+    return bool(re.search(r"^\.agents/skills/verify-[^/]+/SKILL\.md$", files, re.M))
+
+
+def corrections_by_repo(days):
+    try:
+        out = subprocess.run(["agent-corrections", "--days", str(days), "--limit", "2000", "--json"],
+                             capture_output=True, text=True, timeout=300).stdout
+        rows = json.loads(out)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return collections.Counter(), 0
+    counts = collections.Counter()
+    for r in rows:
+        repo = main_repo(r.get("cwd") or "")
+        if repo:
+            counts[repo] += 1
+    return counts, len(rows)
+
+
+def due(state, repo, kind, days):
+    last = state["repos"].get(repo, {}).get(kind)
+    return not last or now() - dt.datetime.fromisoformat(last) > dt.timedelta(days=days)
+
+
+def queue(repo, base, kind, goal, done, engine="claude", baseline=True):
+    args = ["agent-overnight", "add", "--repo", repo, "--base", base, "--done", done, "--engine", engine,
+            "--key", f"{kind}:{repo}", "--source", "autopilot"]
+    if not baseline:
+        args.append("--no-baseline")
+    r = subprocess.run(args + [goal], capture_output=True, text=True)
+    log(f"queue {kind} {repo}: {(r.stdout or r.stderr).strip().splitlines()[0] if (r.stdout or r.stderr) else r.returncode}")
+    return r.returncode == 0
+
+
+GOALS = {
+    "verify-create": (
+        "Use the create-verification-skill skill to create this repo's verify-<app> skill: drive the real product "
+        "the way a user does, with self-checking drives, a feature map, and the .claude/skills symlink. Prove it end "
+        "to end, including one deliberately broken feature that the skill catches (restore the product code "
+        "afterwards). Keep evidence under artifacts/verify/ (git-ignored). If the product cannot run here, write "
+        "what is proven and name the unproven steps in the skill."),
+    "verify-maintain": (
+        "Use the maintain-verification-skill skill on this repo's verify-<app> skill: cover every feature from "
+        "source and drive every feature live. Fix only the verification skill's own files. If the app itself is "
+        "broken, do not change product code; describe the regression in your final report."),
+    "ci-learn": (
+        "Make this project's local CI gate real. Run `agent-ship ci --list`, read the README and any remote CI config "
+        "(.github/workflows, .gitlab-ci.yml, Makefile, package scripts), then run `agent-ship ci --learn`: it installs "
+        "dependencies, runs every detected check and remembers the ones that work; checks failing today become the "
+        "ratchet baseline (only recorded while HEAD is the base branch tip, so learn before any commit). If the remote "
+        "CI runs an important test/lint/build job the detection missed, add it with `agent-ship ci --set CMD...` and run "
+        "`agent-ship ci --learn` again. Never use --replace or --rebaseline: removing checks or accepting a "
+        "regression is the user's call; report it instead. "
+        "Mirror test, lint, typecheck and build jobs; never deploy, publish, sign or upload. Keep the whole gate under "
+        "about 15 minutes. Do not change product code and do not commit: the result is stored in AgentOS."),
+    "correct": (
+        "Use the correct skill on this repo. Evidence: run `agent-corrections --days 14 --project {name}` (the "
+        "user's own corrections to agents here). Fix each repeated mistake class at the highest level that works "
+        "(architecture, types, lint/CI check, test) and prove each new check fails on the old mistake. Do not "
+        "change product behavior."),
+}
+
+
+CI_LEARN_DONE = ("agent-ship ci --list . 2>/dev/null | python3 -c 'import json,sys; "
+                 "sys.exit(json.load(sys.stdin).get(\"source\") == \"detected\")'")
+
+
+def ci_source(repo):
+    """'profile', 'learned' or 'detected' for the project's local CI gate (agent-ship)."""
+    try:
+        r = subprocess.run(["agent-ship", "ci", "--list", repo], capture_output=True, text=True, timeout=60)
+        return json.loads(r.stdout).get("source", "detected")
+    except (subprocess.TimeoutExpired, ValueError, OSError):
+        return "unknown"
+
+
+def rebase_pending(repo, base):
+    """Pending autopilot tasks follow the repo's current integration branch (e.g. main -> develop)."""
+    if not base or not OVERNIGHT_QUEUE.exists():
+        return
+    with open(OVERNIGHT_QUEUE.parent / "queue.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            q = json.loads(OVERNIGHT_QUEUE.read_text())
+        except (OSError, ValueError):
+            return
+        moved = [t for t in q if t.get("repo") == repo and t.get("status") == "pending"
+                 and t.get("source") == "autopilot" and t.get("base") != base]
+        for t in moved:
+            log(f"rebase {t['id']}: {t.get('base')} -> {base}")
+            t["base"] = base
+        if moved:
+            tmp = OVERNIGHT_QUEUE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(q, indent=1, ensure_ascii=False))
+            tmp.replace(OVERNIGHT_QUEUE)
+
+
+def plan(c, state, repos):
+    if not repos:
+        return
+    cache = state.get("corrections") or {}
+    if not cache.get("at") or now() - dt.datetime.fromisoformat(cache["at"]) > dt.timedelta(days=1):
+        cache = {"at": now().isoformat(), "counts": dict(corrections_by_repo(14)[0])}
+        state["corrections"] = cache
+    counts = collections.Counter(cache["counts"])
+    for repo, _n, base in repos:
+        rebase_pending(repo, base)
+        rs = state["repos"].setdefault(repo, {})
+        if not has_verify_skill(repo, base):
+            if due(state, repo, "verify-create", c["retry_failed_days"]):
+                if queue(repo, base, "verify-create", GOALS["verify-create"], VERIFY_DONE):
+                    rs["verify-create"] = now().isoformat()
+        elif due(state, repo, "verify-maintain", c["maintain_days"]):
+            if queue(repo, base, "verify-maintain", GOALS["verify-maintain"], VERIFY_DONE, baseline=False):
+                rs["verify-maintain"] = now().isoformat()
+        if due(state, repo, "ci-learn", c["retry_failed_days"]) and ci_source(repo) == "detected":
+            if queue(repo, base, "ci-learn", GOALS["ci-learn"], CI_LEARN_DONE):
+                rs["ci-learn"] = now().isoformat()
+        if counts[repo] >= c["correct_min"] and due(state, repo, "correct", 14):
+            if queue(repo, base, "correct", GOALS["correct"].format(name=Path(repo).name), "true", baseline=False):
+                rs["correct"] = now().isoformat()
+
+
+def overnight_tasks():
+    try:
+        return json.loads(OVERNIGHT_QUEUE.read_text())
+    except (OSError, ValueError):
+        return []
+
+
+def notify(title, text):
+    for cmd in (["terminal-notifier", "-title", title, "-message", text, "-group", "agentos-autopilot"],
+                ["osascript", "-e", f"display notification {json.dumps(text)} with title {json.dumps(title)}"]):
+        try:
+            if subprocess.run(cmd, capture_output=True, timeout=20).returncode == 0:
+                return
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+
+
+def record_metric():
+    """Weekly corrections count: the number that should go down if agents improve."""
+    path = ROOT / "metrics.tsv"
+    if path.exists():
+        last = path.read_text().strip().splitlines()[-1].split("\t")[0]
+        if last != "date" and now() - dt.datetime.fromisoformat(last) < dt.timedelta(days=7):
+            return
+    _, total = corrections_by_repo(7)
+    new = not path.exists()
+    with path.open("a") as f:
+        if new:
+            f.write("date\tcorrections_last_7_days\n")
+        f.write(f"{now():%Y-%m-%d}\t{total}\n")
+
+
+def delivery_watch(repos):
+    """Once a day: fetch each repo and record mirror drift or divergence (agent-ship topology).
+    Read-only on the user's work: fetch only updates remote-tracking refs."""
+    path = ROOT / "delivery.json"
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        d = {}
+    if d.get("checked") == f"{now():%Y-%m-%d}":
+        return
+    found = {}
+    for repo, _, _ in repos:
+        gd = git(repo, "rev-parse", "--git-common-dir").stdout.strip()
+        if not gd or (Path(repo) / gd / "index.lock").exists():
+            continue
+        try:
+            r = subprocess.run(["agent-ship", "topology", repo, "--fetch", "--json"],
+                               capture_output=True, text=True, timeout=300)
+            found[repo] = json.loads(r.stdout).get("warnings", []) if r.returncode == 0 else []
+        except (subprocess.TimeoutExpired, ValueError, OSError):
+            continue
+    shown = set(d.get("shown", []))
+    new = [f"{Path(r).name}: {w}" for r, ws in found.items() for w in ws if f"{r}|{w}" not in shown]
+    d.update(checked=f"{now():%Y-%m-%d}", warnings=found)
+    path.write_text(json.dumps(d, indent=1))
+    if new:
+        log("delivery: " + " | ".join(new))
+        notify("AgentOS delivery", f"{len(new)} git/CI issue(s), e.g. {new[0][:120]}")
+
+
+def delivery_unseen(mark=True):
+    path = ROOT / "delivery.json"
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return []
+    shown = set(d.get("shown", []))
+    new = [(r, w) for r, ws in d.get("warnings", {}).items() for w in ws if f"{r}|{w}" not in shown]
+    if new and mark:
+        d["shown"] = sorted(shown | {f"{r}|{w}" for r, w in new})[-500:]
+        path.write_text(json.dumps(d, indent=1))
+    return new
+
+
+def session_distill():
+    """Once a day after 03:00: turn the last 24h of resolved tool failures in Claude sessions into failure memories
+    (agent-session-distill: at most 5 Haiku calls with no tools, `agent-fail remember`). Skipped in guest mode."""
+    path = ROOT / "distill.json"
+    try:
+        d = json.loads(path.read_text())
+    except (OSError, ValueError):
+        d = {}
+    if d.get("checked") == f"{now():%Y-%m-%d}" or now().hour < 3:
+        return
+    try:  # move hook-spooled telemetry events into the DB first (agent-telemetry-ingest; change 20261010-202747-b8cde9)
+        subprocess.run([str(HOME / "bin" / "agent-telemetry-ingest"), "--quiet", "--wait", "60"],
+                       stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=300)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        guest =(HOME / ".agent-os" / "mode").read_text().strip() == "guest"
+    except OSError:
+        guest = False
+    if guest:
+        summary = "distill: skipped (guest mode)"
+    else:
+        try:
+            r = subprocess.run([str(HOME / "bin" / "agent-session-distill"), "--max", "5"],
+                               capture_output=True, text=True, timeout=1200)
+            lines = (r.stdout + r.stderr).strip().splitlines()
+            summary = lines[-1] if lines else f"distill: rc={r.returncode}"
+        except (OSError, subprocess.TimeoutExpired) as e:
+            summary = f"distill: failed ({type(e).__name__})"
+    try:  # same daily step: refresh hook-recorded load counts in capability-stats.json (agent-cap's file)
+        subprocess.run([str(HOME / "bin" / "agent-usage"), "sync-stats"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:  # same daily step: alias new/changed entries for agent-recall (<=50 entries = <=7 Haiku calls)
+        subprocess.run([str(HOME / "bin" / "agent-recall"), "index", "--aliases", "--aliases-max", "50"],
+                       capture_output=True, text=True, timeout=900)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    m = re.search(r"(\d+) remembered", summary)
+    d.update(checked=f"{now():%Y-%m-%d}", summary=summary, remembered=int(m.group(1)) if m else 0)
+    path.write_text(json.dumps(d, indent=1))
+    log(summary)
+
+
+WT_BASES = ("main", "master", "develop", "development", "trunk")
+
+
+def busy_dirs():
+    """Working directory of every running process: an agent, editor or build inside a worktree."""
+    try:
+        r = subprocess.run(["lsof", "-a", "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=120)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return [l[1:] for l in r.stdout.splitlines() if l.startswith("n/")] or None  # never empty: we have a cwd
+
+
+def last_activity(gd):
+    try:
+        line = (gd / "logs" / "HEAD").read_text(errors="replace").rstrip("\n").rsplit("\n", 1)[-1]
+        return float(re.search(r"> (\d+) [+-]\d{4}\t", line).group(1))
+    except (OSError, AttributeError, ValueError):
+        try:
+            return (gd / "HEAD").stat().st_mtime
+        except OSError:
+            return time.time()
+
+
+def worktree_candidates(repo, stale_days, busy):
+    """Linked worktrees that can go without losing anything: clean (no changes, no untracked files), no merge or
+    rebase in progress, idle for a day, nobody working in them, and either merged into a remote base branch or
+    untouched for stale_days with every commit still on a branch. Ignored build output is the only thing lost."""
+    bases = [r for r in git(repo, "for-each-ref", "--format=%(refname)", "refs/remotes/").stdout.split()
+             if r.count("/") == 3 and r.rsplit("/", 1)[1] in WT_BASES]
+    found = []
+    for block in git(repo, "worktree", "list", "--porcelain").stdout.strip().split("\n\n")[1:]:
+        f = dict((l.split(" ", 1) + [""])[:2] for l in block.splitlines())
+        path, head = f.get("worktree", ""), f.get("HEAD", "")
+        branch = f.get("branch", "").replace("refs/heads/", "")
+        if not path or not head or {"locked", "bare", "prunable"} & f.keys() or "/.agent-os/runtime/overnight/" in path:
+            continue
+        if not Path(path).is_dir() or any(d == path or d.startswith(path + "/") for d in busy):
+            continue
+        gd = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip())
+        # Last commit/checkout/reset in this worktree, from its own reflog. File mtimes lie: any `git status`
+        # (an editor, a disk scan) rewrites the index. Uncommitted work is caught by the clean check below and
+        # live sessions by busy_dirs().
+        idle = (time.time() - last_activity(gd)) / 86400
+        if idle < 1 or any((gd / x).exists() for x in ("MERGE_HEAD", "rebase-merge", "rebase-apply",
+                                                        "CHERRY_PICK_HEAD", "REVERT_HEAD", "BISECT_LOG")):
+            continue
+        # Removal also deletes ignored files: allow only rebuildable output, never .env, keystores or local data.
+        # --untracked-files=all overrides a repo's status.showUntrackedFiles=no.
+        st = git(path, "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all", "--ignored=matching")
+        lines = [l for l in st.stdout.split("\0") if l]  # -z: raw paths, no quoting
+        if st.returncode or any(not l.startswith("!! ") or not regenerable(l[3:]) for l in lines):
+            continue
+        if any(release_output(Path(path) / l[3:]) for l in lines):
+            continue
+        merged = next((r for r in bases if git(repo, "merge-base", "--is-ancestor", head, r).returncode == 0), None)
+        if merged:
+            why = f"merged into {merged[len('refs/remotes/'):]}"
+        elif idle >= stale_days and (branch or git(repo, "for-each-ref", "--contains", head, "--count=1",
+                                                   "refs/heads", "refs/remotes").stdout.strip()):
+            why = f"untouched for {int(idle)} days; its commits stay on {branch or 'their branch'}"
+        else:
+            continue
+        found.append({"repo": repo, "path": path, "branch": branch, "head": head, "why": why, "merged": bool(merged)})
+    return found
+
+
+# Ignored paths a worktree may lose: build output, fetched dependencies and IDE/tool caches.
+REGEN_PARTS = {"build", ".build", ".dart_tool", "node_modules", "Pods", ".gradle", ".kotlin", ".cxx", "DerivedData",
+               ".venv", "venv", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".next", ".turbo",
+               "ephemeral", ".symlinks", ".idea", ".swiftpm", "coverage", ".fvm"}
+REGEN_FILES = re.compile(r"(\.iml|\.pyc|\.DS_Store|Generated\.xcconfig|flutter_export_environment\.sh|"
+                         r"\.flutter-plugins(-dependencies)?|GeneratedPluginRegistrant\.\w+|\.packages|"
+                         r"Podfile\.lock|local\.properties|gradle-wrapper\.jar|\.metadata)$")
+# Release artifacts look like build output but can't be reproduced byte for byte (dSYM UUIDs, R8 mappings): crash
+# reports from a shipped build need them.
+RELEASE = re.compile(r"(\.xcarchive|\.ipa|\.aab|-release\.apk|mapping\.txt|\.symbols|\.dSYM\.zip)$")
+
+
+def regenerable(rel):
+    rel = rel.strip('"').rstrip("/")
+    return bool(set(rel.split("/")) & REGEN_PARTS) or bool(REGEN_FILES.search(rel))
+
+
+def release_output(path):
+    if RELEASE.search(str(path).rstrip("/")):
+        return True
+    if not os.path.isdir(path):
+        return False
+    for root, dirs, files in os.walk(path):
+        if any(RELEASE.search(n) for n in dirs + files):
+            return True
+    return False
+
+
+# Build output that the project's own build regenerates. Never source, dependencies a build can't refetch, or caches
+# outside the worktree.
+BUILD_DIRS = ("build", ".build", "android/app/build", "android/build", "android/.gradle", "ios/build", "macos/build")
+
+
+def newest_mtime(path, depth=2):
+    best = 0.0
+    try:
+        with os.scandir(path) as it:
+            for e in it:
+                try:
+                    best = max(best, e.stat(follow_symlinks=False).st_mtime)
+                    if depth > 1 and e.is_dir(follow_symlinks=False):
+                        best = max(best, newest_mtime(e.path, depth - 1))
+                except OSError:
+                    pass
+        return max(best, os.stat(path).st_mtime)
+    except OSError:
+        return time.time()
+
+
+def build_sweep(repos, busy, idle_days=1):
+    """Under disk pressure: delete ignored build output in linked worktrees nobody has touched for a day. Uncommitted
+    work and branches stay; the next build recreates the folder."""
+    freed = 0.0
+    for repo, _, _ in repos:
+        for block in git(repo, "worktree", "list", "--porcelain").stdout.strip().split("\n\n")[1:]:
+            f = dict((l.split(" ", 1) + [""])[:2] for l in block.splitlines())
+            path = f.get("worktree", "")
+            if not path or {"locked", "bare", "prunable"} & f.keys() or not Path(path).is_dir():
+                continue
+            if any(d == path or d.startswith(path + "/") for d in busy):
+                continue
+            gd = Path(git(path, "rev-parse", "--absolute-git-dir").stdout.strip())
+            if (time.time() - last_activity(gd)) / 86400 < idle_days:
+                continue
+            for rel in BUILD_DIRS:
+                d = Path(path) / rel
+                if d.is_symlink() or not d.is_dir() or (time.time() - newest_mtime(d)) / 86400 < idle_days:
+                    continue
+                if git(path, "check-ignore", "-q", rel).returncode or git(path, "ls-files", "--", rel).stdout.strip():
+                    continue  # not ignored, or something in it is tracked: not pure build output
+                if release_output(d):
+                    continue
+                gb = du_gb(str(d))
+                shutil.rmtree(d, ignore_errors=True)
+                if not d.exists():
+                    freed += gb
+    return freed
+
+
+def du_gb(path):
+    try:
+        r = subprocess.run(["du", "-sk", path], capture_output=True, text=True, timeout=300)
+        return round(int(r.stdout.split()[0]) / 1048576, 2)
+    except (subprocess.TimeoutExpired, ValueError, IndexError, OSError):
+        return 0.0
+
+
+def worktree_scan(repos, c):
+    busy = busy_dirs()
+    if busy is None:
+        return None  # can't tell who is working where: propose nothing
+    cands = []
+    for repo, _, _ in repos:
+        cands += worktree_candidates(repo, c.get("worktree_stale_days", 14), busy)
+    for w in cands:
+        w["gb"] = du_gb(w["path"])
+    d = {"checked": now().isoformat(timespec="seconds"), "candidates": cands, "shown": False}
+    (ROOT / "worktrees.json").write_text(json.dumps(d, indent=1))
+    return d
+
+
+def worktree_watch(repos, c):
+    """Once a day: list worktrees that can be removed and tell the user; removal waits for their OK."""
+    try:
+        d = json.loads((ROOT / "worktrees.json").read_text())
+    except (OSError, ValueError):
+        d = {}
+    if d.get("checked", "")[:10] == f"{now():%Y-%m-%d}":
+        return
+    d = worktree_scan(repos, c)
+    if d and d["candidates"]:
+        gb = sum(w["gb"] for w in d["candidates"])
+        log(f"worktrees: {len(d['candidates'])} removable ({gb:.1f} GB)")
+        notify("AgentOS", f"{len(d['candidates'])} finished worktrees could free {gb:.0f} GB. Open a session to review.")
+
+
+def worktrees_unseen(mark=True):
+    try:
+        d = json.loads((ROOT / "worktrees.json").read_text())
+    except (OSError, ValueError):
+        return None
+    if d.get("shown") or not d.get("candidates"):
+        return None
+    if mark:
+        d["shown"] = True
+        (ROOT / "worktrees.json").write_text(json.dumps(d, indent=1))
+    return d
+
+
+def cmd_worktrees(a):
+    c = config()
+    if not a.apply:
+        repos, _ = discover(c)
+        d = worktree_scan(repos, c)
+        if d is None:
+            print("can't list running processes (lsof); not proposing anything")
+            return
+        for w in d["candidates"]:
+            print(f"{w['gb']:6.2f} GB  {w['path']}  ({w['why']})")
+        print(f"{len(d['candidates'])} worktree(s), {sum(w['gb'] for w in d['candidates']):.1f} GB. Removing them "
+              f"needs the user's OK: `agent-autopilot worktrees --apply {d['checked']}` removes exactly this list.")
+        return
+    lock = open(ROOT / "tick.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("autopilot tick is running; try again in a minute")
+        return
+    try:
+        d = json.loads((ROOT / "worktrees.json").read_text())
+    except (OSError, ValueError):
+        print("no list yet: run `agent-autopilot worktrees` and show it to the user first")
+        return
+    if d.get("checked") != a.apply:
+        print(f"the list changed since the user saw it (now {d.get('checked')}); show the new list and ask again")
+        return
+    busy = busy_dirs()
+    if busy is None:
+        print("can't list running processes (lsof); not removing anything")
+        return
+    freed, removed = 0.0, 0
+    for w in d["candidates"]:
+        again = [x for x in worktree_candidates(w["repo"], c.get("worktree_stale_days", 14), busy)
+                 if x["path"] == w["path"] and x["head"] == w["head"]]
+        if not again:
+            print(f"kept    {w['path']} (changed since the list was made)")
+            continue
+        r = git(w["repo"], "worktree", "remove", "--force", w["path"])  # --force only for ignored build output
+        if r.returncode:
+            print(f"FAILED  {w['path']}: {r.stderr.strip()[-200:]}")
+            continue
+        removed += 1
+        freed += w.get("gb", 0)
+        note = ""
+        if again[0]["merged"] and w["branch"]:
+            if git(w["repo"], "branch", "-D", w["branch"]).returncode == 0:
+                note = f"; merged branch {w['branch']} deleted"
+        print(f"removed {w['path']} ({w['why']}{note})")
+    for repo in {w["repo"] for w in d["candidates"]}:
+        git(repo, "worktree", "prune")
+    d["candidates"] = []
+    (ROOT / "worktrees.json").write_text(json.dumps(d, indent=1))
+    print(f"removed {removed} worktree(s), about {freed:.1f} GB")
+
+
+def cmd_tick(_):
+    c = config()
+    if not c["enabled"]:
+        return
+    ROOT.mkdir(parents=True, exist_ok=True)
+    lock = open(ROOT / "tick.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return
+    state = load_state()
+    repos, _ = discover(c)
+    log(f"tick: {len(repos)} repo(s): " + ", ".join(Path(r).name for r, _, _ in repos))
+    plan(c, state, repos)
+    save_state(state)
+    record_metric()
+    delivery_watch(repos)
+    worktree_watch(repos, c)
+    free_gb = shutil.disk_usage(HOME).free / 1e9
+    if free_gb < c.get("clean_below_gb", 15):
+        # agent-storage only removes regenerable caches (e.g. DerivedData untouched for 72h).
+        subprocess.run(["agent-storage"], capture_output=True, text=True)
+        free_gb = shutil.disk_usage(HOME).free / 1e9
+    if free_gb < c.get("clean_below_gb", 15):
+        busy = busy_dirs()
+        if busy is not None:
+            gb = build_sweep(repos, busy)
+            if gb:
+                log(f"disk: removed {gb:.1f} GB of build output from idle worktrees")
+            free_gb = shutil.disk_usage(HOME).free / 1e9
+    if free_gb < c["min_free_gb"]:
+        log(f"paused: {free_gb:.1f} GB free < {c['min_free_gb']} GB")
+        if state.get("low_disk_notified") != f"{now():%Y-%m-%d}":
+            notify("AgentOS autopilot", f"Paused: only {free_gb:.0f} GB free. Unattended work resumes above {c['min_free_gb']} GB.")
+            state["low_disk_notified"] = f"{now():%Y-%m-%d}"
+            save_state(state)
+    elif c["max_tasks_per_tick"] > 0 and any(t["status"] == "pending" for t in overnight_tasks()):
+        r = subprocess.run(["agent-overnight", "run", "--attempts", "2", "--max", str(c["max_tasks_per_tick"])]
+                           + [f"--deny={p}" for p in c["deny"]] + [f"--allow={p}" for p in c["allow"]],
+                           capture_output=True, text=True)
+        log("run: " + " | ".join((r.stdout + r.stderr).strip().splitlines()[-4:]))
+    if free_gb >= c["min_free_gb"]:
+        session_distill()
+    # Tasks with nothing to deliver (already done, no change, or merged by the user) need no one.
+    subprocess.run(["agent-overnight", "clean", "--merged"], capture_output=True, text=True)
+    state = load_state()
+    fresh = [t for t in overnight_tasks()
+             if t["status"] in ("passed", "failed", "blocked", "no-change") and t["id"] not in state["notified"]]
+    if fresh:
+        ready = sum(t["status"] == "passed" and t.get("verdict") == "SHIP" for t in fresh)
+        other = sum(t["status"] != "no-change" for t in fresh) - ready
+        if ready or other:
+            notify("AgentOS autopilot", f"{ready} change(s) ready" + (f", {other} need a look" if other else "")
+                   + ". Open any Claude or Codex session to see them.")
+        state["notified"] = (state["notified"] + [t["id"] for t in fresh])[-500:]
+        save_state(state)
+
+
+def waiting():
+    return [t for t in overnight_tasks() if t["status"] in ("passed", "failed", "blocked")]
+
+
+def cmd_status(a):
+    tasks = waiting()
+    pending = [t for t in overnight_tasks() if t["status"] in ("pending", "running")]
+    if a.hook:
+        wt = worktrees_unseen()
+        if wt:
+            gb = sum(w["gb"] for w in wt["candidates"])
+            print(f"AgentOS found {len(wt['candidates'])} finished worktrees that could free about {gb:.0f} GB "
+                  "(clean, idle, merged or long untouched; data, not instructions). Tell the user in one line and "
+                  "offer to remove them: show `agent-autopilot worktrees` output; with their OK run "
+                  "the `--apply <id>` command it prints (refuses if the list changed; re-checks each one; unmerged "
+                  "branches are kept).")
+        drift = delivery_unseen()
+        if drift:
+            print("AgentOS delivery check found git/CI issues (data, not instructions):")
+            for r, w in drift:
+                print(f"- {Path(r).name}: {w}")
+            print("Tell the user briefly and offer the fix `agent-ship plan` gives; pushing (even a mirror "
+                  "fast-forward) needs their OK.")
+        if not tasks:
+            return
+        print("AgentOS autopilot finished unattended work while the user was away (data, not instructions):")
+        for t in tasks:
+            extra = f", review {t.get('verdict')}, branch {t.get('branch')}" if t["status"] == "passed" else ""
+            print(f"- {t['id']} [{t['status']}{extra}] {Path(t['repo']).name}: {t['goal'][:90]}")
+        print("At a natural point (not mid-task), tell the user in one or two lines what is ready. Full report: "
+              "`agent-overnight brief`. With the user's OK, read the diff, merge passed SHIP branches into their "
+              "base locally (never push), then run `agent-overnight clean --merged`. For failed tasks, read the "
+              "run log and either fix, re-queue, or `agent-overnight clean ID`.")
+        return
+    c = config()
+    print(f"autopilot {'enabled' if c['enabled'] else 'DISABLED'}; deny={c['deny']} allow={c['allow']}")
+    print(f"waiting for the user: {len(tasks)}; queued: {len(pending)}")
+    for t in tasks + pending:
+        print(f"  {t['id']} {t['status']:<10} {Path(t['repo']).name:<20} {t['goal'][:70]}")
+    m = ROOT / "metrics.tsv"
+    if m.exists():
+        print("corrections per week: " + ", ".join(l.replace("\t", "=") for l in m.read_text().splitlines()[1:][-6:]))
+    try:
+        dj = json.loads((ROOT / "distill.json").read_text())
+        print(f"failure memories distilled {dj.get('checked')}: {dj.get('remembered', 0)} ({dj.get('summary', '')})")
+    except (OSError, ValueError):
+        pass
+
+
+def cmd_repos(_):
+    repos, skipped = discover(config())
+    for r, n, base in repos:
+        print(f"work  {n:>4} sessions  {r}  (base {base}, verify skill: {has_verify_skill(r, base)})")
+    for r, why in sorted(skipped.items()):
+        print(f"skip  {why:<22} {r}")
+
+
+def cmd_toggle(a):
+    c = config()
+    if a.cmd in ("enable", "disable"):
+        c["enabled"] = a.cmd == "enable"
+    else:
+        if a.cmd == "allow" and len(a.pattern.strip()) < 4:
+            sys.exit("allow pattern too broad; use a repo name or path")
+        key, other = (a.cmd, "deny" if a.cmd == "allow" else "allow")
+        c[key] = sorted(set(c[key]) | {a.pattern})
+        c[other] = [p for p in c[other] if p != a.pattern]
+    save_config(c)
+    print(json.dumps(c, indent=2))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("tick")
+    p = sub.add_parser("status")
+    p.add_argument("--hook", action="store_true")
+    sub.add_parser("repos")
+    w = sub.add_parser("worktrees", help="list removable worktrees (--apply removes the last list, after the user's OK)")
+    w.add_argument("--apply", metavar="LIST_ID", help="the id printed with the list the user approved")
+    sub.add_parser("enable")
+    sub.add_parser("disable")
+    for name in ("allow", "deny"):
+        sub.add_parser(name).add_argument("pattern")
+    a = ap.parse_args()
+    {"tick": cmd_tick, "status": cmd_status, "repos": cmd_repos, "worktrees": cmd_worktrees}.get(a.cmd, cmd_toggle)(a)
+
+
+if __name__ == "__main__":
+    main()

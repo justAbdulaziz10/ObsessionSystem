@@ -1,0 +1,11 @@
+{
+  "updated_at": null,
+  "claude_selector": "opus",
+  "claude_opus_resolved": null,
+  "claude_source": "anthropic/local",
+  "codex_family": "luna",
+  "codex_luna": null,
+  "codex_source": "openai-official-catalog",
+  "codex_effort": "xhigh",
+  "previous_luna": null
+}

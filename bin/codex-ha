@@ -1,0 +1,564 @@
+#!/usr/bin/env python3
+
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+HOME = pathlib.Path.home()
+BASE = HOME / ".codex-ha"
+STATE_FILE = BASE / "state.json"
+RUNS = BASE / "runs"
+LOCKS = BASE / "locks"
+
+REAL_CODEX = shutil.which("codex") or "/opt/homebrew/bin/codex"
+
+ACCOUNTS = [
+    {
+        "name": "codex1",
+        "home": str(HOME / ".codex"),
+    },
+    {
+        "name": "codex2",
+        "home": str(HOME / ".codex_second"),
+    },
+]
+
+QUOTA_PATTERNS = [
+    "you've hit your usage limit",
+    "you’ve hit your usage limit",
+    "usage limit",
+    "subscription sharing usage limit",
+    "try again at",
+]
+
+AUTH_PATTERNS = [
+    "not logged in",
+    "authentication required",
+    "please log in",
+    "unauthorized",
+]
+
+TRANSIENT_PATTERNS = [
+    "stream disconnected",
+    "connection reset",
+    "connection closed",
+    "timed out",
+    "timeout",
+    "too many requests",
+    "rate limit",
+]
+
+# Unattended coding workers run with approvals off, so they get no personal
+# accounts and no production-write services (V2.md: "Coding workers do not
+# need Gmail, Slack, production cloud access, or unrelated private
+# connectors"). The lead passes any data they need in the brief.
+# Interactive Codex keeps the full config; CODEX_HA_ALL_MCPS=1 opts out.
+WORKER_DISABLED_MCPS = [
+    "gmail", "google-calendar", "google-drive", "slack", "discord",
+    "notion", "clickup", "canva", "resend",
+    "supabase", "vercel", "cloudflare", "revenuecat", "posthog",
+]
+
+WORKER_DISABLED_PLUGINS = [
+    "gmail@openai-curated",
+    "canva@openai-curated",
+    "stripe@openai-curated",
+]
+
+def worker_profile_args():
+    if os.environ.get("CODEX_HA_ALL_MCPS") == "1":
+        return []
+
+    args = []
+
+    for name in WORKER_DISABLED_MCPS:
+        args += ["-c", f"mcp_servers.{name}.enabled=false"]
+
+    for name in WORKER_DISABLED_PLUGINS:
+        args += ["-c", f'plugins."{name}".enabled=false']
+
+    return args
+
+def load_state():
+    if not STATE_FILE.exists():
+        return {
+            "preferred": "codex1",
+            "accounts": {}
+        }
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {
+            "preferred": "codex1",
+            "accounts": {}
+        }
+
+def save_state(state):
+    BASE.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+def account_state(state, name):
+    return state.setdefault("accounts", {}).setdefault(name, {})
+
+def blocked_until(state, name):
+    value = account_state(state, name).get("blocked_until", 0)
+    try:
+        return float(value)
+    except Exception:
+        return 0
+
+def available(state, name):
+    return time.time() >= blocked_until(state, name)
+
+def parse_retry_time(text):
+    # Weekly/monthly limits name a date:
+    # "try again at Oct 14th, 2026 6:48 AM."
+    match = re.search(
+        r"try again at\s+([A-Za-z]{3})[a-z]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\s+(\d{1,2}):(\d{2})\s*([ap]m)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        try:
+            when = datetime.datetime.strptime(
+                "{} {} {} {}:{} {}".format(*match.groups()),
+                "%b %d %Y %I:%M %p",
+            )
+            return (when + datetime.timedelta(minutes=1)).timestamp()
+        except ValueError:
+            pass
+
+    match = re.search(
+        r"try again at\s+(\d{1,2}):(\d{2})\s*([ap]m)",
+        text,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return time.time() + 30 * 60
+
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    ampm = match.group(3).lower()
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+
+    now = datetime.datetime.now()
+    candidate = now.replace(
+        hour=hour,
+        minute=minute,
+        second=0,
+        microsecond=0,
+    )
+
+    if candidate <= now:
+        candidate += datetime.timedelta(days=1)
+
+    candidate += datetime.timedelta(minutes=1)
+
+    return candidate.timestamp()
+
+def classify(text, rc):
+    # The transcript contains the echoed prompt, model narration and test
+    # logs, so words like "timeout" or "usage limit" there are task content,
+    # not provider failures. codex exec exits non-zero when a turn errors,
+    # so only inspect its ERROR lines and the tail of a failed run.
+    if rc == 0:
+        return "success"
+
+    lines = text.splitlines()
+
+    low = "\n".join(
+        [
+            line
+            for line in lines
+            if line.lstrip().lower().startswith(("error", "[error", "fatal"))
+        ]
+        + lines[-20:]
+    ).lower()
+
+    if any(x in low for x in QUOTA_PATTERNS):
+        return "quota"
+
+    if any(x in low for x in AUTH_PATTERNS):
+        return "auth"
+
+    if any(x in low for x in TRANSIENT_PATTERNS):
+        return "transient"
+
+    return "failure"
+
+def mark_failure(state, account, kind, output):
+    entry = account_state(state, account["name"])
+
+    entry["last_failure"] = datetime.datetime.now().isoformat()
+    entry["last_failure_type"] = kind
+
+    if kind == "quota":
+        entry["blocked_until"] = parse_retry_time(output)
+
+    elif kind == "auth":
+        entry["blocked_until"] = time.time() + 10 * 60
+
+    elif kind == "transient":
+        entry["blocked_until"] = time.time() + 2 * 60
+
+    else:
+        entry["blocked_until"] = time.time() + 60
+
+    save_state(state)
+
+def mark_success(state, account):
+    entry = account_state(state, account["name"])
+
+    entry["blocked_until"] = 0
+    entry["last_success"] = datetime.datetime.now().isoformat()
+    entry["last_failure_type"] = None
+
+    state["preferred"] = account["name"]
+
+    save_state(state)
+
+def ordered_accounts(state):
+    preferred = state.get("preferred", "codex1")
+
+    ordered = sorted(
+        ACCOUNTS,
+        key=lambda a: 0 if a["name"] == preferred else 1
+    )
+
+    ready = [a for a in ordered if available(state, a["name"])]
+    blocked = [a for a in ordered if not available(state, a["name"])]
+
+    return ready, blocked
+
+def continuation_prompt(original, previous_account):
+    return f"""
+You are taking over an implementation that was interrupted because another
+Codex account became unavailable.
+
+Original task:
+
+{original}
+
+The previous executor was {previous_account}.
+
+IMPORTANT:
+- Work in the CURRENT working tree.
+- Before editing anything, inspect `git status` and `git diff`.
+- Assume there may already be valid partial implementation from the previous executor.
+- Preserve correct existing changes.
+- Do not blindly restart or revert work.
+- Continue from the current repository state.
+- Complete the original task end-to-end.
+- Run the strongest relevant tests/checks available.
+- Fix failures caused by the implementation.
+- Do not stop for progress updates.
+- Only finish when the task is complete or there is a genuine non-provider blocker.
+""".strip()
+
+def run_codex(account, prompt, run_dir, attempt):
+    env = os.environ.copy()
+    env["CODEX_HOME"] = account["home"]
+
+    tmp_dir = run_dir / f"tmp-{attempt:02d}-{account['name']}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
+
+    env["TMPDIR"] = str(tmp_dir) + "/"
+    env["TMP"] = str(tmp_dir)
+    env["TEMP"] = str(tmp_dir)
+
+    output_file = run_dir / f"{attempt:02d}-{account['name']}.log"
+
+    cmd = [
+        REAL_CODEX,
+        "--ask-for-approval",
+        "never",
+        "exec",
+        "--ephemeral",
+        "--model",
+        "gpt-6-luna",
+        "-c",
+        'model_reasoning_effort="xhigh"',
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+    ]
+
+    cmd += worker_profile_args()
+
+    # workspace-write keeps .git read-only even when it is inside the
+    # workspace, so Codex cannot commit; the dispatching agent commits.
+    # "--" keeps a task that starts with "-" (or is "resume"/"review") a prompt, not a codex option or subcommand.
+    cmd += ["--", prompt]
+
+    print()
+    print("=" * 72)
+    print(f"Codex HA → {account['name']}")
+    print(f"CODEX_HOME={account['home']}")
+    print("=" * 72)
+    print()
+
+    lines = []
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            env=env,
+            cwd=os.getcwd(),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        assert proc.stdout is not None
+
+        with output_file.open("w") as log:
+            for line in proc.stdout:
+                print(line, end="", flush=True)
+                log.write(line)
+                log.flush()
+                lines.append(line)
+
+        rc = proc.wait()
+
+    except KeyboardInterrupt:
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+
+    output = "".join(lines)
+
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+
+    return rc, output
+
+def lock_workspace():
+    cwd = str(pathlib.Path.cwd().resolve())
+    key = hashlib.sha256(cwd.encode()).hexdigest()[:20]
+
+    LOCKS.mkdir(parents=True, exist_ok=True)
+
+    path = LOCKS / f"{key}.lock"
+    f = path.open("w")
+
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print(
+            "Another codex-ha worker is already editing this exact worktree.",
+            file=sys.stderr,
+        )
+        sys.exit(73)
+
+    return f
+
+def cmd_status():
+    state = load_state()
+
+    print("Codex HA")
+    print()
+
+    for account in ACCOUNTS:
+        name = account["name"]
+        entry = account_state(state, name)
+        until = blocked_until(state, name)
+
+        if time.time() >= until:
+            status = "✅ AVAILABLE"
+        else:
+            dt = datetime.datetime.fromtimestamp(until)
+            status = f"⏳ BLOCKED until {dt.strftime('%Y-%m-%d %I:%M %p')}"
+
+        preferred = " ← preferred" if state.get("preferred") == name else ""
+
+        print(f"{name:8} {status}{preferred}")
+        print(f"         {account['home']}")
+
+        if entry.get("last_failure_type"):
+            print(f"         last failure: {entry['last_failure_type']}")
+
+    print()
+
+def cmd_ready():
+    """Preflight for dispatchers: exit 0 if an account can run now, else 75."""
+    state = load_state()
+    ready, blocked = ordered_accounts(state)
+
+    if ready:
+        print("CODEX_HA_READY " + ",".join(a["name"] for a in ready))
+        return 0
+
+    soonest = min(blocked_until(state, a["name"]) for a in blocked)
+    when = datetime.datetime.fromtimestamp(soonest).strftime("%Y-%m-%d %I:%M %p")
+    print(f"AGENT_CODEX_HA_EXHAUSTED no Codex account is available until {when}")
+    return 75
+
+def cmd_reset(target):
+    state = load_state()
+
+    if target == "all":
+        for account in ACCOUNTS:
+            account_state(state, account["name"])["blocked_until"] = 0
+    else:
+        names = [a["name"] for a in ACCOUNTS]
+        if target not in names:
+            print("Use: codex-ha reset codex1|codex2|all", file=sys.stderr)
+            sys.exit(1)
+        account_state(state, target)["blocked_until"] = 0
+
+    save_state(state)
+    cmd_status()
+
+def cmd_run(prompt):
+    workspace_lock = lock_workspace()
+    state = load_state()
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = RUNS / f"{timestamp}-{os.getpid()}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    (run_dir / "prompt.txt").write_text(prompt + "\n")
+    (run_dir / "cwd.txt").write_text(str(pathlib.Path.cwd().resolve()) + "\n")
+
+    ready, blocked = ordered_accounts(state)
+
+    if not ready:
+        print()
+        print("AGENT_CODEX_HA_EXHAUSTED")
+        print("Both Codex accounts are currently in cooldown.")
+        print("The calling Claude agent must continue the implementation itself.")
+        print()
+        cmd_status()
+        sys.exit(75)
+
+    previous = None
+    attempt = 0
+
+    for account in ready:
+        attempt += 1
+
+        actual_prompt = (
+            prompt
+            if previous is None
+            else continuation_prompt(prompt, previous)
+        )
+
+        rc, output = run_codex(
+            account,
+            actual_prompt,
+            run_dir,
+            attempt,
+        )
+
+        kind = classify(output, rc)
+
+        if kind == "success":
+            mark_success(state, account)
+
+            print()
+            print("=" * 72)
+            print(f"✅ Completed by {account['name']}")
+            print(f"Run log: {run_dir}")
+            print("=" * 72)
+
+            return 0
+
+        print()
+        print(f"⚠️ {account['name']} failed: {kind}")
+
+        mark_failure(state, account, kind, output)
+
+        if rc == 130:
+            return 130
+
+        previous = account["name"]
+
+        if kind in ("quota", "auth", "transient", "failure"):
+            print("Failing over to the next Codex account...")
+
+    print()
+    print("AGENT_CODEX_HA_EXHAUSTED")
+    print("All usable Codex accounts failed this task.")
+    print("IMPORTANT: partial changes may already exist in the working tree.")
+    print("The calling Claude agent must inspect git diff and continue itself.")
+    print(f"Run logs: {run_dir}")
+
+    return 75
+
+def usage():
+    print("""
+codex-ha
+
+Commands:
+  codex-ha run "TASK"
+  echo "TASK" | codex-ha run -
+  codex-ha status
+  codex-ha ready          exit 0 if an account can run now, else 75
+  codex-ha reset codex1
+  codex-ha reset codex2
+  codex-ha reset all
+""".strip())
+
+def main():
+    BASE.mkdir(parents=True, exist_ok=True)
+    RUNS.mkdir(parents=True, exist_ok=True)
+    LOCKS.mkdir(parents=True, exist_ok=True)
+
+    if len(sys.argv) < 2:
+        usage()
+        return 1
+
+    cmd = sys.argv[1]
+
+    if cmd == "status":
+        cmd_status()
+        return 0
+
+    if cmd == "ready":
+        return cmd_ready()
+
+    if cmd == "reset":
+        if len(sys.argv) != 3:
+            usage()
+            return 1
+        cmd_reset(sys.argv[2])
+        return 0
+
+    if cmd == "run":
+        if len(sys.argv) < 3:
+            usage()
+            return 1
+
+        if sys.argv[2] == "-":
+            prompt = sys.stdin.read().strip()
+        else:
+            prompt = " ".join(sys.argv[2:]).strip()
+
+        if not prompt:
+            print("Task cannot be empty.", file=sys.stderr)
+            return 1
+
+        return cmd_run(prompt)
+
+    usage()
+    return 1
+
+if __name__ == "__main__":
+    sys.exit(main())
