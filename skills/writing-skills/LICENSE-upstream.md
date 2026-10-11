@@ -1,6 +1,6 @@
 # Upstream notices
 
-`writing-skills` adapts material from the following MIT-licensed projects. Text was rewritten for AgentOS; no upstream code is executed or vendored.
+`writing-skills` adapts material from the following MIT-licensed projects. Text was rewritten for ObsessionSystem; no upstream code is executed or vendored.
 
 | Project | Commit | Used for |
 |---|---|---|

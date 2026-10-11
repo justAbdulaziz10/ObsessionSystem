@@ -1,5 +1,5 @@
 #!/usr/bin/python3 -I -S
-"""Ingest the AgentOS telemetry spool into the usage/sessions tables (change 20261010-202747-b8cde9).
+"""Ingest the AgentOS telemetry spool into the usage/sessions tables.
 
 ~/bin/agent-telemetry-hook (dash) writes one private file per Claude Code hook event into the spool:
     <spool>/e.<pid>[.<n>]    line 1: AOS1<TAB>CLAUDE_CONFIG_DIR<TAB>mode    rest: hook JSON; mtime = event time

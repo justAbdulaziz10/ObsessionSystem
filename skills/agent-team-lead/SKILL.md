@@ -9,8 +9,8 @@ Act as lead architect and integrator. One strong worker beats three overlapping 
 
 ## 1. Ground
 
-- Run `agent-cap recommend "<task>"` and load only capabilities that materially help.
-- Reuse current state: repository profile (`agent-project bootstrap`), checkpoints, and earlier research.
+- Load only the skills and tools that materially help this task.
+- Reuse current state: `agent-task status`, checkpoints, and earlier research.
 - When the requirements are vague, run `requirements-grilling` first.
 - Write acceptance criteria as pass/fail checks.
 
@@ -39,7 +39,7 @@ Done when every slice has an acceptance check and an explicit `blocked-by` (or `
 The frontier is every slice whose blockers are merged into the integration branch.
 
 - Create the integration branch from the freshly synced base (`agent-ship sync`, then `git switch -c integrate/<slug>`) and keep it checked out. Worker worktrees start from its last commit, so commit integrated work before each dispatch.
-- Dispatch each frontier slice to `agent-codex-worker` as soon as it is unblocked; each worker gets its own worktree. Brief with the slice's behaviour, its acceptance check, and pointers (spec path, related commits, files) instead of pasted context.
+- Dispatch each frontier slice as soon as it is unblocked, each worker in its own worktree: to `agent-codex-worker` when the Codex add-on is set up (`codex-ha ready` exits 0), otherwise to a Claude Code subagent. Brief with the slice's behaviour, its acceptance check, and pointers (spec path, related commits, files) instead of pasted context.
 - Run at most 3 workers at once, and only on slices with no blocking link between them and no overlapping files.
 - On `CODEX_UNAVAILABLE`, implement the slice yourself from the worker's worktree and say so in the final report.
 - Background workers die when this session compacts or exits. Tell each worker to write its report to a file (path in the brief) before its final verification, and to run checks longer than a minute detached: `nohup <cmd> > <log> 2>&1 &`, then read the log.
@@ -59,7 +59,7 @@ Done when the slice's acceptance check passes on the integration branch.
 
 - Run `agent-review-route "<task>"` and only the reviewers it recommends. Give each reviewer the integration diff (`git diff <base>...integrate/<slug>`) and the acceptance criteria, never worker summaries, per `agent-team-reviewer`.
 - Fix findings in one worker per cycle. After 3 review-fix cycles without SHIP, escalate to the user with the open findings.
-- Run every acceptance check and the project's checks on the integration branch, then `agent-proof --checks "<task>"`.
+- Run every acceptance check and the project's checks on the integration branch, then record them with `agent-task proof capture <task-id> --checks`.
 
 Done when every acceptance check passes on the integration branch and the review verdict is SHIP.
 

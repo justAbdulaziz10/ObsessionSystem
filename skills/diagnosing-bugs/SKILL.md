@@ -41,7 +41,7 @@ Done when you have run the command at least once and shown the invocation and it
 Stop. List what you tried.
 
 - Interactive: ask the user for access to the environment that reproduces it, a redacted artifact (log, HAR, crash report, timestamped screen recording), or permission to add temporary instrumentation.
-- Non-interactive (autopilot, `agent-overnight`, Codex worker, CI): record the blocker in the task notes or report (what you tried, what would unblock it) and end the task as blocked. Leave source unchanged.
+- Non-interactive (`agent-overnight`, Codex worker, `claude -p`, CI): record the blocker in the task notes or report (what you tried, what would unblock it) and end the task as blocked. Leave source unchanged.
 
 Done when the blocker is recorded. A fix without a repro is a guess; ship none.
 

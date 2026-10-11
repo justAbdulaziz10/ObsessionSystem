@@ -18,8 +18,10 @@ and errors there are downgraded to warnings: we do not edit those files, so they
 errors in our own skills. The summary still reports them as upstream_errors.
 
 hash-drift: SKILL.md sha256 differs from installed_sha256 in skill-sources.json. Error for
-device-local skills (source without a repository), warning for upstream-sourced ones. Refresh a
-sanctioned edit with `agent-system-change rehash <skill> --change <id>`.
+device-local skills (source without a repository), warning for upstream-sourced ones. After a
+deliberate edit, update installed_sha256 in skill-sources.json.
+
+Both provenance checks are skipped when neither catalog file exists.
 
 Exit code: 0 = no errors in our own skills (warnings and upstream errors allowed; with --strict
 upstream errors count), 1 = at least one counted error, 2 = usage error.
@@ -266,7 +268,7 @@ def check_hash_drift(skill_dir, owner):
         return []
     sev = "E" if kind == "device-local" else "W"
     return [("hash-drift", "SKILL.md sha256 %s != installed_sha256 %s in skill-sources.json (%s, %s); "
-             "if the edit was sanctioned: agent-system-change rehash %s --change <id>"
+             "if the edit was deliberate, update installed_sha256 for %s"
              % (current[:12], recorded[:12], sid, kind, Path(skill_dir).name), sev)]
 
 
@@ -513,7 +515,8 @@ def lint_skill(skill_dir, provenance, check_provenance=True):
             meta["provenance"] = "plugin-symlink:" + real
         else:
             meta["provenance"] = ""
-            findings.append(("provenance-missing", "not in skill-sources.json/.skill-lock.json and no 'metadata: origin: home-grown'"))
+            if SOURCES.exists() or LOCK.exists():  # only meaningful when you keep a skill catalog
+                findings.append(("provenance-missing", "not in skill-sources.json/.skill-lock.json and no 'metadata: origin: home-grown'"))
     return meta, findings
 
 

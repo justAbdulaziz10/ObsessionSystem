@@ -10,8 +10,7 @@
 
 Installed skills = ~/.agents/skills, ~/.claude*/skills, and skills of plugins enabled in either Claude account.
 Codex sessions are not instrumented (no Codex hook); counts are Claude-only.
-sync-stats adds `loads`, `loads_window_days`, `last_loaded` per key and never touches the manual
-`success`/`failure`/`seconds` outcome fields that `agent-cap record` owns.
+sync-stats adds `loads`, `loads_window_days`, `last_loaded` per key and leaves any other fields alone.
 Every command first ingests the hook spool (~/bin/agent-telemetry-ingest) so reports include events up to
 ~1 s ago; --no-ingest skips that.
 Env: AGENTOS_TELEMETRY_DB overrides the DB path; AGENTOS_CAP_STATS the stats file

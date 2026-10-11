@@ -420,7 +420,6 @@ def cmd_run(a):
         if result == "codex-unavailable":
             print("No Codex account available; stopping. Remaining tasks stay queued.")
             break
-    subprocess.run(["agent-storage"], capture_output=True)
 
 
 def cmd_brief(_):

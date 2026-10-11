@@ -1,6 +1,6 @@
 ---
 name: writing-skills
-description: Writes and reviews agent skills (SKILL.md) to the AgentOS standard for descriptions, lean bodies, invocation, layout, and provenance. Use when creating, editing, splitting, or reviewing a skill, even for a one-line description change, or when a skill fires at the wrong time or never.
+description: Writes and reviews agent skills (SKILL.md) to a consistent standard for descriptions, lean bodies, invocation, layout, and provenance. Use when creating, editing, splitting, or reviewing a skill, even for a one-line description change, or when a skill fires at the wrong time or never.
 ---
 
 # Writing skills
@@ -9,7 +9,7 @@ A skill is two things: a **description** that sits in every session's context an
 
 ## Steps
 
-1. **Find the gap.** Search `~/.agents/skills` and plugin skills for overlap, and run `~/.agent-os/evals/cap-router/run-triggers.sh --threshold 0.4` to see the existing cluster you would join. Edit the overlapping skill instead of adding a neighbour.
+1. **Find the gap.** Search `~/.agents/skills` and plugin skills for overlap by reading their descriptions. Edit the overlapping skill instead of adding a neighbour.
    Done when: you can name the one case no installed skill covers, and you have chosen model-invoked or user-only (see Invocation).
 2. **Write the description** by the rules below.
    Done when: `agent-skill-lint <dir>` reports no `desc-*` or `frontmatter-*` finding.
@@ -19,15 +19,15 @@ A skill is two things: a **description** that sits in every session's context an
    Done when: each applicable section exists, and none of the rest do.
 5. **Install one layout** (see Layout and provenance).
    Done when: lint shows no `nested-plugin-layout`, `ref-*`, `abs-user-path`, or `provenance-missing` finding.
-6. **Prove it routes.** Add `~/.agent-os/evals/cap-router/skill-triggers/<name>.json` with at least 3 positive prompts in the user's own words (never copied from the description) and 2 negatives that belong to neighbouring skills, then run `run-triggers.sh --compare ~/.agent-os/evals/cap-router/triggers-baseline.json`.
-   Done when: every positive ranks top-3, no negative fires the skill, the total top-3 rate did not drop, and no new pair crossed 0.5 similarity. A miss means the description lacks the user's words: fix the description, not the prompt.
+6. **Prove it routes.** Write at least 3 prompts in the user's own words (never copied from the description) and 2 that belong to neighbouring skills. Try each in a fresh session.
+   Done when: every positive prompt loads the skill and no negative does. A miss means the description lacks the user's words: fix the description, not the prompt.
 
 ## Description rules
 
 The description is a context pointer: its wording, not the body, decides whether the body is ever read.
 
 - Shape: `<What it does, third person>. Use when <case>; when <case>.` One trigger per distinct case; synonyms of one case collapse into one.
-- Name the edge case the model would otherwise handle alone, e.g. "even when the diff is pasted inline". That one clause moved a review skill from 7/27 to 21/27 fires in addyosmani/agent-skills plugin evals.
+- Name the edge case the model would otherwise handle alone, e.g. "even when the diff is pasted inline". One such clause is often the difference between a skill that fires and one that never does.
 - State the outcome and the triggers. A step list in the description ("Ground, design, implement, verify …") gets executed in place of the body.
 - Front-load the words users actually type: tool names, error strings, file types, slash commands.
 - Target 300 characters or fewer; over 500 is a hard warning; 1024 is the host limit. Every character is paid in every session.
@@ -48,7 +48,7 @@ After: `Fetches the latest docs for libraries, frameworks, SDKs, and CLIs throug
 
 ## Sections by type
 
-- **Interactive skills** (ask the user questions, wait for approval, open a browser for the user): add `## Loading constraints` stating what happens when no human is present (agent-autopilot, agent-overnight, `claude -p`, Codex exec). Example: "Non-interactive: take the recommended answer for each question, record the assumptions in the spec, and stop before any external side effect."
+- **Interactive skills** (ask the user questions, wait for approval, open a browser for the user): add `## Loading constraints` stating what happens when no human is present (agent-overnight, `claude -p`, Codex exec). Example: "Non-interactive: take the recommended answer for each question, record the assumptions in the spec, and stop before any external side effect."
 - **Discipline skills** (TDD, verification, review, root-cause debugging; anything an agent is tempted to skip): add `## Common rationalizations` (excuse | reality table) and `## Red flags` (observable signs the skill is being skipped).
 - **Workflow skills**: end with a `## Verification` checklist where each item names its evidence (command output, screenshot, diff).
 
@@ -57,7 +57,7 @@ A copyable skeleton with all sections is in [references/anatomy-template.md](ref
 ## Invocation
 
 - **Model-invoked** (default): keep a trigger-rich description. Pay its characters in every session in exchange for the agent finding it on its own, or another skill calling it.
-- **User-only**: set `disable-model-invocation: true` (supported by Claude Code; verified on 2.1.296). The description then becomes a one-line human summary with no trigger list. For Codex, also add `agents/openai.yaml` with `policy: allow_implicit_invocation: false`. Use this for setup wizards, smoke tests, destructive one-shots, and scheduled maintenance the user types by name.
+- **User-only**: set `disable-model-invocation: true` (supported by Claude Code). The description then becomes a one-line human summary with no trigger list. For Codex, also add `agents/openai.yaml` with `policy: allow_implicit_invocation: false`. Use this for setup wizards, smoke tests, destructive one-shots, and scheduled maintenance the user types by name.
 - A skill that another skill or an autonomous worker must call stays model-invoked.
 
 Frontmatter keys, `user-invocable`, Codex `openai.yaml` fields, and splitting decisions are in [references/skill-mechanics.md](references/skill-mechanics.md).
@@ -73,7 +73,7 @@ Frontmatter keys, `user-invocable`, Codex `openai.yaml` fields, and splitting de
 ```
 
 - One layout per skill directory. A `.claude-plugin/` folder or a nested `skills/<name>/SKILL.md` inside `~/.agents/skills/<name>` registers the skill a second time as `<name>:<name>`.
-- Third-party skill: add or update its entry in `~/.agents/skill-sources.json` with repository, license, `source_revision` (exact commit SHA), and `reviewed_at`. Re-read the file just before writing and merge minimally.
+- Third-party skill: keep its license next to it and record where it came from (repository, exact commit SHA). If you keep a catalog in `~/.agents/skill-sources.json`, `agent-skill-lint` checks it.
 - Home-grown skill: add `metadata:` with `origin: home-grown` to the frontmatter.
 
 ## Common rationalizations

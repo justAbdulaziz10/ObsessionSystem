@@ -17,7 +17,7 @@ metadata:
 ## Loading constraints            <!-- interactive skills only -->
 
 - Interactive: <what the agent asks, and in what batch size>.
-- Non-interactive (agent-autopilot, agent-overnight, `claude -p`, Codex exec): <default it takes, where it records assumptions, which side effects it stops before>.
+- Non-interactive (agent-overnight, `claude -p`, Codex exec): <default it takes, where it records assumptions, which side effects it stops before>.
 
 ## Steps
 
@@ -43,12 +43,3 @@ metadata:
 - [ ] <check> — evidence: <command output / screenshot / diff>
 ```
 
-Then add `~/.agent-os/evals/cap-router/skill-triggers/<dir-name>.json`:
-
-```json
-{
-  "skill": "<dir-name>",
-  "positive": ["<user phrasing 1>", "<user phrasing 2>", "<user phrasing 3>"],
-  "negative": ["<prompt that belongs to a neighbouring skill>", "<another>"]
-}
-```

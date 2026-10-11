@@ -12,7 +12,7 @@ Read when choosing frontmatter keys, deciding model-invoked vs user-only, adding
 | `user-invocable: false` | Claude Code | Hides it from the `/` menu; the model can still invoke it. Use for background reference skills. |
 | `allowed-tools`, `argument-hint`, `model`, `effort`, `context`, `agent`, `paths`, `hooks` | Claude Code | Runtime controls. Codex ignores them. |
 | `license` | all | SPDX id when the skill ships under its own license. |
-| `metadata:` (map) | all | Free-form. AgentOS uses `origin: home-grown` for device-local skills. Codex reads `metadata.short-description`. |
+| `metadata:` (map) | all | Free-form. `agent-skill-lint` treats `origin: home-grown` as a locally written skill. Codex reads `metadata.short-description`. |
 
 Codex has no frontmatter equivalent of `disable-model-invocation`. Its control lives in `agents/openai.yaml`:
 

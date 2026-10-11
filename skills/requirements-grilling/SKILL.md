@@ -44,7 +44,7 @@ Done when every criterion has a check.
 
 ## Non-interactive runs
 
-In autopilot, `agent-overnight`, Codex workers, or CI, ask nothing:
+In `agent-overnight`, Codex workers, `claude -p`, or CI, ask nothing:
 
 - Adopt high-confidence recommendations as decisions.
 - Record medium- and low-confidence ones as assumptions or blockers in the task notes, report, or PR description.

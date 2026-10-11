@@ -1,6 +1,6 @@
 ---
 name: create-verification-skill
-description: Generate a project-local verify-<app> skill that drives the real product the way a user does and captures evidence, for any stack (web, iOS/macOS, Flutter, Android, desktop, CLI/TUI, HTTP/gRPC services, networks, embedded/hardware, games, data/ML). Use when a repo has no scripted way to prove behavior, or the user asks for a verification/control skill or feature map.
+description: Generates a project-local verify-<app> skill that drives the real product the way a user does and captures evidence, for web, mobile, desktop, CLI, services, embedded and data stacks. Use when a repo has no scripted way to prove behavior.
 ---
 
 # Create a verification skill

@@ -1,9 +1,8 @@
-# AgentOS capability + session telemetry hook: spool writer (change 20261010-202747-b8cde9).
-# Replaces the Python hook of change 20261010-125352-781c6f (backup: agent-telemetry-hook.bak-20261010b).
+# Claude Code telemetry hook: records skill, agent and MCP use and session outcomes to a local spool.
 #
 # NO SHEBANG ON PURPOSE. Claude Code runs this via `sh -c '"$HOME/bin/agent-telemetry-hook"'`; execve() fails with
 # ENOEXEC and /bin/sh (bash 3.2 in POSIX mode on macOS; zsh and dash hand it to /bin/sh too) interprets the file
-# in-process. That skips a second interpreter exec, the biggest cost left on this machine (~3 ms CPU per exec).
+# in-process. That skips a second interpreter exec, the biggest remaining cost (~3 ms CPU per exec on a laptop).
 # It must therefore be started through a shell (as settings.json does), not via a direct execve without one.
 #
 # Registered in ~/.claude/settings.json and ~/.claude_second/settings.json on

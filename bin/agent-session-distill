@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Turn yesterday's resolved tool failures into AgentOS failure memories (`agent-fail remember`).
+"""Turn yesterday's resolved tool failures into failure memories (`agent-task fail remember`).
 
   agent-session-distill [--hours 24] [--max 5] [--dry-run] [--live N] [--json] [--transcript PATH]
 
@@ -13,13 +13,13 @@
 3. For at most --max sessions (best pair each), a redacted snippet goes to Haiku via `claude -p`
    with no tools, no MCP servers, no session persistence, and AGENTOS_DISTILL=1 (telemetry hook off).
    It must answer strict JSON {error_signature, resolution} or {skip: true}.
-4. Accepted answers are written with `agent-fail remember` (max --max per run); sessions are marked
+4. Accepted answers are written with `agent-task fail remember` (max --max per run); sessions are marked
    distilled in the DB (result label only). No transcript text is stored anywhere: only paths,
    counts, and the one-line signature/resolution.
 
 --dry-run: list candidates and snippet sizes; no model call, no writes.
 --dry-run --live N: also ask the model for the first N candidates and print the answer; still no writes.
-Guest mode (agent-mode guest): does nothing.
+Does nothing when ~/.agent-os/mode contains "guest".
 Env: AGENTOS_TELEMETRY_DB (DB path), AGENTOS_DISTILL_LOG (log file).
 """
 import argparse
@@ -429,9 +429,9 @@ def main():
         elif a.dry_run:
             entry["result"] = "would-remember"
         else:
-            p = subprocess.run([os.path.join(HOME, "bin", "agent-fail"), "remember", ans["error_signature"],
+            p = subprocess.run([os.path.join(HOME, "bin", "agent-task"), "fail", "remember", ans["error_signature"],
                                 ans["resolution"]], capture_output=True, text=True, timeout=60)
-            entry["result"] = "remembered" if p.returncode == 0 else "agent-fail rc=%d" % p.returncode
+            entry["result"] = "remembered" if p.returncode == 0 else "agent-task fail rc=%d" % p.returncode
             remembered += p.returncode == 0
         if not a.dry_run:
             label = entry["result"] if entry["result"] != "error" else "error: " + note

@@ -1,7 +1,0 @@
-#!/usr/bin/env bash
-# GLOBAL.md form:  agent-proof [--checks] "<task>"           -> agent-intel proof
-# V2.md form:      agent-proof capture|metric|artifact ...   -> agentos2 proof
-case "${1-}" in
-  capture|metric|artifact) exec "$HOME/bin/agentos2" proof "$@" ;;
-  *) exec "$HOME/bin/agent-intel" proof "$@" ;;
-esac

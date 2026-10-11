@@ -2,10 +2,9 @@
 """agent-recall: one ranked index over AgentOS memory.
 
 Sources (files stay the source of truth; the index is fully rebuildable):
-  ~/.agent-os/{LESSONS,DECISIONS,IMPROVEMENTS}.md  one entry per "## " heading
-  ~/.agent-os/SYSTEM.md                            one entry per "# N." section
+  ~/.agent-os/{LESSONS,DECISIONS,IMPROVEMENTS}.md  one entry per "## " heading (whichever exist)
   ~/.claude*/projects/*/memory/*.md                one entry per memory file
-  agentos.sqlite failures table (agent-fail)       one entry per row
+  agentos.sqlite failures table (agent-task fail)  one entry per row
 
 Usage:
   agent-recall "<query>" [--k 5] [--kind lessons,decisions,...] [--account claude1|claude2]
@@ -15,20 +14,20 @@ Usage:
                           the automatic refresh never calls a model)
   agent-recall status     show index size, freshness and alias-cache coverage
 
-Write-time aliases (experiment, change 20261010-202747-b8cde9): `index --aliases` asks Haiku
+Write-time aliases (opt-in): `index --aliases` asks Haiku
 (`claude -p`, no tools, AGENTOS_DISTILL=1) for 6 alternative search phrasings per entry it has
 not seen (cache ~/.agent-os/recall/aliases.json keyed by entry key + content hash, mode 600),
 at most --aliases-max entries per run, 8 entries per call. The aliases are indexed as an extra
-FTS column. Queries never call a model. Aliases are ON by default (ALIASES_DEFAULT); turn
-them off with --no-aliases / `index --no-llm` or AGENT_RECALL_ALIASES=0. Evidence: evals/recall.
+FTS column. Queries never call a model. Aliases are OFF by default because they send note
+text to a model; turn them on with --aliases or AGENT_RECALL_ALIASES=1.
 
 Ranking: FTS5 BM25, porter stemming, query words OR-ed (heading x5, abstract x3, body x1)
 x recency decay (half-life 180 d,
 floor 0.35). Entries whose `Invalid at:` is past, or that a newer entry `Supersedes:`,
 are hidden unless --all. Output is a pointer (path:line, heading, one-line abstract);
 read the file for the full text. Lexical: a query must share (stemmed) words with the entry
-or with its cached write-time aliases (x5). A hand thesaurus was tried and removed: +0 on a
-paraphrase holdout (evals/recall). Aliases: blind paraphrase recall@5 0% -> 28%.
+or with its cached write-time aliases (x5). Aliases help when you search with different words than
+the note used.
 
 Ranking idea ("eligibility before relevance, then relevance x weight x recency") adapted
 from tigerless-labs/agent-memory core/recall.py (MIT). No code copied.
@@ -61,21 +60,19 @@ FILE_KINDS = [
     ("lessons", "LESSONS.md", "##"),
     ("decisions", "DECISIONS.md", "##"),
     ("improvements", "IMPROVEMENTS.md", "##"),
-    ("system", "SYSTEM.md", "#N"),
 ]
 ACCOUNTS = [("claude1", ".claude"), ("claude2", ".claude_second")]
-KINDS = ["lessons", "decisions", "improvements", "system", "memory", "failures"]
+KINDS = ["lessons", "decisions", "improvements", "memory", "failures"]
 
 W_HEADING, W_ABSTRACT, W_BODY = 5.0, 3.0, 1.0
-W_ALIAS = 5.0  # chosen on questions.json only (evals/recall); never tuned on the blind set
+W_ALIAS = 5.0
 try:
     W_ALIAS = float(os.environ.get("AGENT_RECALL_W_ALIAS") or W_ALIAS)  # experiments only
 except ValueError:
     pass
-# Decision rule (change 20261010-202747-b8cde9): ON only if paraphrase-blind recall@5 >= +20pp
-# and no other set drops > 2pp. Env AGENT_RECALL_ALIASES=1/0 or --aliases/--no-aliases override.
-ALIASES_DEFAULT = True  # met: blind recall@5 0 -> 28.1 (+28.1pp), no set dropped
-ALIAS_KINDS = ("lessons", "decisions", "improvements", "system", "memory")
+# Off by default: aliases send note text to a model. AGENT_RECALL_ALIASES=1/0 or --aliases/--no-aliases override.
+ALIASES_DEFAULT = False
+ALIAS_KINDS = ("lessons", "decisions", "improvements", "memory")
 ALIAS_PROMPT_VERSION = "1"
 ALIAS_BATCH = 8
 ALIAS_WORKERS = 3
@@ -734,7 +731,7 @@ def _match(con, match, kinds, account, project, aliases=False):
 
 
 def fmt(d):
-    loc = tilde(d["path"]) if d["kind"] != "failures" else "agent-fail"
+    loc = tilde(d["path"]) if d["kind"] != "failures" else "agent-task fail"
     if d["line"]:
         loc += ":%d" % d["line"]
     tag = d["kind"]

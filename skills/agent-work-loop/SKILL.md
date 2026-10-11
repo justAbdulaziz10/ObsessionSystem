@@ -1,6 +1,6 @@
 ---
 name: agent-work-loop
-description: Ground, design, implement, and verify substantive software work in a real codebase. Use for features, ambiguous bugs, architecture, UI/runtime behavior, or performance work where context and evidence affect correctness.
+description: Keeps substantive software work grounded in the real codebase and finished with evidence rather than claims. Use for features, ambiguous bugs, architecture, UI or runtime behavior, or performance work where context and proof affect correctness.
 ---
 
 # Agent work loop
@@ -45,7 +45,7 @@ Deliver the requested outcome with evidence that it works. Preserve the user's s
 - Mark claims as measured (you ran it and saw the result), inferred (follows from what you saw), or guessed.
 - The agent that wrote a change does not approve it: review it in a fresh context, with a different model when one is available, following `agent-team-reviewer` (give the reviewer the diff and the original requirement, not your claim of success).
 - When the user corrects the same mistake twice, use the `correct` skill to make it impossible instead of adding another written rule.
-- Work that can run unattended (a goal plus a command that proves it done) goes to `agent-overnight add --repo <path> --done "<cmd>" "<goal>"`; `agent-autopilot` runs the queue on its own (own worktree and branch, retries, review in a fresh context). Queue leftovers yourself instead of telling the user to.
+- Work that can run unattended (a goal plus a command that proves it done) goes to `agent-overnight add --repo <path> --done "<cmd>" "<goal>"`; `agent-overnight run` works through the queue, each task in its own worktree and branch. Queue leftovers yourself instead of telling the user to.
 
 ## Report the result
 
