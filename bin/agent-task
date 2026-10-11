@@ -1,0 +1,843 @@
+#!/usr/bin/env python3
+"""agent-task: a durable, resumable record of one piece of agent work.
+
+Each task is a row in a local SQLite database plus a folder of plain files, so a
+later session, or another agent, can pick the work up where the last one stopped.
+
+  init                                    create the store and print its location
+  start "REQUEST" [--repo PATH] [--new]   open a task for REQUEST in the repository and print its id.
+                                          Running it again with the same request in the same repository
+                                          prints the id of the task that is still open; --new always opens
+                                          a fresh one
+  status  [TASK]                          the task record, latest outcome, event and proof counts (JSON)
+  context [TASK]                          compile a working brief: request, checklist, git state, detected
+                                          checks, matching failure memory, recent events and proof (JSON)
+  event   TASK TYPE [--payload JSON]      append an event to the task's log
+  handoff [TASK]                          write and print a Markdown brief another session can resume from
+  fail search "ERROR"                     look up recorded fixes for an error message
+  fail remember "ERROR" "FIX" [--failed]  record what fixed an error (with --failed: what did not)
+  proof metric   TASK before|after NAME VALUE UNIT
+                                          record a measurement
+  proof artifact TASK before|after NAME PATH
+                                          record a file as evidence (log, screenshot, report)
+  proof capture  TASK [--checks] [--run CMD]...
+                                          optionally run checks, summarize the evidence, list what is
+                                          missing; exits 1 when the proof is incomplete
+  finish  TASK --outcome success|partial|failure [--checks] [--run CMD]...
+                                          capture proof, record the outcome and close the task
+
+TASK may be left out for status, context and handoff: the most recently updated
+open task for the current repository is used.
+
+The checklist that `start` writes is a keyword heuristic, not an understanding of
+the request. Words such as "fix"/"bug", "slow"/"performance", "ui"/"layout" or
+"auth"/"payment" add the matching items (reproduce the bug, before/after metrics,
+before/after artifacts, independent review). Edit checklist.json when it is wrong.
+
+Storage (local only; nothing is sent anywhere):
+  ~/.agent-os/v2/db/agentos.sqlite   tables tasks, events, proof, metrics, failures
+  ~/.agent-os/v2/tasks/<id>/         request.txt, checklist.json, events.ndjson,
+                                     context.json, proof.json, handoff.md
+"""
+import argparse
+import hashlib
+import json
+import os
+import re
+import secrets
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+
+HOME = Path.home()
+BASE = HOME / ".agent-os" / "v2"
+DB = BASE / "db" / "agentos.sqlite"
+TASKS = BASE / "tasks"
+
+OPEN_STATUSES = ("created", "running", "blocked")
+TASK_ID_RE = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{8}$")
+TASK_ID_EXAMPLE = "20260101-120000-1a2b3c4d"
+
+# The tasks table keeps the columns of databases written by earlier versions
+# (domain, complexity, plan_path, max_workers), so an existing store keeps working.
+# This tool leaves those four empty.
+SCHEMA = """
+PRAGMA journal_mode=WAL;
+
+CREATE TABLE IF NOT EXISTS tasks(
+    id TEXT PRIMARY KEY,
+    created TEXT,
+    updated TEXT,
+    status TEXT,
+    repo TEXT,
+    domain TEXT,
+    complexity TEXT,
+    risk TEXT,
+    request_hash TEXT,
+    request_path TEXT,
+    spec_path TEXT,
+    context_path TEXT,
+    plan_path TEXT,
+    max_workers INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS events(
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT,
+    ts TEXT,
+    type TEXT,
+    payload TEXT
+);
+
+CREATE TABLE IF NOT EXISTS metrics(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT,
+    ts TEXT,
+    outcome TEXT,
+    quality REAL,
+    duration REAL,
+    human INTEGER,
+    workers INTEGER,
+    tool_calls INTEGER,
+    capabilities TEXT
+);
+
+CREATE TABLE IF NOT EXISTS failures(
+    signature TEXT PRIMARY KEY,
+    normalized TEXT,
+    resolution TEXT,
+    success INTEGER DEFAULT 0,
+    failure INTEGER DEFAULT 0,
+    updated TEXT
+);
+
+CREATE TABLE IF NOT EXISTS proof(
+    task_id TEXT,
+    kind TEXT,
+    name TEXT,
+    value TEXT,
+    unit TEXT,
+    ts TEXT
+);
+"""
+
+# Checklist heuristics: (words that start a word in the request, checklist item, proof kinds required).
+CHECKLIST_RULES = [
+    (("bug", "fix", "crash", "error", "broken", "regression", "fail"),
+     "Reproduce the problem before the fix and show it gone after; add a regression test where practical.",
+     ()),
+    (("performance", "perf", "slow", "fast", "latency", "speed", "memory"),
+     "Back any performance claim with comparable before/after measurements (agent-task proof metric).",
+     ("metric-before", "metric-after")),
+    (("ui", "ux", "screen", "layout", "visual", "design", "css", "style"),
+     "Inspect the UI before and after the change and keep the evidence (agent-task proof artifact).",
+     ("artifact-before", "artifact-after")),
+]
+HIGH_RISK_WORDS = ("auth", "security", "secret", "password", "payment", "billing", "subscription",
+                   "production", "deploy", "privacy", "encrypt", "delete", "migration")
+MEDIUM_RISK_WORDS = ("refactor", "database", "schema", "architecture", "concurrency", "upgrade")
+
+# Proof kinds written by earlier versions, mapped to the current names.
+LEGACY_PROOF_KINDS = {
+    "visual-before": "artifact-before",
+    "visual-after": "artifact-after",
+    "performance-before": "metric-before",
+    "performance-after": "metric-after",
+}
+
+
+# ---------------------------------------------------------------- helpers
+
+def die(message, code=2):
+    print(f"agent-task: {message}", file=sys.stderr)
+    raise SystemExit(code)
+
+
+def now():
+    return datetime.now().astimezone().isoformat()
+
+
+def save_json(path, data):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    tmp.replace(path)
+
+
+def load_json(path, default=None):
+    try:
+        return json.loads(Path(path).read_text())
+    except (OSError, ValueError, TypeError):
+        return {} if default is None else default
+
+
+def read_text(path):
+    try:
+        return Path(path).read_text()
+    except (OSError, TypeError):
+        return ""
+
+
+def run(cmd, cwd=None, timeout=60, shell=False):
+    """Run a command; return (exit code, stdout+stderr). Never raises."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, text=True, capture_output=True, timeout=timeout, shell=shell)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
+    except subprocess.TimeoutExpired:
+        return 124, f"timed out after {timeout}s"
+    except OSError as e:
+        return 127, f"{type(e).__name__}: {e}"
+
+
+def git(repo, *args):
+    rc, output = run(["git", "-C", str(repo), *args], timeout=30)
+    return output.strip() if rc == 0 else ""
+
+
+def repo_root(path=None):
+    """The git toplevel containing PATH (default: cwd), or PATH itself outside git."""
+    p = Path(path or os.getcwd()).expanduser()
+    if not p.is_dir():
+        die(f"not a directory: {p}")
+    p = p.resolve()
+    top = git(p, "rev-parse", "--show-toplevel")
+    return Path(top).resolve() if top else p
+
+
+def words(text):
+    """Lower-case words of three or more characters (any script), for overlap matching."""
+    return set(re.findall(r"[^\W\d_][\w+.-]{2,}", (text or "").lower()))
+
+
+def mentions(text, stems):
+    """True if any stem starts a word in text ("fix" matches "fixing", "ui" does not match "build")."""
+    return re.search(r"\b(?:%s)" % "|".join(re.escape(s) for s in stems), text.lower()) is not None
+
+
+# ---------------------------------------------------------------- store
+
+def init_store():
+    for d in (BASE, DB.parent, TASKS):
+        d.mkdir(parents=True, exist_ok=True)
+    try:
+        BASE.chmod(0o700)
+    except OSError:
+        pass
+    c = sqlite3.connect(DB)
+    c.executescript(SCHEMA)
+    c.commit()
+    c.close()
+
+
+def connect():
+    c = sqlite3.connect(DB)
+    c.row_factory = sqlite3.Row
+    return c
+
+
+def record_event(task_id, kind, payload=None):
+    payload = payload or {}
+    ts = now()
+    c = connect()
+    c.execute("INSERT INTO events(task_id, ts, type, payload) VALUES(?,?,?,?)",
+              (task_id, ts, kind, json.dumps(payload, ensure_ascii=False)))
+    c.execute("UPDATE tasks SET updated=? WHERE id=?", (ts, task_id))
+    c.commit()
+    c.close()
+    d = TASKS / task_id
+    d.mkdir(parents=True, exist_ok=True)
+    with (d / "events.ndjson").open("a") as f:
+        f.write(json.dumps({"ts": ts, "type": kind, "payload": payload}, ensure_ascii=False) + "\n")
+
+
+def get_task(task_id):
+    if not TASK_ID_RE.match(task_id or ""):
+        die(f"{task_id!r} is not a task id (ids look like {TASK_ID_EXAMPLE}). "
+            f"To open a task for a request, run: agent-task start \"<request>\"")
+    c = connect()
+    row = c.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+    c.close()
+    if not row:
+        die(f"unknown task {task_id!r} (no such task in {DB})")
+    return dict(row)
+
+
+def resolve_task(task_id):
+    """An explicit id, or the most recently updated open task for the current repository."""
+    if task_id:
+        return get_task(task_id)
+    repo = repo_root()
+    c = connect()
+    row = c.execute(
+        "SELECT * FROM tasks WHERE repo=? AND status IN (%s) ORDER BY updated DESC LIMIT 1"
+        % ",".join("?" * len(OPEN_STATUSES)),
+        (str(repo), *OPEN_STATUSES)).fetchone()
+    c.close()
+    if not row:
+        die(f"no open task for {repo}; pass a task id, or open one with: agent-task start \"<request>\"")
+    return dict(row)
+
+
+def proof_rows(task_id):
+    c = connect()
+    rows = [dict(r) for r in c.execute(
+        "SELECT kind, name, value, unit, ts FROM proof WHERE task_id=? ORDER BY ts", (task_id,))]
+    c.close()
+    return rows
+
+
+def recent_events(task_id, limit):
+    c = connect()
+    rows = []
+    for r in c.execute("SELECT ts, type, payload FROM events WHERE task_id=? ORDER BY seq DESC LIMIT ?",
+                       (task_id, limit)):
+        rows.append({"ts": r["ts"], "type": r["type"], "payload": load_payload(r["payload"])})
+    c.close()
+    return rows
+
+
+def load_payload(text):
+    try:
+        return json.loads(text or "{}")
+    except ValueError:
+        return text
+
+
+# ---------------------------------------------------------------- checklist and checks
+
+def make_checklist(request):
+    """A keyword-derived checklist for the request; see the module docstring for its limits."""
+    acceptance = [
+        "Deliver the requested outcome.",
+        "Leave unrelated behavior and other people's changes intact.",
+        "Verify in proportion to the risk and record the evidence with agent-task proof.",
+    ]
+    required = []
+    for stems, item, kinds in CHECKLIST_RULES:
+        if mentions(request, stems):
+            acceptance.append(item)
+            required.extend(kinds)
+    if mentions(request, HIGH_RISK_WORDS):
+        risk = "high"
+        acceptance.append("Get an independent review of the change; finish only with no unresolved blocker.")
+    elif mentions(request, MEDIUM_RISK_WORDS):
+        risk = "medium"
+    else:
+        risk = "low"
+    return {
+        "objective": request,
+        "risk": risk,
+        "acceptance": acceptance,
+        "required_proof": required,
+        "source": "keyword heuristic; edit this file if it is wrong",
+    }
+
+
+def required_proof(checklist):
+    if "required_proof" in checklist:
+        return list(checklist["required_proof"])
+    legacy = [LEGACY_PROOF_KINDS.get(k) for k in checklist.get("evidence", [])]
+    return [k for k in legacy if k]
+
+
+def detect_checks(repo):
+    """Test/lint/build commands the repository advertises through its manifest files."""
+    repo = Path(repo)
+    checks = []
+    if (repo / "pubspec.yaml").exists():
+        checks += ["flutter analyze", "flutter test"]
+    if (repo / "Package.swift").exists():
+        checks.append("swift test")
+    if (repo / "Cargo.toml").exists():
+        checks.append("cargo test")
+    if (repo / "go.mod").exists():
+        checks.append("go test ./...")
+    if (repo / "package.json").exists():
+        manifest = load_json(repo / "package.json", {})
+        scripts = manifest.get("scripts", {}) if isinstance(manifest, dict) else {}
+        if (repo / "pnpm-lock.yaml").exists():
+            runner = "pnpm"
+        elif (repo / "yarn.lock").exists():
+            runner = "yarn"
+        else:
+            runner = "npm run"
+        for name in ("lint", "typecheck", "test", "build"):
+            if name in scripts:
+                checks.append(f"{runner} {name}")
+    return checks[:8]
+
+
+def git_state(repo):
+    return {
+        "branch": git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+        "head": git(repo, "rev-parse", "HEAD"),
+        "status": git(repo, "status", "--short"),
+        "recent": git(repo, "log", "-8", "--oneline"),
+    }
+
+
+# ---------------------------------------------------------------- failure memory
+
+def normalize_error(text):
+    """Strip details that differ between occurrences of the same error (home paths, hashes, numbers)."""
+    s = (text or "").replace(str(HOME), "~")
+    s = re.sub(r"/(?:Users|home)/[^/\s]+", "~", s)
+    s = re.sub(r"\b[0-9a-f]{7,40}\b", "<HEX>", s, flags=re.I)
+    s = re.sub(r"\b\d+\b", "<N>", s)
+    return re.sub(r"\s+", " ", s).strip()[:8000]
+
+
+def search_failures(error, limit=5):
+    query = words(normalize_error(error))
+    if not query:
+        return []
+    c = connect()
+    rows = c.execute("SELECT * FROM failures ORDER BY updated DESC LIMIT 500").fetchall()
+    c.close()
+    scored = []
+    for r in rows:
+        overlap = len(query & words((r["normalized"] or "") + " " + (r["resolution"] or "")))
+        if overlap:
+            scored.append((overlap + min((r["success"] or 0) * 0.1, 2), dict(r)))
+    scored.sort(key=lambda pair: -pair[0])
+    return [row for _, row in scored[:limit]]
+
+
+def remember_failure(error, resolution, worked=True):
+    normalized = normalize_error(error)
+    if not normalized:
+        die("the error text is empty")
+    signature = hashlib.sha256(normalized.encode()).hexdigest()[:24]
+    c = connect()
+    row = c.execute("SELECT success, failure FROM failures WHERE signature=?", (signature,)).fetchone()
+    success = (row["success"] if row else 0) + (1 if worked else 0)
+    failure = (row["failure"] if row else 0) + (0 if worked else 1)
+    c.execute(
+        """INSERT INTO failures(signature, normalized, resolution, success, failure, updated)
+           VALUES(?,?,?,?,?,?)
+           ON CONFLICT(signature) DO UPDATE SET
+               normalized=excluded.normalized, resolution=excluded.resolution,
+               success=excluded.success, failure=excluded.failure, updated=excluded.updated""",
+        (signature, normalized, resolution[:12000], success, failure, now()))
+    c.commit()
+    c.close()
+    return signature
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_start(request, repo_path=None, new=False):
+    request = (request or "").strip()
+    if not request:
+        die("the request is empty; describe the work, e.g. agent-task start \"fix the login crash\"")
+    repo = repo_root(repo_path)
+    request_hash = hashlib.sha256(f"{repo}\n{request}".encode()).hexdigest()
+
+    if not new:
+        c = connect()
+        row = c.execute(
+            "SELECT id FROM tasks WHERE request_hash=? AND repo=? AND status IN (%s) "
+            "ORDER BY created DESC LIMIT 1" % ",".join("?" * len(OPEN_STATUSES)),
+            (request_hash, str(repo), *OPEN_STATUSES)).fetchone()
+        c.close()
+        if row:
+            record_event(row["id"], "TASK_RESUMED")
+            print(f"agent-task: resuming open task {row['id']} (use --new for a separate task)", file=sys.stderr)
+            print(row["id"])
+            return
+
+    task_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + secrets.token_hex(4)
+    d = TASKS / task_id
+    d.mkdir(parents=True)
+    request_path = d / "request.txt"
+    request_path.write_text(request + "\n")
+    checklist = make_checklist(request)
+    checklist_path = d / "checklist.json"
+    save_json(checklist_path, checklist)
+
+    ts = now()
+    c = connect()
+    c.execute(
+        """INSERT INTO tasks(id, created, updated, status, repo, domain, complexity, risk, request_hash,
+                             request_path, spec_path, context_path, plan_path, max_workers)
+           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (task_id, ts, ts, "running", str(repo), "", "", checklist["risk"], request_hash,
+         str(request_path), str(checklist_path), "", "", None))
+    c.commit()
+    c.close()
+    record_event(task_id, "TASK_STARTED", {"repo": str(repo), "risk": checklist["risk"]})
+    print(task_id)
+
+
+def cmd_status(task_id):
+    task = resolve_task(task_id)
+    c = connect()
+    outcome = c.execute("SELECT outcome, ts FROM metrics WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                        (task["id"],)).fetchone()
+    events = c.execute("SELECT COUNT(*) FROM events WHERE task_id=?", (task["id"],)).fetchone()[0]
+    proofs = c.execute("SELECT COUNT(*) FROM proof WHERE task_id=?", (task["id"],)).fetchone()[0]
+    c.close()
+    report = {k: v for k, v in task.items() if k not in ("domain", "complexity", "plan_path", "max_workers")}
+    report["request"] = read_text(task["request_path"]).strip()
+    report["outcome"] = outcome["outcome"] if outcome else None
+    report["finished"] = outcome["ts"] if outcome else None
+    report["events"] = events
+    report["proof_entries"] = proofs
+    report["dir"] = str(TASKS / task["id"])
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+
+
+def cmd_context(task_id):
+    task = resolve_task(task_id)
+    repo = Path(task["repo"])
+    request = read_text(task["request_path"]).strip()
+    context = {
+        "task_id": task["id"],
+        "generated": now(),
+        "status": task["status"],
+        "repo": str(repo),
+        "request": request,
+        "checklist": load_json(task["spec_path"], {}),
+        "git": git_state(repo) if repo.is_dir() else {},
+        "detected_checks": detect_checks(repo) if repo.is_dir() else [],
+        "failure_memory": search_failures(request),
+        "recent_events": recent_events(task["id"], 10),
+        "proof": proof_rows(task["id"]),
+    }
+    path = TASKS / task["id"] / "context.json"
+    save_json(path, context)
+    c = connect()
+    c.execute("UPDATE tasks SET context_path=? WHERE id=?", (str(path), task["id"]))
+    c.commit()
+    c.close()
+    record_event(task["id"], "CONTEXT_COMPILED", {"path": str(path)})
+    print(json.dumps(context, indent=2, ensure_ascii=False))
+
+
+def cmd_event(task_id, kind, payload_text):
+    task = get_task(task_id)
+    kind = (kind or "").strip()
+    if not kind:
+        die("the event type is empty")
+    try:
+        payload = json.loads(payload_text)
+    except ValueError as e:
+        die(f"--payload is not valid JSON: {e}")
+    if not isinstance(payload, dict):
+        die("--payload must be a JSON object, e.g. '{\"note\": \"tests pass\"}'")
+    record_event(task["id"], kind, payload)
+    print("ok")
+
+
+def cmd_handoff(task_id):
+    task = resolve_task(task_id)
+    tid = task["id"]
+    repo = Path(task["repo"])
+    checklist = load_json(task["spec_path"], {})
+    request = read_text(task["request_path"]).strip() or checklist.get("objective", "")
+    state = git_state(repo) if repo.is_dir() else {}
+    proofs = proof_rows(tid)
+    have = {LEGACY_PROOF_KINDS.get(p["kind"], p["kind"]) for p in proofs}
+    missing = [k for k in required_proof(checklist) if k not in have]
+
+    lines = [
+        f"# Handoff: task {tid}",
+        "",
+        f"- Status: {task['status']}",
+        f"- Repository: {task['repo']}",
+    ]
+    if state.get("branch"):
+        lines.append(f"- Branch: {state['branch']} at {state['head'][:12]}")
+    lines += [
+        f"- Risk hint (keyword-based): {task['risk'] or 'unknown'}",
+        f"- Started: {task['created']}",
+        f"- Last update: {task['updated']}",
+        "",
+        "## Request",
+        "",
+        request or "(missing)",
+        "",
+        "## Checklist",
+        "",
+    ]
+    lines += [f"- {item}" for item in checklist.get("acceptance", [])] or ["- (none)"]
+    lines += ["", "## Proof recorded", ""]
+    if proofs:
+        for p in proofs:
+            unit = f" {p['unit']}" if p["unit"] else ""
+            lines.append(f"- {p['kind']} {p['name']}: {p['value']}{unit} ({p['ts']})")
+    else:
+        lines.append("- (none yet)")
+    if missing:
+        lines += ["", "Still required by the checklist: " + ", ".join(missing)]
+    lines += ["", "## Recent events (newest first)", ""]
+    for e in recent_events(tid, 15):
+        payload = "" if e["payload"] in ({}, "", None) else " " + json.dumps(e["payload"], ensure_ascii=False)
+        lines.append(f"- {e['ts']} {e['type']}{payload}")
+    if state.get("status"):
+        lines += ["", "## Uncommitted changes", "", "```", state["status"], "```"]
+    lines += [
+        "",
+        "## Resume",
+        "",
+        "```",
+        f"cd {task['repo']}",
+        f"agent-task context {tid}",
+        f"agent-task finish {tid} --outcome success|partial|failure",
+        "```",
+        "",
+    ]
+    text = "\n".join(lines)
+    path = TASKS / tid / "handoff.md"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    record_event(tid, "HANDOFF_WRITTEN", {"path": str(path)})
+    print(text, end="")
+    print(f"agent-task: wrote {path}", file=sys.stderr)
+
+
+def cmd_fail_search(error):
+    print(json.dumps(search_failures(error), indent=2, ensure_ascii=False))
+
+
+def cmd_fail_remember(error, resolution, failed):
+    if not (resolution or "").strip():
+        die("the resolution is empty; say what fixed it (or, with --failed, what did not)")
+    print(remember_failure(error, resolution, worked=not failed))
+
+
+def add_proof(task_id, kind, name, value, unit=""):
+    task = get_task(task_id)
+    c = connect()
+    c.execute("INSERT INTO proof(task_id, kind, name, value, unit, ts) VALUES(?,?,?,?,?,?)",
+              (task["id"], kind, name, str(value), unit, now()))
+    c.commit()
+    c.close()
+    record_event(task["id"], "PROOF_ADDED", {"kind": kind, "name": name})
+    print("ok")
+
+
+def capture_proof(task_id, checks=False, run_cmds=None, quiet=False):
+    """Run checks (optional), compare recorded evidence with the checklist, write proof.json."""
+    task = get_task(task_id)
+    tid = task["id"]
+    repo = Path(task["repo"])
+    checklist = load_json(task["spec_path"], {})
+    commands = []
+    notes = []
+    if checks:
+        detected = detect_checks(repo) if repo.is_dir() else []
+        if not detected:
+            notes.append("--checks: no checks detected for this repository; pass them with --run CMD")
+        commands += detected
+    commands += list(run_cmds or [])
+
+    results = []
+    for command in commands:
+        started = time.time()
+        rc, output = run(command, cwd=str(repo) if repo.is_dir() else None, timeout=900, shell=True)
+        results.append({"command": command, "exit": rc, "seconds": round(time.time() - started, 2),
+                        "tail": output[-3000:]})
+
+    rows = proof_rows(tid)
+    have = {LEGACY_PROOF_KINDS.get(r["kind"], r["kind"]) for r in rows}
+    missing = [f"{k} (required by the checklist)" for k in required_proof(checklist) if k not in have]
+    # No checks and no recorded evidence proves nothing.
+    if not results and not rows:
+        missing.append("no verification: no checks ran and no evidence was recorded (run checks with "
+                       "--checks or --run CMD, or record evidence with agent-task proof metric|artifact)")
+    out = {
+        "task": tid,
+        "head": git(repo, "rev-parse", "HEAD") if repo.is_dir() else "",
+        "diffstat": git(repo, "diff", "--stat", "HEAD") if repo.is_dir() else "",
+        "checks": results,
+        "evidence": rows,
+        "missing": missing,
+        "notes": notes,
+        "complete": not missing and all(r["exit"] == 0 for r in results),
+    }
+    save_json(TASKS / tid / "proof.json", out)
+    record_event(tid, "PROOF_CAPTURED", {"complete": out["complete"], "missing": missing})
+    if not quiet:
+        print(json.dumps(out, indent=2, ensure_ascii=False))
+    return out
+
+
+def cmd_finish(task_id, outcome, quality, human, workers, tools, capabilities, checks, run_cmds):
+    task = get_task(task_id)
+    tid = task["id"]
+    if task["status"] not in OPEN_STATUSES:
+        print(f"agent-task: task {tid} was already closed ({task['status']}); recording this outcome too",
+              file=sys.stderr)
+    proof = capture_proof(tid, checks, run_cmds, quiet=True)
+    try:
+        created = datetime.fromisoformat(task["created"])
+        duration = (datetime.now(created.tzinfo) - created).total_seconds()
+    except (TypeError, ValueError):
+        duration = None
+    status = "completed" if outcome in ("success", "partial") else "failed"
+    ts = now()
+    c = connect()
+    c.execute(
+        """INSERT INTO metrics(task_id, ts, outcome, quality, duration, human, workers, tool_calls, capabilities)
+           VALUES(?,?,?,?,?,?,?,?,?)""",
+        (tid, ts, outcome, quality, duration, human, workers, tools, capabilities))
+    c.execute("UPDATE tasks SET status=?, updated=? WHERE id=?", (status, ts, tid))
+    c.commit()
+    c.close()
+    record_event(tid, "TASK_COMPLETED", {"outcome": outcome, "quality": quality, "proof_complete": proof["complete"]})
+    print(json.dumps({
+        "task": tid,
+        "outcome": outcome,
+        "status": status,
+        "duration_seconds": round(duration, 1) if duration is not None else None,
+        "proof_complete": proof["complete"],
+        "missing": proof["missing"],
+        "proof": str(TASKS / tid / "proof.json"),
+    }, indent=2, ensure_ascii=False))
+
+
+# ---------------------------------------------------------------- CLI
+
+def build_parser():
+    raw = argparse.RawDescriptionHelpFormatter
+    p = argparse.ArgumentParser(prog="agent-task", description=__doc__, formatter_class=raw)
+    s = p.add_subparsers(dest="cmd", metavar="COMMAND")
+    s.required = True
+
+    s.add_parser("init", help="create the store and print its location",
+                 description="Create ~/.agent-os/v2 (database and task folders) if missing and print its path.")
+
+    a = s.add_parser("start", help="open (or resume) a task and print its id", formatter_class=raw,
+                     description="Open a task for REQUEST in the repository and print its id on stdout.\n\n"
+                                 "If a task with the same request is still open in the same repository, its id\n"
+                                 "is printed instead (a note goes to stderr); --new always opens a fresh task.\n"
+                                 "Writes request.txt and checklist.json (a keyword-derived checklist; see\n"
+                                 "agent-task --help) to ~/.agent-os/v2/tasks/<id>/.")
+    a.add_argument("request", help="what the task should achieve, in plain words")
+    a.add_argument("--repo", metavar="PATH", help="repository the task is about (default: the current directory)")
+    a.add_argument("--new", action="store_true", help="open a new task even if the same request is still open")
+
+    for name, summary in (
+            ("status", "show the task record, latest outcome, event and proof counts (JSON)"),
+            ("context", "compile and print a working brief for the task (JSON); also writes context.json"),
+            ("handoff", "write and print a Markdown brief another session can resume from (handoff.md)")):
+        a = s.add_parser(name, help=summary,
+                         description=summary[0].upper() + summary[1:] + ". Without TASK, the most recently "
+                         "updated open task for the current repository is used.")
+        a.add_argument("task", nargs="?", metavar="TASK", help=f"task id, e.g. {TASK_ID_EXAMPLE}")
+
+    a = s.add_parser("event", help="append an event to a task's log",
+                     description="Append an event to the task's log (database and events.ndjson).")
+    a.add_argument("task", metavar="TASK", help="task id")
+    a.add_argument("type", metavar="TYPE", help="event type, e.g. DECISION, BLOCKED, TESTS_PASSED")
+    a.add_argument("--payload", default="{}", metavar="JSON", help="details as a JSON object (default: {})")
+
+    f = s.add_parser("fail", help="failure memory: look up or record fixes for errors",
+                     description="Failure memory shared by all tasks. Errors are normalized (home paths, hashes "
+                                 "and numbers removed) so the same error matches across runs.")
+    fs = f.add_subparsers(dest="sub", metavar="ACTION")
+    fs.required = True
+    a = fs.add_parser("search", help="print recorded fixes whose error or fix shares words with ERROR (JSON)",
+                      description="Print up to five recorded entries whose error or fix shares words with ERROR, "
+                                  "best match first (JSON). Matching is word overlap, not semantic search.")
+    a.add_argument("error", metavar="ERROR", help="the error message, or part of it")
+    a = fs.add_parser("remember", help="record what fixed an error (or, with --failed, what did not)",
+                      description="Record RESOLUTION for ERROR and print the entry's signature. Recording the "
+                                  "same error again replaces the resolution and counts the attempt.")
+    a.add_argument("error", metavar="ERROR", help="the error message")
+    a.add_argument("resolution", metavar="RESOLUTION", help="what fixed it")
+    a.add_argument("--failed", action="store_true", help="the resolution did not work; count it as a failure")
+
+    pr = s.add_parser("proof", help="record evidence for a task and check it",
+                      description="Record evidence for a task and check it against the task's checklist.")
+    ps = pr.add_subparsers(dest="sub", metavar="ACTION")
+    ps.required = True
+    a = ps.add_parser("metric", help="record a measurement taken before or after the change",
+                      description="Record a measurement (kind metric-before or metric-after).")
+    a.add_argument("task", metavar="TASK", help="task id")
+    a.add_argument("phase", choices=["before", "after"], help="taken before or after the change")
+    a.add_argument("name", metavar="NAME", help="what was measured, e.g. cold_start")
+    a.add_argument("value", metavar="VALUE", help="the measured value")
+    a.add_argument("unit", metavar="UNIT", help="unit of the value, e.g. ms")
+    a = ps.add_parser("artifact", help="record a file (log, screenshot, report) as evidence",
+                      description="Record an existing file as evidence (kind artifact-before or artifact-after). "
+                                  "The absolute path is stored; the file is not copied.")
+    a.add_argument("task", metavar="TASK", help="task id")
+    a.add_argument("phase", choices=["before", "after"], help="captured before or after the change")
+    a.add_argument("name", metavar="NAME", help="short label, e.g. login_screen")
+    a.add_argument("path", metavar="PATH", help="the file")
+    a = ps.add_parser("capture", help="run checks, summarize evidence, list what is missing (JSON)",
+                      description="Optionally run checks, then compare the recorded evidence with the checklist, "
+                                  "print the result (JSON) and write proof.json. Exits 1 when the proof is "
+                                  "incomplete: a check failed, required evidence is missing, or nothing at all "
+                                  "was checked or recorded.")
+    a.add_argument("task", metavar="TASK", help="task id")
+    a.add_argument("--checks", action="store_true",
+                   help="run the checks the repository advertises (package.json scripts, flutter, swift, cargo, go)")
+    a.add_argument("--run", action="append", default=[], metavar="CMD",
+                   help="run CMD in the repository as a check (repeatable)")
+
+    a = s.add_parser("finish", help="capture proof, record the outcome and close the task",
+                     description="Capture proof (as proof capture, without printing it), record the outcome in "
+                                 "the metrics table and close the task: success and partial set status "
+                                 "completed, failure sets failed. Prints a JSON summary. The numeric options are "
+                                 "self-reported and stored as given.")
+    a.add_argument("task", metavar="TASK", help="task id")
+    a.add_argument("--outcome", choices=["success", "partial", "failure"], required=True, help="how it ended")
+    a.add_argument("--checks", action="store_true", help="run the repository's detected checks first")
+    a.add_argument("--run", action="append", default=[], metavar="CMD", help="run CMD as a check first (repeatable)")
+    a.add_argument("--quality", type=float, default=None, metavar="0-1", help="your quality rating, 0 to 1")
+    a.add_argument("--human", type=int, default=0, metavar="N", help="times a human had to step in")
+    a.add_argument("--workers", type=int, default=0, metavar="N", help="number of worker agents used")
+    a.add_argument("--tools", type=int, default=0, metavar="N", help="number of tool calls")
+    a.add_argument("--capabilities", default="", metavar="LIST", help="skills/tools used, comma-separated")
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    init_store()
+
+    if args.cmd == "init":
+        print(BASE)
+    elif args.cmd == "start":
+        cmd_start(args.request, args.repo, args.new)
+    elif args.cmd == "status":
+        cmd_status(args.task)
+    elif args.cmd == "context":
+        cmd_context(args.task)
+    elif args.cmd == "handoff":
+        cmd_handoff(args.task)
+    elif args.cmd == "event":
+        cmd_event(args.task, args.type, args.payload)
+    elif args.cmd == "fail":
+        if args.sub == "search":
+            cmd_fail_search(args.error)
+        else:
+            cmd_fail_remember(args.error, args.resolution, args.failed)
+    elif args.cmd == "proof":
+        if args.sub == "metric":
+            add_proof(args.task, "metric-" + args.phase, args.name, args.value, args.unit)
+        elif args.sub == "artifact":
+            path = Path(args.path).expanduser()
+            if not path.is_file():
+                die(f"no such file: {args.path}")
+            add_proof(args.task, "artifact-" + args.phase, args.name, str(path.resolve()))
+        else:
+            result = capture_proof(args.task, args.checks, args.run)
+            if not result["complete"]:
+                raise SystemExit(1)
+    elif args.cmd == "finish":
+        if args.quality is not None and not 0 <= args.quality <= 1:
+            die("--quality must be between 0 and 1")
+        cmd_finish(args.task, args.outcome, args.quality, args.human, args.workers, args.tools,
+                   args.capabilities, args.checks, args.run)
+
+
+if __name__ == "__main__":
+    main()
