@@ -16,7 +16,11 @@ Scope (what "the change" is):
               (on a base branch), falls back to working tree vs HEAD.
   --range A..B   committed range only (A...B uses the merge-base of A and B)
   --base REF     merge-base with REF plus working tree and untracked files
-  --worktree     working tree vs HEAD (the pre-2026-10-10 behaviour)
+  --worktree     working tree vs HEAD only
+
+Reviewers named "pr-review-toolkit:*" come from Anthropic's pr-review-toolkit
+plugin. Skill specialists other than security-review are only recommended when
+the skill is installed under ~/.claude/skills or ~/.agents/skills.
 
 Output: JSON with scope, files, risk (signals), and reviewers (<= 3).
 Stdlib only; runs under /usr/bin/python3 (3.9).
@@ -580,6 +584,11 @@ def analyse(task, files, diff):
 
 
 SECURITY_CATS = {"auth", "crypto", "secrets", "web-security", "injection", "webhooks"}
+SKILL_DIRS = [os.path.expanduser("~/.claude/skills"), os.path.expanduser("~/.agents/skills")]
+
+
+def skill_installed(name):
+    return any(os.path.isfile(os.path.join(d, name, "SKILL.md")) for d in SKILL_DIRS)
 
 
 def pick_specialist(task, files, code_files, doc_files, risk, stats):
@@ -601,9 +610,9 @@ def pick_specialist(task, files, code_files, doc_files, risk, stats):
     if exts:
         swift = sum(x == ".swift" for x in exts)
         react = sum(x in (".tsx", ".jsx") for x in exts)
-        if swift * 2 > len(exts):
+        if swift * 2 > len(exts) and skill_installed("swiftui-pro"):
             cands.append(("swiftui-pro", "skill", "swiftui-pro", "mostly Swift/SwiftUI changes"))
-        elif react * 2 > len(exts):
+        elif react * 2 > len(exts) and skill_installed("vercel-react-best-practices"):
             cands.append(("vercel-react-best-practices", "skill", "vercel-react-best-practices",
                           "mostly React component changes"))
     if re.search(r"(?i)\b(refactor\w*|simplif\w*|clean ?up)\b", task or "") and code_files:
