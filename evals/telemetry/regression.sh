@@ -13,7 +13,7 @@ USAGE="$HOME/bin/agent-usage"
 DISTILL="$HOME/bin/agent-session-distill"
 INGEST="$HOME/bin/agent-telemetry-ingest"
 PY=/usr/bin/python3
-TMP=$(mktemp -d -t agentos-telemetry-reg)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/agentos-telemetry-reg.XXXXXX") || { echo "FAIL: mktemp"; exit 1; }
 export AGENTOS_TELEMETRY_DB="${AGENTOS_TELEMETRY_DB:-$TMP/test.sqlite}"
 export AGENTOS_CAP_STATS="$TMP/capability-stats.json"
 export AGENTOS_DISTILL_LOG="$TMP/distill.log"
@@ -209,7 +209,8 @@ printf '%s' '{"session_id":"s7","cwd":"/tmp","hook_event_name":"PreToolUse","too
   | CLAUDE_CONFIG_DIR="$HOME/.claude_second" "$HOOK"
 f=$(ls "$AGENTOS_TELEMETRY_SPOOL"/e.* 2>/dev/null | head -1)
 [ -n "$f" ] || fail "no spool file for a Skill event"
-[ "$(stat -f %Lp "$f")" = 600 ] && [ "$(stat -f %Lp "$AGENTOS_TELEMETRY_SPOOL")" = 700 ] || fail "spool modes: file $(stat -f %Lp "$f") dir $(stat -f %Lp "$AGENTOS_TELEMETRY_SPOOL")"
+mode() { "$PY" -c 'import os, sys; print("%o" % (os.stat(sys.argv[1]).st_mode & 0o777))' "$1"; }  # stat flags differ between BSD and GNU
+[ "$(mode "$f")" = 600 ] && [ "$(mode "$AGENTOS_TELEMETRY_SPOOL")" = 700 ] || fail "spool modes: file $(mode "$f") dir $(mode "$AGENTOS_TELEMETRY_SPOOL")"
 head -1 "$f" | grep -q "^AOS1	$HOME/.claude_second	" || fail "spool header: $(head -1 "$f")"
 [ "$(q "select account||'|'||mode from usage where session_id='s7'")" = "claude_second|$(cat "$HOME/.agent-os/mode" 2>/dev/null || echo owner)" ] || fail "account/mode from spool header"
 [ "$(spooled)" = 0 ] || fail "ingest left spool files"
