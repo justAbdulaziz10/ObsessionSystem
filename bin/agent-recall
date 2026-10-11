@@ -1,13 +1,15 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """agent-recall: one ranked index over agent memory.
 
 Sources (files stay the source of truth; the index is fully rebuildable):
   ~/.agent-os/{LESSONS,DECISIONS,IMPROVEMENTS}.md  one entry per "## " heading (whichever exist)
-  ~/.claude*/projects/*/memory/*.md                one entry per memory file
+  <claude dir>/projects/*/memory/*.md              one entry per memory file
   agentos.sqlite failures table (agent-task fail)  one entry per row
+Claude dirs: ~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated); a memory
+entry's account is its dir's name without the leading dot (claude, work-claude, ...).
 
 Usage:
-  agent-recall "<query>" [--k 5] [--kind lessons,decisions,...] [--account claude1|claude2]
+  agent-recall "<query>" [--k 5] [--kind lessons,decisions,...] [--account LABEL]
                [--project SUBSTR] [--all] [--json] [--no-reindex] [--aliases|--no-aliases]
   agent-recall index [--aliases|--no-llm] [--aliases-max 300]
                           rebuild now (also happens automatically when a source changed;
@@ -48,7 +50,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
-VERSION = "2"  # bump to force a reindex when parsing changes (2: aliases column)
+VERSION = "3"  # bump to force a reindex when parsing changes (2: aliases column, 3: account labels)
 
 HOME = os.environ.get("AGENT_RECALL_HOME") or os.path.expanduser("~")
 AOS = os.path.join(HOME, ".agent-os")
@@ -61,7 +63,6 @@ FILE_KINDS = [
     ("decisions", "DECISIONS.md", "##"),
     ("improvements", "IMPROVEMENTS.md", "##"),
 ]
-ACCOUNTS = [("claude1", ".claude"), ("claude2", ".claude_second")]
 KINDS = ["lessons", "decisions", "improvements", "memory", "failures"]
 
 W_HEADING, W_ABSTRACT, W_BODY = 5.0, 3.0, 1.0
@@ -131,12 +132,33 @@ def iso(ts):
     return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d") if ts else ""
 
 
+def claude_dirs():
+    """Existing Claude config dirs: ~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated),
+    de-duplicated by realpath."""
+    home, out, seen = HOME, [], set()
+    for d in [os.path.join(home, ".claude"), os.environ.get("CLAUDE_CONFIG_DIR", "")] + \
+            os.environ.get("AGENT_CLAUDE_DIRS", "").split(":"):
+        if d == "~" or d.startswith("~/"):
+            d = home + d[1:]
+        if d and os.path.isdir(d) and os.path.realpath(d) not in seen:
+            seen.add(os.path.realpath(d))
+            out.append(os.path.abspath(d))
+    return out
+
+
+def account_label(d):
+    """Account label of a config dir: its name without the leading dot (~/.claude -> claude)."""
+    b = os.path.basename(d.rstrip("/"))
+    return b[1:] if b.startswith(".") else b
+
+
 # ---------------------------------------------------------------- sources
 
 def memory_files():
     out = []
-    for account, d in ACCOUNTS:
-        for p in sorted(glob.glob(os.path.join(HOME, d, "projects", "*", "memory", "*.md"))):
+    for d in claude_dirs():
+        account = account_label(d)
+        for p in sorted(glob.glob(os.path.join(d, "projects", "*", "memory", "*.md"))):
             if os.path.basename(p) == "MEMORY.md":  # index of pointers, duplicates the files
                 continue
             out.append((account, p))
@@ -447,7 +469,6 @@ ALIAS_SYSTEM = (
 )
 OUT_OF_USAGE = re.compile(r"usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage|"
                           r"credit balance|not logged in|please run /login|overloaded", re.I)
-CLAUDE_HOMES = [os.path.join(HOME, ".claude"), os.path.join(HOME, ".claude_second")]
 
 
 def aliases_enabled(flag=None):
@@ -526,9 +547,7 @@ def ask_haiku(text):
     """(result text or None, usage dict, note). Same headless pattern as agent-session-distill."""
     note = "no Claude account available"
     with tempfile.TemporaryDirectory(prefix="agentos-recall-") as cwd:
-        for home in CLAUDE_HOMES:
-            if not os.path.isdir(home):
-                continue
+        for home in claude_dirs():
             env = dict(os.environ, CLAUDE_CONFIG_DIR=home, AGENTOS_DISTILL="1", AGENTOS_TELEMETRY_DISABLE="1")
             cmd = ["claude", "-p", "--model", "haiku", "--output-format", "json", "--tools", "",
                    "--strict-mcp-config", "--no-session-persistence", "--max-budget-usd", "0.25",
@@ -781,7 +800,7 @@ def main(argv):
     ap.add_argument("query", nargs="+")
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--kind", help="comma list: " + ",".join(KINDS))
-    ap.add_argument("--account", help="claude1 or claude2 (memory entries only)")
+    ap.add_argument("--account", help="account label, e.g. claude (memory entries only)")
     ap.add_argument("--project", help="substring of the Claude project dir (memory entries only)")
     ap.add_argument("--all", action="store_true", help="include invalid/superseded entries")
     ap.add_argument("--json", action="store_true")
@@ -796,13 +815,12 @@ def main(argv):
         bad = [k for k in kinds if k not in KINDS]
         if bad:
             die("unknown kind(s): %s (valid: %s)" % (",".join(bad), ",".join(KINDS)), 2)
-    acct = {"claude": "claude1", "claude_second": "claude2", "1": "claude1", "2": "claude2"}.get(a.account, a.account)
 
     con = connect()
     ensure_schema(con)
     if not a.no_reindex:
         maybe_reindex(con)
-    res = search(con, " ".join(a.query), a.k, kinds, acct, a.project, a.all, aliases_enabled(a.aliases))
+    res = search(con, " ".join(a.query), a.k, kinds, a.account, a.project, a.all, aliases_enabled(a.aliases))
     if a.json:
         keep = ["kind", "path", "line", "anchor", "heading", "abstract", "account", "project",
                 "status", "superseded_by", "score"]

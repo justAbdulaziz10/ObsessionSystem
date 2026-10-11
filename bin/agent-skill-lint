@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """agent-skill-lint: deterministic checks for SKILL.md skills (no LLM, stdlib only).
 
 Usage:
@@ -42,11 +42,7 @@ HOME = Path.home()
 SKILLS_ROOT = HOME / ".agents" / "skills"
 SOURCES = HOME / ".agents" / "skill-sources.json"
 LOCK = HOME / ".agents" / ".skill-lock.json"
-PLUGIN_GLOBS = [
-    ".claude/plugins/cache/*/*/*/skills/*",
-    ".claude_second/plugins/cache/*/*/*/skills/*",
-    ".codex/plugins/cache/*/*/*/skills/*",
-]
+PLUGIN_GLOB = "plugins/cache/*/*/*/skills/*"
 
 DESC_WARN, DESC_HARD, DESC_MAX = 300, 500, 1024
 BODY_WARN = 200
@@ -66,6 +62,26 @@ SEVERITY = {
 
 PLACEHOLDER_USERS = {"user", "username", "you", "me", "name", "example", "someone", "john",
                      "jane", "alice", "bob", "dev", "runner", "foo", "yourname", "your-name", "x"}
+
+
+def claude_dirs():
+    """Existing Claude config dirs: ~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated),
+    de-duplicated by realpath."""
+    home, out, seen = str(HOME), [], set()
+    for d in [os.path.join(home, ".claude"), os.environ.get("CLAUDE_CONFIG_DIR", "")] + \
+            os.environ.get("AGENT_CLAUDE_DIRS", "").split(":"):
+        if d == "~" or d.startswith("~/"):
+            d = home + d[1:]
+        if d and os.path.isdir(d) and os.path.realpath(d) not in seen:
+            seen.add(os.path.realpath(d))
+            out.append(os.path.abspath(d))
+    return out
+
+
+def plugin_skill_dirs():
+    """Plugin skill dirs of every Claude config dir and of ~/.codex."""
+    for base in [Path(d) for d in claude_dirs()] + [HOME / ".codex"]:
+        yield from sorted(base.glob(PLUGIN_GLOB))
 
 
 # ---------------------------------------------------------------- frontmatter
@@ -534,26 +550,24 @@ def discover(all_flag, plugins, dirs):
     if plugins:
         seen = set()
         latest = {}
-        for g in PLUGIN_GLOBS:
-            for d in HOME.glob(g):
-                version_dir = d.parent.parent
-                plug = version_dir.parent
-                try:
-                    mt = version_dir.stat().st_mtime
-                except OSError:
-                    continue
-                if plug not in latest or mt > latest[plug][0]:
-                    latest[plug] = (mt, version_dir)
+        for d in plugin_skill_dirs():
+            version_dir = d.parent.parent
+            plug = version_dir.parent
+            try:
+                mt = version_dir.stat().st_mtime
+            except OSError:
+                continue
+            if plug not in latest or mt > latest[plug][0]:
+                latest[plug] = (mt, version_dir)
         active = set(v for _, v in latest.values())
-        for g in PLUGIN_GLOBS:
-            for d in sorted(HOME.glob(g)):
-                if d.parent.parent not in active:
-                    continue
-                if (d / "SKILL.md").is_file():
-                    key = os.path.realpath(d)
-                    if key not in seen:
-                        seen.add(key)
-                        out.append((d, False))
+        for d in plugin_skill_dirs():
+            if d.parent.parent not in active:
+                continue
+            if (d / "SKILL.md").is_file():
+                key = os.path.realpath(d)
+                if key not in seen:
+                    seen.add(key)
+                    out.append((d, False))
     return out
 
 

@@ -18,7 +18,7 @@ export HOME="$T" PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/u
 git config --global user.name ci
 git config --global user.email ci@example.invalid
 git config --global init.defaultBranch main
-# Both account slots exist, as the telemetry and overnight suites expect.
+# A second Claude config dir; the telemetry suite names it in AGENT_CLAUDE_DIRS.
 mkdir -p "$T/.claude" "$T/.claude_second"
 
 "$REPO/install.sh" --with-hooks --with-git-hooks >/dev/null || { echo "FAIL install"; exit 1; }

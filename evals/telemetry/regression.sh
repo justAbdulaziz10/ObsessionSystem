@@ -21,6 +21,8 @@ export AGENTOS_TELEMETRY_ERRLOG="$TMP/telemetry-errors.log"
 export AGENTOS_TELEMETRY_SPOOL="$TMP/spool"
 export AGENTOS_TELEMETRY_MIN_AGE=0   # tests write sequentially; production claims files >= 1 s old
 unset AGENTOS_DISTILL AGENTOS_TELEMETRY_DISABLE AGENTOS_TELEMETRY_TEST_CRASH
+# A second account the way a user configures one; ~/.claude is always the first.
+export AGENT_CLAUDE_DIRS="$HOME/.claude_second"
 pass=0
 fail() { echo "FAIL: $*"; [ -n "${KEEP:-}" ] || rm -rf "$TMP"; exit 1; }
 ok() { pass=$((pass + 1)); echo "ok   $*"; }
@@ -75,7 +77,7 @@ feed '{"session_id":"s1","transcript_path":"'"$TP1"'","cwd":"/tmp","hook_event_n
 feed '{"session_id":"s1","transcript_path":"'"$TP1"'","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"mcp__plugin_lazyweb_lazyweb__lazyweb_execute","tool_input":{}}'
 feed '{"session_id":"s1","transcript_path":"'"$TP1"'","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Bash","tool_input":{"command":"ls"}}'
 got=$(q "select kind||'|'||name||'|'||detail||'|'||account from usage order by id" | tr '\n' ';')
-want="skill|agent-work-loop||claude1;agent|Explore||claude1;agent|general-purpose||claude1;read_skill|graphify||claude1;read_skill|writing-rules|plugin:hookify|claude1;read_agent|agent-risk-reviewer||claude1;mcp|claude_ai_Gmail|search_threads|claude1;mcp|plugin_lazyweb_lazyweb|lazyweb_execute|claude1;"
+want="skill|agent-work-loop||claude;agent|Explore||claude;agent|general-purpose||claude;read_skill|graphify||claude;read_skill|writing-rules|plugin:hookify|claude;read_agent|agent-risk-reviewer||claude;mcp|claude_ai_Gmail|search_threads|claude;mcp|plugin_lazyweb_lazyweb|lazyweb_execute|claude;"
 [ "$got" = "$want" ] || fail "usage rows: got [$got] want [$want]"
 ok "PreToolUse: skill, agent (Agent+Task), read_skill (user+plugin), read_agent, mcp; plain Read/Bash ignored"
 [ "$(q "select repo from usage where id=1")" = "" ] || [ -d "$HOME/bin/.git" ] || fail "repo for non-repo cwd"
@@ -84,21 +86,28 @@ ok "no free text (skill args, prompts) stored"
 
 # 2. account from transcript path / CLAUDE_CONFIG_DIR
 feed '{"session_id":"s2","transcript_path":"'"$TP2"'","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Skill","tool_input":{"skill":"x"}}'
-[ "$(q "select account from usage where session_id='s2'")" = claude2 ] || fail "account claude2 from transcript path"
+[ "$(q "select account from usage where session_id='s2'")" = claude_second ] || fail "account claude_second from transcript path"
 printf '%s' '{"session_id":"s3","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Skill","tool_input":{"skill":"y"}}' \
   | CLAUDE_CONFIG_DIR="$HOME/.claude_second" "$HOOK"
-[ "$(q "select account from usage where session_id='s3'")" = claude2 ] || fail "account from CLAUDE_CONFIG_DIR"
+[ "$(q "select account from usage where session_id='s3'")" = claude_second ] || fail "account from CLAUDE_CONFIG_DIR"
 printf '%s' '{"session_id":"s4","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Skill","tool_input":{"skill":"y"}}' \
   | env -u CLAUDE_CONFIG_DIR "$HOOK"
-[ "$(q "select account from usage where session_id='s4'")" = claude1 ] || fail "default account claude1"
-ok "account: transcript path first, then CLAUDE_CONFIG_DIR, default claude1"
+[ "$(q "select account from usage where session_id='s4'")" = claude ] || fail "default account claude"
+mkdir -p "$TMP/work-claude"
+feed '{"session_id":"s2b","transcript_path":"'"$TMP"'/work-claude/projects/-tmp-x/cccc.jsonl","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Skill","tool_input":{"skill":"x"}}'
+AGENT_CLAUDE_DIRS="$HOME/.claude_second:$TMP/work-claude" ingest
+[ "$(qraw "select account from usage where session_id='s2b'")" = work-claude ] || fail "account label from an AGENT_CLAUDE_DIRS entry"
+feed '{"session_id":"s2c","transcript_path":"'"$TP2"'","cwd":"/tmp","hook_event_name":"PreToolUse","tool_name":"Skill","tool_input":{"skill":"x"}}'
+env -u AGENT_CLAUDE_DIRS -u CLAUDE_CONFIG_DIR "$INGEST" --quiet --wait 30 || fail "ingest rc=$?"
+[ "$(qraw "select account from usage where session_id='s2c'")" = claude ] || fail "transcript outside known dirs, no header: want claude"
+ok "account: config dir holding the transcript (~/.claude, CLAUDE_CONFIG_DIR, AGENT_CLAUDE_DIRS), then header CLAUDE_CONFIG_DIR, default claude"
 
 # 3. session events
 feed '{"session_id":"s1","transcript_path":"'"$TP1"'","cwd":"/tmp","hook_event_name":"Stop","last_assistant_message":"done"}'
 feed '{"session_id":"s1","transcript_path":"'"$TP1"'","cwd":"/tmp","hook_event_name":"StopFailure","error":"rate_limit","error_details":"429 secret detail","last_assistant_message":"API Error"}'
 feed '{"session_id":"s1","transcript_path":"'"$TP1"'","cwd":"/tmp","hook_event_name":"SessionEnd","reason":"prompt_input_exit"}'
 got=$(q "select account||'|'||stops||'|'||stop_failures||'|'||last_error||'|'||end_reason||'|'||tool_counts||'|'||transcript_path from sessions where session_id='s1'")
-want="claude1|2|1|rate_limit|prompt_input_exit|{\"agent\": 2, \"mcp\": 2, \"read_agent\": 1, \"read_skill\": 2, \"skill\": 1}|$TP1"
+want="claude|2|1|rate_limit|prompt_input_exit|{\"agent\": 2, \"mcp\": 2, \"read_agent\": 1, \"read_skill\": 2, \"skill\": 1}|$TP1"
 [ "$got" = "$want" ] || fail "sessions row: got [$got] want [$want]"
 [ "$(q "select count(*) from sessions where last_error like '%secret%'")" = 0 ] || fail "error text leaked"
 ok "Stop/StopFailure/SessionEnd upsert: stops, failures, error type only, end reason, tool counts"
@@ -170,7 +179,7 @@ u([{"type": "tool_result", "tool_use_id": "t7", "content": "ok"}])
 rows.append({"type": "assistant", "isApiErrorMessage": True, "message": {"role": "assistant", "content": [{"type": "text", "text": "API Error"}]}})
 open(sys.argv[1], "w").write("\n".join(json.dumps(r) for r in rows) + "\n")
 EOF
-q "insert into sessions(session_id,account,cwd,transcript_path,last_seen,stops,stop_failures) values('fx','claude1','/tmp/proj','$FX',strftime('%Y-%m-%dT%H:%M:%S','now','localtime')||'.000+03:00',1,1)"
+q "insert into sessions(session_id,account,cwd,transcript_path,last_seen,stops,stop_failures) values('fx','claude','/tmp/proj','$FX',strftime('%Y-%m-%dT%H:%M:%S','now','localtime')||'.000+03:00',1,1)"
 "$DISTILL" --dry-run --json --show-snippet --transcript "$FX" > "$TMP/distill.json" || fail "distill dry-run rc"
 "$PY" - "$TMP/distill.json" <<'EOF' || fail "distill parse/redaction"
 import json, sys
@@ -202,7 +211,7 @@ f=$(ls "$AGENTOS_TELEMETRY_SPOOL"/e.* 2>/dev/null | head -1)
 [ -n "$f" ] || fail "no spool file for a Skill event"
 [ "$(stat -f %Lp "$f")" = 600 ] && [ "$(stat -f %Lp "$AGENTOS_TELEMETRY_SPOOL")" = 700 ] || fail "spool modes: file $(stat -f %Lp "$f") dir $(stat -f %Lp "$AGENTOS_TELEMETRY_SPOOL")"
 head -1 "$f" | grep -q "^AOS1	$HOME/.claude_second	" || fail "spool header: $(head -1 "$f")"
-[ "$(q "select account||'|'||mode from usage where session_id='s7'")" = "claude2|$(cat "$HOME/.agent-os/mode" 2>/dev/null || echo owner)" ] || fail "account/mode from spool header"
+[ "$(q "select account||'|'||mode from usage where session_id='s7'")" = "claude_second|$(cat "$HOME/.agent-os/mode" 2>/dev/null || echo owner)" ] || fail "account/mode from spool header"
 [ "$(spooled)" = 0 ] || fail "ingest left spool files"
 ok "spool file 600 in 700 dir; header keeps CLAUDE_CONFIG_DIR + mode; plain Read/disabled write nothing; ingest empties spool"
 
@@ -222,7 +231,7 @@ cat "$TMP"/conc.* | grep -q HOOKFAIL && fail "hook failed under concurrency"
 AGENTOS_TELEMETRY_SPOOL="$CS" "$INGEST" --quiet --wait 30 || fail "ingest after concurrent writers"
 [ "$(qraw "select count(*) from usage where session_id like 'c-%'")" = 240 ] || fail "concurrent rows: $(qraw "select count(*) from usage where session_id like 'c-%'")"
 [ "$(qraw "select count(distinct session_id||name) from usage where session_id like 'c-%'")" = 240 ] || fail "concurrent rows duplicated or lost"
-[ "$(qraw "select count(*) from usage where session_id like 'c-%-claude_second' and account='claude2'")" = 120 ] || fail "concurrent account split"
+[ "$(qraw "select count(*) from usage where session_id like 'c-%-claude_second' and account='claude_second'")" = 120 ] || fail "concurrent account split"
 ok "8 parallel writers (both accounts) x 30 events: 240 files, 240 rows, none lost or duplicated"
 
 # 9. double ingest + crash safety: two concurrent ingesters, crash before COMMIT, crash after COMMIT

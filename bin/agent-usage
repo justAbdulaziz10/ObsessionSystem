@@ -1,14 +1,16 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 """Capability usage recorded automatically by ~/bin/agent-telemetry-hook (Claude Code hooks).
 
-  agent-usage skills   [--days 14] [--account claude1|claude2] [--json]   Skill tool calls + Reads of SKILL.md
+  agent-usage skills   [--days 14] [--account LABEL] [--json]          Skill tool calls + Reads of SKILL.md
   agent-usage agents   [--days 14] ...                                   Agent/Task calls + Reads of agents/*.md
   agent-usage mcp      [--days 14] ...                                   MCP calls per server (top tools)
   agent-usage unused   [--days 14] [--json]     installed skills with zero loads in the window
   agent-usage sessions [--days 1]  [--json]     recorded sessions (paths and counts only)
   agent-usage sync-stats [--days 14]            merge load counts into ~/.agent-os/telemetry/capability-stats.json
 
-Installed skills = ~/.agents/skills, ~/.claude*/skills, and skills of plugins enabled in either Claude account.
+Installed skills = ~/.agents/skills, <claude dir>/skills, and skills of plugins enabled in any Claude dir.
+Claude dirs: ~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated). An account label is
+the dir's name without the leading dot (claude, work-claude, ...).
 Codex sessions are not instrumented (no Codex hook); counts are Claude-only.
 sync-stats adds `loads`, `loads_window_days`, `last_loaded` per key and leaves any other fields alone.
 Every command first ingests the hook spool (~/bin/agent-telemetry-ingest) so reports include events up to
@@ -28,7 +30,20 @@ import sys
 HOME = os.path.expanduser("~")
 DB = os.environ.get("AGENTOS_TELEMETRY_DB") or os.path.join(HOME, ".agent-os", "v2", "db", "agentos.sqlite")
 STATS = os.environ.get("AGENTOS_CAP_STATS") or os.path.join(HOME, ".agent-os", "telemetry", "capability-stats.json")
-CLAUDE_HOMES = [os.path.join(HOME, ".claude"), os.path.join(HOME, ".claude_second")]
+
+
+def claude_dirs():
+    """Existing Claude config dirs: ~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated),
+    de-duplicated by realpath."""
+    home, out, seen = HOME, [], set()
+    for d in [os.path.join(home, ".claude"), os.environ.get("CLAUDE_CONFIG_DIR", "")] + \
+            os.environ.get("AGENT_CLAUDE_DIRS", "").split(":"):
+        if d == "~" or d.startswith("~/"):
+            d = home + d[1:]
+        if d and os.path.isdir(d) and os.path.realpath(d) not in seen:
+            seen.add(os.path.realpath(d))
+            out.append(os.path.abspath(d))
+    return out
 
 
 def ingest_spool():
@@ -119,7 +134,7 @@ def installed_skills():
             pass
 
     scan(os.path.join(HOME, ".agents", "skills"), "user")
-    for h in CLAUDE_HOMES:
+    for h in claude_dirs():
         scan(os.path.join(h, "skills"), "user")
         try:
             enabled = {k for k, v in json.load(open(os.path.join(h, "settings.json"))).get("enabledPlugins", {}).items() if v}
@@ -214,7 +229,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("cmd", choices=["skills", "agents", "mcp", "unused", "sessions", "sync-stats"])
     ap.add_argument("--days", type=float, default=None)
-    ap.add_argument("--account", choices=["claude1", "claude2"])
+    ap.add_argument("--account", metavar="LABEL", help="account label, e.g. claude")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-ingest", action="store_true", help="report without ingesting the hook spool first")
     a = ap.parse_args()
