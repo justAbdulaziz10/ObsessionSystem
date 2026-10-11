@@ -6,16 +6,26 @@
 # agent-codex --cancel <job>      stop a detached job and its process tree
 # Exit 75 means every Codex account is exhausted (from --detach or --wait).
 #
-# Claude Code kills a foreground Bash call after 10 minutes, and an xhigh
-# Codex task often runs longer, so dispatchers must use --detach/--wait.
+# Optional Codex add-on. This script only starts, waits for, and cancels
+# `codex-ha run` jobs; it passes no flags to codex itself. codex-ha runs
+#   codex --ask-for-approval never exec --ephemeral [--model M]
+#         [-c model_reasoning_effort="E"] --sandbox workspace-write
+#         --skip-git-repo-check [-c <disabled MCPs/plugins>] -- "<task>"
+# (see the codex-ha header for where model, effort and disabled MCPs come from).
+#
+# Job files live in $AGENT_CODEX_JOBS (default ~/.agent-os/runtime/codex-jobs/<job>):
+# prompt.txt, cwd.txt, pid, log, rc.
+#
+# Claude Code kills a foreground Bash call after 10 minutes, and a Codex task
+# often runs longer, so dispatchers must use --detach/--wait.
 set -uo pipefail
 
-JOBS="$HOME/.agent-os/runtime/codex-jobs"
+JOBS="${AGENT_CODEX_JOBS:-$HOME/.agent-os/runtime/codex-jobs}"
 
 usage() { sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; }
 
 # Flags are parsed before anything else: --help must never reach the task
-# path, which records events/checkpoints and starts Codex.
+# path, which starts Codex.
 case "${1-}" in
   -h|--help) usage; exit 0 ;;
   --cancel|--wait|--detach) ;;
@@ -51,7 +61,7 @@ if [ "${1-}" = "--wait" ]; then
   PID="$(cat "$DIR/pid")"
   END=$((SECONDS + MAX))
   while [ ! -f "$DIR/rc" ] && kill -0 "$PID" 2>/dev/null && [ "$SECONDS" -lt "$END" ]; do
-    sleep 5
+    sleep 2
   done
   if [ -f "$DIR/rc" ]; then
     RC="$(cat "$DIR/rc")"
@@ -110,17 +120,5 @@ if [ -z "$PROMPT" ]; then
   exit 2
 fi
 
-agent-storage >/dev/null 2>&1 || true
-agent-ops event codex_start "$PROMPT" >/dev/null 2>&1 || true
-agent-ops checkpoint pre-codex >/dev/null 2>&1 || true
-
-set +e
 codex-ha run "$PROMPT"
-RC=$?
-set -e
-
-agent-ops event codex_end "exit=$RC" >/dev/null 2>&1 || true
-agent-ops checkpoint "post-codex-$RC" >/dev/null 2>&1 || true
-agent-storage >/dev/null 2>&1 || true
-
-exit "$RC"
+exit $?

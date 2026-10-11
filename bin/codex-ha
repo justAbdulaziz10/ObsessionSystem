@@ -1,4 +1,37 @@
 #!/usr/bin/env python3
+"""codex-ha: run a Codex task with failover across logged-in Codex homes.
+
+Optional add-on. Requires the Codex CLI (`codex`) on PATH and at least one
+logged-in Codex home.
+
+Accounts
+  codex1  ~/.codex          (used if the directory exists)
+  codex2  ~/.codex_second   (used only if the directory exists)
+  CODEX_HA_HOMES=dir1:dir2  replaces that list (named codex1, codex2, ...).
+An account is ready when the directory exists, `CODEX_HOME=<home> codex login
+status` exits 0 (if that subcommand is unknown, <home>/auth.json must exist),
+and it is not in a cooldown recorded after a failed run (~/.codex-ha/state.json).
+
+Exact command run per attempt (with CODEX_HOME=<account home>):
+  codex --ask-for-approval never exec --ephemeral
+        [--model M] [-c model_reasoning_effort="E"]
+        --sandbox workspace-write --skip-git-repo-check
+        [-c mcp_servers.<name>.enabled=false ...]
+        [-c plugins."<name>".enabled=false ...]
+        -- "<task>"
+  - approvals off and sandbox workspace-write: Codex may edit files in the
+    current directory (and run commands there) without asking; .git stays
+    read-only, so Codex cannot commit.
+  - no --model / effort override by default: the Codex CLI's own configured
+    defaults apply. Override with env CODEX_HA_MODEL / CODEX_HA_EFFORT, else
+    "codex_model" / "codex_effort" in ~/.agent-os/config.json (null = unset).
+  - MCP servers / plugins to disable for unattended workers come from
+    "worker_disabled_mcps" / "worker_disabled_plugins" in
+    ~/.agent-os/config.json (default: none). CODEX_HA_ALL_MCPS=1 ignores them.
+
+Exit codes: 0 success, 75 no Codex account available (or all failed),
+73 another codex-ha run holds this directory, 1 usage error.
+"""
 
 import datetime
 import fcntl
@@ -17,19 +50,68 @@ BASE = HOME / ".codex-ha"
 STATE_FILE = BASE / "state.json"
 RUNS = BASE / "runs"
 LOCKS = BASE / "locks"
+CONFIG_FILE = HOME / ".agent-os" / "config.json"
 
-REAL_CODEX = shutil.which("codex") or "/opt/homebrew/bin/codex"
+EXHAUSTED = "AGENT_CODEX_HA_EXHAUSTED"
 
-ACCOUNTS = [
-    {
-        "name": "codex1",
-        "home": str(HOME / ".codex"),
-    },
-    {
-        "name": "codex2",
-        "home": str(HOME / ".codex_second"),
-    },
-]
+
+def codex_bin():
+    return shutil.which("codex")
+
+
+def short(path):
+    """Show a path relative to HOME as ~/... for human output."""
+    text = str(path)
+    home = str(HOME)
+    if text == home or text.startswith(home + os.sep):
+        return "~" + text[len(home):]
+    return text
+
+
+def build_accounts():
+    override = os.environ.get("CODEX_HA_HOMES", "").strip()
+    if override:
+        homes = [h for h in override.split(os.pathsep) if h.strip()]
+        return [
+            {"name": f"codex{i}", "home": os.path.expanduser(h.strip())}
+            for i, h in enumerate(homes, 1)
+        ]
+
+    accounts = [{"name": "codex1", "home": str(HOME / ".codex")}]
+    second = HOME / ".codex_second"
+    if second.is_dir():
+        accounts.append({"name": "codex2", "home": str(second)})
+    return accounts
+
+
+ACCOUNTS = build_accounts()
+
+
+def load_config():
+    try:
+        data = json.loads(CONFIG_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def config_value(env_name, key):
+    value = os.environ.get(env_name, "").strip()
+    if value:
+        return value
+    value = load_config().get(key)
+    if value is None:
+        return None
+    value = str(value).strip()
+    return value or None
+
+
+def config_list(key):
+    value = load_config().get(key)
+    if not isinstance(value, list):
+        return []
+    return [str(v) for v in value if isinstance(v, str) and v.strip()]
+
 
 QUOTA_PATTERNS = [
     "you've hit your usage limit",
@@ -56,36 +138,90 @@ TRANSIENT_PATTERNS = [
     "rate limit",
 ]
 
-# Unattended coding workers run with approvals off, so they get no personal
-# accounts and no production-write services (V2.md: "Coding workers do not
-# need Gmail, Slack, production cloud access, or unrelated private
-# connectors"). The lead passes any data they need in the brief.
-# Interactive Codex keeps the full config; CODEX_HA_ALL_MCPS=1 opts out.
-WORKER_DISABLED_MCPS = [
-    "gmail", "google-calendar", "google-drive", "slack", "discord",
-    "notion", "clickup", "canva", "resend",
-    "supabase", "vercel", "cloudflare", "revenuecat", "posthog",
+UNKNOWN_SUBCOMMAND_PATTERNS = [
+    "unrecognized subcommand",
+    "unknown subcommand",
+    "unknown command",
+    "unexpected argument",
+    "invalid subcommand",
+    "no such subcommand",
 ]
 
-WORKER_DISABLED_PLUGINS = [
-    "gmail@openai-curated",
-    "canva@openai-curated",
-    "stripe@openai-curated",
-]
+
+def model_args():
+    args = []
+    model = config_value("CODEX_HA_MODEL", "codex_model")
+    if model:
+        args += ["--model", model]
+    effort = config_value("CODEX_HA_EFFORT", "codex_effort")
+    if effort:
+        # json.dumps yields a valid TOML basic string for the -c override.
+        args += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+    return args
+
 
 def worker_profile_args():
+    """Unattended workers run with approvals off; the user may list MCP
+    servers and plugins (e.g. personal mail, production cloud) that workers
+    must not get. The list is empty unless configured."""
     if os.environ.get("CODEX_HA_ALL_MCPS") == "1":
         return []
 
     args = []
 
-    for name in WORKER_DISABLED_MCPS:
+    for name in config_list("worker_disabled_mcps"):
         args += ["-c", f"mcp_servers.{name}.enabled=false"]
 
-    for name in WORKER_DISABLED_PLUGINS:
+    for name in config_list("worker_disabled_plugins"):
         args += ["-c", f'plugins."{name}".enabled=false']
 
     return args
+
+
+def login_hint(home):
+    if pathlib.Path(home) == HOME / ".codex":
+        return "run: codex login"
+    return f"run: CODEX_HOME={short(home)} codex login"
+
+
+def login_check(home):
+    """Return (ok, reason) for one Codex home."""
+    path = pathlib.Path(home)
+    if not path.is_dir():
+        return False, f"does not exist ({login_hint(home)})"
+
+    binary = codex_bin()
+    if not binary:
+        return False, "codex CLI not found on PATH"
+
+    env = os.environ.copy()
+    env["CODEX_HOME"] = str(path)
+    try:
+        proc = subprocess.run(
+            [binary, "login", "status"],
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=30,
+        )
+        rc, out = proc.returncode, (proc.stdout or "").lower()
+    except subprocess.TimeoutExpired:
+        rc, out = None, "timeout"
+    except OSError as exc:
+        return False, f"could not run codex: {exc}"
+
+    if rc == 0:
+        return True, "logged in"
+
+    unknown = rc is None or any(p in out for p in UNKNOWN_SUBCOMMAND_PATTERNS)
+    if unknown:
+        if (path / "auth.json").is_file():
+            return True, "auth.json present"
+        return False, f"not logged in ({login_hint(home)})"
+
+    return False, f"not logged in ({login_hint(home)})"
 
 def load_state():
     if not STATE_FILE.exists():
@@ -232,6 +368,12 @@ def mark_success(state, account):
     save_state(state)
 
 def ordered_accounts(state):
+    """Return (ready, blocked, unusable).
+
+    ready: logged in and not in cooldown, preferred account first.
+    blocked: logged in but in cooldown.
+    unusable: list of (account, reason) that cannot run at all.
+    """
     preferred = state.get("preferred", "codex1")
 
     ordered = sorted(
@@ -239,10 +381,32 @@ def ordered_accounts(state):
         key=lambda a: 0 if a["name"] == preferred else 1
     )
 
-    ready = [a for a in ordered if available(state, a["name"])]
-    blocked = [a for a in ordered if not available(state, a["name"])]
+    ready, blocked, unusable = [], [], []
+    for account in ordered:
+        ok, reason = login_check(account["home"])
+        if not ok:
+            unusable.append((account, reason))
+        elif available(state, account["name"]):
+            ready.append(account)
+        else:
+            blocked.append(account)
 
-    return ready, blocked
+    return ready, blocked, unusable
+
+
+def not_ready_reason(state, blocked, unusable):
+    parts = []
+    if not codex_bin():
+        parts.append("codex CLI not found on PATH (install the Codex CLI)")
+    else:
+        for account, reason in unusable:
+            parts.append(f"{account['name']} {short(account['home'])}: {reason}")
+    if blocked:
+        soonest = min(blocked_until(state, a["name"]) for a in blocked)
+        when = datetime.datetime.fromtimestamp(soonest).strftime("%Y-%m-%d %I:%M %p")
+        names = ",".join(a["name"] for a in blocked)
+        parts.append(f"{names} in cooldown; no Codex account is available until {when}")
+    return "; ".join(parts) or "no Codex account configured"
 
 def continuation_prompt(original, previous_account):
     return f"""
@@ -283,15 +447,16 @@ def run_codex(account, prompt, run_dir, attempt):
     output_file = run_dir / f"{attempt:02d}-{account['name']}.log"
 
     cmd = [
-        REAL_CODEX,
+        codex_bin() or "codex",
         "--ask-for-approval",
         "never",
         "exec",
         "--ephemeral",
-        "--model",
-        "gpt-6-luna",
-        "-c",
-        'model_reasoning_effort="xhigh"',
+    ]
+
+    cmd += model_args()
+
+    cmd += [
         "--sandbox",
         "workspace-write",
         "--skip-git-repo-check",
@@ -371,43 +536,48 @@ def lock_workspace():
 
 def cmd_status():
     state = load_state()
+    binary = codex_bin()
 
     print("Codex HA")
+    print(f"codex CLI: {binary or 'not found on PATH (install the Codex CLI)'}")
+    model = config_value("CODEX_HA_MODEL", "codex_model")
+    effort = config_value("CODEX_HA_EFFORT", "codex_effort")
+    print(f"model: {model or 'Codex CLI default'}   effort: {effort or 'Codex CLI default'}")
     print()
 
     for account in ACCOUNTS:
         name = account["name"]
         entry = account_state(state, name)
         until = blocked_until(state, name)
+        ok, reason = login_check(account["home"])
 
-        if time.time() >= until:
-            status = "✅ AVAILABLE"
+        if not ok:
+            status = f"NOT READY: {reason}"
+        elif time.time() >= until:
+            status = f"READY ({reason})"
         else:
             dt = datetime.datetime.fromtimestamp(until)
-            status = f"⏳ BLOCKED until {dt.strftime('%Y-%m-%d %I:%M %p')}"
+            status = f"COOLDOWN until {dt.strftime('%Y-%m-%d %I:%M %p')}"
 
-        preferred = " ← preferred" if state.get("preferred") == name else ""
+        preferred = " (preferred)" if ok and state.get("preferred") == name else ""
 
-        print(f"{name:8} {status}{preferred}")
-        print(f"         {account['home']}")
+        print(f"{name} {short(account['home'])}: {status}{preferred}")
 
         if entry.get("last_failure_type"):
-            print(f"         last failure: {entry['last_failure_type']}")
+            print(f"    last failure: {entry['last_failure_type']}")
 
     print()
 
 def cmd_ready():
     """Preflight for dispatchers: exit 0 if an account can run now, else 75."""
     state = load_state()
-    ready, blocked = ordered_accounts(state)
+    ready, blocked, unusable = ordered_accounts(state)
 
     if ready:
         print("CODEX_HA_READY " + ",".join(a["name"] for a in ready))
         return 0
 
-    soonest = min(blocked_until(state, a["name"]) for a in blocked)
-    when = datetime.datetime.fromtimestamp(soonest).strftime("%Y-%m-%d %I:%M %p")
-    print(f"AGENT_CODEX_HA_EXHAUSTED no Codex account is available until {when}")
+    print(f"{EXHAUSTED} {not_ready_reason(state, blocked, unusable)}")
     return 75
 
 def cmd_reset(target):
@@ -419,7 +589,7 @@ def cmd_reset(target):
     else:
         names = [a["name"] for a in ACCOUNTS]
         if target not in names:
-            print("Use: codex-ha reset codex1|codex2|all", file=sys.stderr)
+            print("Use: codex-ha reset " + "|".join(names + ["all"]), file=sys.stderr)
             sys.exit(1)
         account_state(state, target)["blocked_until"] = 0
 
@@ -437,13 +607,13 @@ def cmd_run(prompt):
     (run_dir / "prompt.txt").write_text(prompt + "\n")
     (run_dir / "cwd.txt").write_text(str(pathlib.Path.cwd().resolve()) + "\n")
 
-    ready, blocked = ordered_accounts(state)
+    ready, blocked, unusable = ordered_accounts(state)
 
     if not ready:
         print()
-        print("AGENT_CODEX_HA_EXHAUSTED")
-        print("Both Codex accounts are currently in cooldown.")
-        print("The calling Claude agent must continue the implementation itself.")
+        print(EXHAUSTED)
+        print("No Codex account can run now: " + not_ready_reason(state, blocked, unusable))
+        print("The calling agent must continue the implementation itself.")
         print()
         cmd_status()
         sys.exit(75)
@@ -494,10 +664,10 @@ def cmd_run(prompt):
             print("Failing over to the next Codex account...")
 
     print()
-    print("AGENT_CODEX_HA_EXHAUSTED")
+    print(EXHAUSTED)
     print("All usable Codex accounts failed this task.")
     print("IMPORTANT: partial changes may already exist in the working tree.")
-    print("The calling Claude agent must inspect git diff and continue itself.")
+    print("The calling agent must inspect git diff and continue itself.")
     print(f"Run logs: {run_dir}")
 
     return 75
@@ -511,21 +681,23 @@ Commands:
   echo "TASK" | codex-ha run -
   codex-ha status
   codex-ha ready          exit 0 if an account can run now, else 75
-  codex-ha reset codex1
-  codex-ha reset codex2
-  codex-ha reset all
+  codex-ha reset codex1|codex2|all   clear a cooldown
+
+Env: CODEX_HA_MODEL, CODEX_HA_EFFORT, CODEX_HA_HOMES, CODEX_HA_ALL_MCPS=1
+Config (~/.agent-os/config.json): codex_model, codex_effort,
+  worker_disabled_mcps, worker_disabled_plugins
 """.strip())
 
 def main():
-    BASE.mkdir(parents=True, exist_ok=True)
-    RUNS.mkdir(parents=True, exist_ok=True)
-    LOCKS.mkdir(parents=True, exist_ok=True)
-
     if len(sys.argv) < 2:
         usage()
         return 1
 
     cmd = sys.argv[1]
+
+    if cmd in ("-h", "--help", "help"):
+        usage()
+        return 0
 
     if cmd == "status":
         cmd_status()
