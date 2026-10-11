@@ -76,7 +76,8 @@ check "copied skill dir removed" '[ ! -e "$HOME/.agents/skills/correct" ]'
 echo "-- 6. dry runs change nothing"
 fresh
 "$R/install.sh" --dry-run --with-hooks --with-git-hooks >/dev/null
-check "install dry-run wrote nothing" '[ -z "$(ls -A "$HOME" | grep -v checkout)" ]'
+# (macOS's system python3 may create ~/Library/Caches; that is not the installer.)
+check "install dry-run wrote nothing" '[ -z "$(ls -A "$HOME" | grep -v -e "^checkout$" -e "^Library$")" ]'
 "$R/install.sh" --with-hooks >/dev/null
 snap="$(find "$HOME" -not -path "*/checkout/*" | sort | sum)"
 "$R/uninstall.sh" --dry-run >/dev/null
@@ -112,5 +113,16 @@ echo "-- 10. --purge"
 fresh
 "$R/install.sh" >/dev/null; "$R/uninstall.sh" --purge >/dev/null
 check "agent-os gone" '[ ! -e "$HOME/.agent-os" ]'
+
+echo "-- 11. AGENT_CLAUDE_DIRS: every listed dir is set up and cleaned, each once"
+fresh
+export AGENT_CLAUDE_DIRS="$HOME/.claude_second:~/.claude:$HOME/.claude_second/"
+out="$("$R/install.sh" --with-hooks)"
+check "second dir has skills and agents" '[ -L "$HOME/.claude_second/skills/correct" ] && [ -L "$HOME/.claude_second/agents/agent-risk-reviewer.md" ]'
+check "second dir has rules and hooks" 'grep -q obsession-system "$HOME/.claude_second/CLAUDE.md" && grep -q agent-telemetry-hook "$HOME/.claude_second/settings.json"'
+check "each dir set up once" '[ "$(grep -c "^Claude Code -> " <<<"$out")" = 2 ]'
+"$R/uninstall.sh" >/dev/null
+check "both dirs cleaned, backups kept" '[ -z "$(find "$HOME/.claude" "$HOME/.claude_second" -mindepth 1 \( -type l -o -type f \) -not -name "*.bak-*")" ] && ls "$HOME/.claude_second" | grep -q "settings.json.bak-"'
+unset AGENT_CLAUDE_DIRS
 
 exit $fail

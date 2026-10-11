@@ -110,13 +110,14 @@ Installed only with `install.sh --with-hooks`.
 |---|---|
 | `agent-telemetry-hook` | Claude Code hook. Writes one small file per event to a private spool (`~/.agent-os/runtime/telemetry-spool`, mode 700). It never calls Python or the network on the hot path. |
 | `agent-telemetry-ingest` | moves the spool into SQLite (`usage` and `sessions` tables); safe to run concurrently |
-| `agent-usage skills\|agents\|mcp\|unused\|sessions [--days N]` | which skills, agents and MCP servers were actually used, and which installed skills never were |
+| `agent-usage skills\|agents\|mcp\|unused\|sessions [--days N] [--account LABEL]` | which skills, agents and MCP servers were actually used, and which installed skills never were |
 
 What is recorded:
 
 - skill, agent and MCP tool names;
 - session ids, working directory, transcript path;
-- stop counts and API error types.
+- stop counts and API error types;
+- the account: the name of the Claude config dir the session ran in, without the dot (`claude`, `claude_second`).
 
 Prompts, arguments and transcript text are never recorded. To pause recording, put `guest` in `~/.agent-os/mode`.
 
@@ -138,7 +139,7 @@ A queue of coding tasks, each with a shell command that decides when it is done.
 4. Nothing is merged or pushed: pushes are disabled inside the run.
 5. `brief` is the morning summary, with anything that needs your attention first.
 
-The engine is Codex through `codex-ha`, or Claude Code with `--engine claude`. State lives in `~/.agent-os/runtime/overnight/`.
+The engine is Codex through `codex-ha`, or Claude Code with `--engine claude`. Claude calls try each config dir in turn (see [several accounts](how-it-works.md#several-claude-accounts)) when one is out of usage. State lives in `~/.agent-os/runtime/overnight/`.
 
 ## Skills
 

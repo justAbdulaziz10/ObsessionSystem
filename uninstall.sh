@@ -8,11 +8,21 @@
 #
 # Only paths listed in ~/.agent-os/install-manifest.tsv are removed. A copied
 # file (install.sh --copy) you have since edited is kept and reported.
-# Files it edits (CLAUDE.md, settings.json) are backed up first.
+# Files it edits (CLAUDE.md, settings.json) are backed up first. Like
+# install.sh, it covers $CLAUDE_CONFIG_DIR (default ~/.claude) and $AGENT_CLAUDE_DIRS.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CLAUDE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+CLAUDE_DIRS=()
+IFS=: read -ra _extra <<<"${AGENT_CLAUDE_DIRS:-}"
+for _c in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ${_extra[@]+"${_extra[@]}"}; do
+  [ -n "$_c" ] || continue
+  _c="${_c/#\~/$HOME}"; _c="${_c%/}"
+  for _s in ${CLAUDE_DIRS[@]+"${CLAUDE_DIRS[@]}"}; do
+    if [ "$_s" = "$_c" ] || [ "$_s" -ef "$_c" ]; then continue 2; fi
+  done
+  CLAUDE_DIRS+=("$_c")
+done
 MANIFEST="$HOME/.agent-os/install-manifest.tsv"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 DRY=0 PURGE=0
@@ -20,7 +30,7 @@ for a in "$@"; do
   case "$a" in
     --dry-run) DRY=1 ;;
     --purge) PURGE=1 ;;
-    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -44,7 +54,9 @@ if [ -f "$MANIFEST" ]; then
   run rm "$MANIFEST"
 else
   echo "No install manifest; removing links that point into this checkout."
-  for root in "$HOME/bin" "$HOME/.agent-os" "$HOME/.agents/skills" "$CLAUDE/agents" "$CLAUDE/skills"; do
+  roots=("$HOME/bin" "$HOME/.agent-os" "$HOME/.agents/skills")
+  for c in "${CLAUDE_DIRS[@]}"; do roots+=("$c/agents" "$c/skills"); done
+  for root in "${roots[@]}"; do
     [ -d "$root" ] || continue
     find -H "$root" -maxdepth 2 -type l 2>/dev/null | while read -r l; do
       case "$(readlink "$l")" in "$REPO"/*) run rm "$l"; gone "$l" ;; esac
@@ -52,10 +64,12 @@ else
   done
 fi
 
-MD="$CLAUDE/CLAUDE.md"
-if [ -f "$MD" ] && grep -qF '<!-- obsession-system:begin -->' "$MD"; then
-  run cp "$MD" "$MD.bak-$STAMP"
-  [ "$DRY" = 1 ] || python3 - "$MD" <<'PY'
+# clean_claude_dir DIR: remove the rules import block and our hooks from one config dir.
+clean_claude_dir() {
+  local MD="$1/CLAUDE.md" S="$1/settings.json"
+  if [ -f "$MD" ] && grep -qF '<!-- obsession-system:begin -->' "$MD"; then
+    run cp "$MD" "$MD.bak-$STAMP"
+    [ "$DRY" = 1 ] || python3 - "$MD" <<'PY'
 import os, re, sys
 p = sys.argv[1]
 s = open(p).read()
@@ -65,11 +79,11 @@ if s.strip():
 else:
     os.remove(p)  # the file held nothing but our block
 PY
-  gone "$MD (import block)"
-fi
+    gone "$MD (import block)"
+  fi
 
-S="$CLAUDE/settings.json"
-if [ -f "$S" ] && [ "$DRY" = 0 ]; then
+  [ -f "$S" ] || return 0
+  if [ "$DRY" = 1 ]; then printf '    remove our hook entries from %s\n' "${S/#$HOME/~}"; return 0; fi
   python3 - "$S" "$REPO/templates/claude/settings.hooks.json" "$STAMP" <<'PY'
 import json, os, shutil, sys
 dst, src, stamp = sys.argv[1:]
@@ -99,9 +113,9 @@ else:
     os.remove(dst)  # nothing left but what install.sh added
 print(f"  - {shown} (hooks; backup {shown}.bak-{stamp})")
 PY
-elif [ -f "$S" ]; then
-  printf '    remove our hook entries from %s\n' "${S/#$HOME/~}"
-fi
+}
+
+for c in "${CLAUDE_DIRS[@]}"; do clean_claude_dir "$c"; done
 
 if [ "$(git config --global core.hooksPath || true)" = "$HOME/.agent-os/git-hooks" ]; then
   run git config --global --unset core.hooksPath; gone "git core.hooksPath"

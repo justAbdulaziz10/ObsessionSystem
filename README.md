@@ -55,7 +55,7 @@ cd ObsessionSystem
 ./install.sh
 ```
 
-Commands are linked into `~/bin`, so make sure it is on your `PATH`. Start a new Claude Code session to load the rules and skills.
+Commands are linked into `~/bin`, so make sure it is on your `PATH`. Start a new Claude Code session to load the rules and skills. If you use more than one Claude Code config dir, list the extra ones in `AGENT_CLAUDE_DIRS` before installing ([details](docs/how-it-works.md#several-claude-accounts)).
 
 The installer never overwrites an existing file. It appends a marked three-line block to `~/.claude/CLAUDE.md` and backs up anything it edits. Two parts are opt-in:
 
@@ -97,9 +97,9 @@ This needs `zsh`, `jq` and `sqlite3`. It installs into a temporary `HOME` and ru
 | `agent-ship` | 155 cases |
 | `agent-task` | 29 |
 | Codex add-on | 24 |
-| `agent-overnight` | 8 |
+| `agent-overnight` | 10 |
 | Telemetry | 13 groups |
-| Install and uninstall | 32 checks in 10 scenarios |
+| Install and uninstall | 36 checks in 11 scenarios |
 | Skill lint | the 9 skills |
 
 ## Limits

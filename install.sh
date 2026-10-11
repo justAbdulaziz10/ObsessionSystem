@@ -7,6 +7,9 @@
 #   ./install.sh --copy            copy files instead of symlinking to this checkout
 #   ./install.sh --dry-run         print what would change, change nothing
 #
+# Claude Code files go to $CLAUDE_CONFIG_DIR (default ~/.claude) and to each
+# directory in $AGENT_CLAUDE_DIRS (colon-separated), e.g. a second account.
+#
 # It never overwrites a file you already have: an existing path is left alone
 # and reported. Files it edits (CLAUDE.md, settings.json) are backed up first.
 # Everything it creates is listed in ~/.agent-os/install-manifest.tsv, which
@@ -17,7 +20,19 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 AOS="$HOME/.agent-os"
 BIN="$HOME/bin"
 SKILLS="$HOME/.agents/skills"
-CLAUDE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+# Claude Code config dirs: $CLAUDE_CONFIG_DIR (default ~/.claude), then each
+# entry of $AGENT_CLAUDE_DIRS, once each.
+CLAUDE_DIRS=()
+IFS=: read -ra _extra <<<"${AGENT_CLAUDE_DIRS:-}"
+for _c in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}" ${_extra[@]+"${_extra[@]}"}; do
+  [ -n "$_c" ] || continue
+  _c="${_c/#\~/$HOME}"; _c="${_c%/}"
+  for _s in ${CLAUDE_DIRS[@]+"${CLAUDE_DIRS[@]}"}; do
+    if [ "$_s" = "$_c" ] || [ "$_s" -ef "$_c" ]; then continue 2; fi
+  done
+  CLAUDE_DIRS+=("$_c")
+done
+
 MANIFEST="$AOS/install-manifest.tsv"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BEGIN='<!-- obsession-system:begin -->'
@@ -30,7 +45,7 @@ for a in "$@"; do
     --copy) COPY=1 ;;
     --with-hooks) HOOKS=1 ;;
     --with-git-hooks) GITHOOKS=1 ;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -88,40 +103,42 @@ seed "$REPO/templates/config.json" "$AOS/config.json"
 seed "$REPO/templates/delivery-profiles.json" "$AOS/delivery/profiles.json"
 seed "$REPO/templates/LESSONS.md" "$AOS/LESSONS.md"
 
-echo "Skills -> ~/.agents/skills, linked into $(tilde "$CLAUDE")/skills"
-for d in "$REPO"/skills/*/; do
-  n="$(basename "$d")"
-  place "${d%/}" "$SKILLS/$n"
-  if [ ! "$SKILLS" -ef "$CLAUDE/skills" ]; then place "$SKILLS/$n" "$CLAUDE/skills/$n"; fi
-done
+echo "Skills -> ~/.agents/skills"
+for d in "$REPO"/skills/*/; do place "${d%/}" "$SKILLS/$(basename "$d")"; done
 
-echo "Agents -> $(tilde "$CLAUDE")/agents"
-for f in "$REPO"/agents/*.md; do place "$f" "$CLAUDE/agents/$(basename "$f")"; done
+# setup_claude_dir DIR: skills, agents, the rules import and (opt-in) hooks for one config dir.
+setup_claude_dir() {
+  local CLAUDE="$1" n f MD S sep
+  echo "Claude Code -> $(tilde "$CLAUDE")"
+  for f in "$REPO"/skills/*/; do
+    n="$(basename "$f")"
+    if [ ! "$SKILLS" -ef "$CLAUDE/skills" ]; then place "$SKILLS/$n" "$CLAUDE/skills/$n"; fi
+  done
+  for f in "$REPO"/agents/*.md; do place "$f" "$CLAUDE/agents/$(basename "$f")"; done
 
-echo "Rules -> $(tilde "$CLAUDE")/CLAUDE.md"
-MD="$CLAUDE/CLAUDE.md"
-if [ -f "$MD" ] && grep -qF "$BEGIN" "$MD"; then
-  keep "$(tilde "$MD") already imports the rules"
-else
-  if [ -f "$MD" ]; then run cp "$MD" "$MD.bak-$STAMP"; ok "backup $(tilde "$MD").bak-$STAMP"; fi
-  if [ "$DRY" = 1 ]; then
-    printf '    append to %s:\n      %s\n      %s\n      %s\n' "$(tilde "$MD")" "$BEGIN" "$(cat "$REPO/templates/claude/CLAUDE.md")" "$END"
+  MD="$CLAUDE/CLAUDE.md"
+  if [ -f "$MD" ] && grep -qF "$BEGIN" "$MD"; then
+    keep "$(tilde "$MD") already imports the rules"
   else
-    mkdir -p "$CLAUDE"
-    sep=""; [ -s "$MD" ] && sep=$'\n'
-    { printf '%s%s\n' "$sep" "$BEGIN"; cat "$REPO/templates/claude/CLAUDE.md"; printf '%s\n' "$END"; } >> "$MD"
+    if [ -f "$MD" ]; then run cp "$MD" "$MD.bak-$STAMP"; ok "backup $(tilde "$MD").bak-$STAMP"; fi
+    if [ "$DRY" = 1 ]; then
+      printf '    append to %s:\n      %s\n      %s\n      %s\n' "$(tilde "$MD")" "$BEGIN" "$(cat "$REPO/templates/claude/CLAUDE.md")" "$END"
+    else
+      mkdir -p "$CLAUDE"
+      sep=""; [ -s "$MD" ] && sep=$'\n'
+      { printf '%s%s\n' "$sep" "$BEGIN"; cat "$REPO/templates/claude/CLAUDE.md"; printf '%s\n' "$END"; } >> "$MD"
+    fi
+    ok "$(tilde "$MD"): import block for ~/.agent-os/policy/RULES.md"
   fi
-  ok "$(tilde "$MD"): import block for ~/.agent-os/policy/RULES.md"
-fi
 
-if [ "$HOOKS" = 1 ]; then
-  echo "Claude Code hooks -> $(tilde "$CLAUDE")/settings.json"
+  [ "$HOOKS" = 1 ] || return 0
   S="$CLAUDE/settings.json"
   if [ "$DRY" = 1 ]; then
     printf '    merge templates/claude/settings.hooks.json into %s\n' "$(tilde "$S")"
-  else
-    mkdir -p "$CLAUDE"
-    python3 - "$S" "$REPO/templates/claude/settings.hooks.json" "$STAMP" <<'PY'
+    return 0
+  fi
+  mkdir -p "$CLAUDE"
+  python3 - "$S" "$REPO/templates/claude/settings.hooks.json" "$STAMP" <<'PY'
 import json, os, shutil, sys
 dst, src, stamp = sys.argv[1:]
 cur = json.load(open(dst)) if os.path.exists(dst) and os.path.getsize(dst) else {}
@@ -145,10 +162,11 @@ if os.path.exists(dst):
 with open(dst, "w") as f:
     json.dump(cur, f, indent=2)
     f.write("\n")
-print(f"  + {shown}: hooks merged, existing hooks kept")
+print(f"  + {shown}: hooks merged (existing hooks kept)")
 PY
-  fi
-fi
+}
+
+for c in "${CLAUDE_DIRS[@]}"; do setup_claude_dir "$c"; done
 
 if [ "$GITHOOKS" = 1 ]; then
   echo "Global git hooks"

@@ -12,16 +12,17 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/os-ci.XXXXXX")"
 
 # Point everything at the temp home. Variables that name config directories
 # would otherwise send the installer and the suites to the real ones.
-unset CLAUDE_CONFIG_DIR CODEX_HOME AGENT_SHIP_DIR AGENT_CODEX_JOBS CODEX_HA_HOMES GIT_CONFIG_GLOBAL XDG_CONFIG_HOME
+unset CLAUDE_CONFIG_DIR AGENT_CLAUDE_DIRS CODEX_HOME AGENT_SHIP_DIR AGENT_CODEX_JOBS CODEX_HA_HOMES GIT_CONFIG_GLOBAL XDG_CONFIG_HOME
 for v in $(env | sed -n 's/^\(AGENTOS_[A-Z_]*\)=.*/\1/p'); do unset "$v"; done
 export HOME="$T" PATH="$T/bin:/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
 git config --global user.name ci
 git config --global user.email ci@example.invalid
 git config --global init.defaultBranch main
-# A second Claude config dir; the telemetry suite names it in AGENT_CLAUDE_DIRS.
+# A second Claude config dir, as a user with two accounts would have; the
+# telemetry suite checks that both get the hooks.
 mkdir -p "$T/.claude" "$T/.claude_second"
 
-"$REPO/install.sh" --with-hooks --with-git-hooks >/dev/null || { echo "FAIL install"; exit 1; }
+AGENT_CLAUDE_DIRS="$T/.claude_second" "$REPO/install.sh" --with-hooks --with-git-hooks >/dev/null || { echo "FAIL install"; exit 1; }
 
 cd "$REPO"
 fails=0

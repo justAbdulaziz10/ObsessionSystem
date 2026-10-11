@@ -15,13 +15,16 @@ A rewrite toward a smaller, accurate product. 1.0 was a copy of one person's mac
   - adds a marked, removable import block to `~/.claude/CLAUDE.md`;
   - honours `CLAUDE_CONFIG_DIR`;
   - backs up before editing, and only when it changes something;
-  - records everything it creates in `~/.agent-os/install-manifest.tsv`, and relinks after the checkout moves.
+  - records everything it creates in `~/.agent-os/install-manifest.tsv`, and relinks after the checkout moves;
+  - sets up every Claude config dir listed in `AGENT_CLAUDE_DIRS` as well.
 - Uninstaller: removes only what the manifest lists, plus the import block and the hooks it added. A `--copy` file you have since edited is kept and reported.
 - `codex-ha`:
   - no hard-coded model; the Codex CLI's defaults apply unless configured;
   - `ready` and `status` check that the CLI exists and is logged in;
   - the MCP servers disabled for workers are configurable and empty by default.
 - `agent-codex`: no longer runs cleanup commands as a side effect.
+- Claude config dirs: no script assumes `~/.claude_second` any more. They use `~/.claude`, `$CLAUDE_CONFIG_DIR` and `AGENT_CLAUDE_DIRS`. Account labels are the dir name without the dot (`claude`, `claude_second`) instead of `claude1`/`claude2`; old telemetry rows keep the old labels. `--account` takes a label.
+- Linux: Python scripts use `#!/usr/bin/env python3` instead of `/usr/bin/python3`.
 - `agent-review-route`: suggests only specialist skills that are installed.
 - `agent-recall`: model-written aliases are off by default, because they send note text to a model.
 - Docs: `agent-ship` now documents the GitHub commit status it posts after a push, and how to turn it off.

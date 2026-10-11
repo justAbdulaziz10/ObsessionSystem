@@ -68,7 +68,18 @@ Plain Python and shell scripts in `~/bin`, with no dependencies beyond Python 3.
 | `~/.agent-os/config.json`, `delivery/profiles.json`, `LESSONS.md` | starting files, then yours | only with `--purge` |
 | `~/.agent-os/v2/`, `runtime/` | task records, telemetry, CI results | only with `--purge` |
 
-The installer writes to `$CLAUDE_CONFIG_DIR` instead of `~/.claude` when that is set. `uninstall.sh` removes only paths listed in the manifest; an edited `--copy` file is kept.
+`uninstall.sh` removes only paths listed in the manifest; an edited `--copy` file is kept.
+
+### Several Claude accounts
+
+`~/.claude` above means every Claude Code config dir in use: `$CLAUDE_CONFIG_DIR` (default `~/.claude`), plus each directory in `AGENT_CLAUDE_DIRS`, a colon-separated list. With a second account in `~/.claude_second`:
+
+```sh
+export AGENT_CLAUDE_DIRS=~/.claude_second   # in your shell profile
+./install.sh --with-hooks
+```
+
+The installer then sets up both dirs. Telemetry labels each session with its dir's name (`claude`, `claude_second`). `agent-overnight` tries the dirs in order when one runs out of usage, and `agent-review-route` looks for skills in all of them.
 
 ## Data and network
 
