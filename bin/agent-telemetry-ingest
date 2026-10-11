@@ -1,14 +1,14 @@
 #!/usr/bin/python3 -I -S
-"""Ingest the AgentOS telemetry spool into the usage/sessions tables.
+"""Ingest the telemetry spool into the usage/sessions tables.
 
 ~/bin/agent-telemetry-hook (dash) writes one private file per Claude Code hook event into the spool:
     <spool>/e.<pid>[.<n>]    line 1: AOS1<TAB>CLAUDE_CONFIG_DIR<TAB>mode    rest: hook JSON; mtime = event time
-This program turns those files into exactly the rows the former Python hook wrote synchronously:
+This program turns those files into rows:
     PreToolUse (Skill, Agent/Task, Read of */skills/<n>/SKILL.md or */agents/<n>.md, mcp__*) -> usage row
                                                                   (+ INSERT OR IGNORE sessions row)
     Stop / StopFailure / SessionEnd -> sessions upsert (paths, counts, error type; never transcript text)
 
-  agent-telemetry-ingest [--wait SEC] [--min-age SEC] [--quiet]   ingest now (agent-usage, autopilot, tests)
+  agent-telemetry-ingest [--wait SEC] [--min-age SEC] [--quiet]   ingest now (agent-usage, tests)
   agent-telemetry-ingest --detach                                 hook trigger: own session, sleep min-age, ingest
   agent-telemetry-ingest --status                                 pending spool files, oldest age, leftover batches
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Regression tests for AgentOS telemetry (changes 20261010-125352-781c6f, 20261010-202747-b8cde9):
+# Regression tests for the telemetry pipeline:
 #   ~/bin/agent-telemetry-hook (shell spool writer), ~/bin/agent-telemetry-ingest (spool -> DB),
 #   ~/bin/agent-usage, ~/bin/agent-session-distill (deterministic parts only).
 # Runs against a throwaway DB and spool: AGENTOS_TELEMETRY_DB / AGENTOS_TELEMETRY_SPOOL (default: new temp paths).
@@ -40,14 +40,14 @@ feed() {
 }
 
 # 0. static checks
-for f in "$INGEST" "$USAGE" "$DISTILL" "$HOME/bin/agent-autopilot"; do
+for f in "$INGEST" "$USAGE" "$DISTILL"; do
   "$PY" -c "import py_compile,sys; py_compile.compile(sys.argv[1], cfile='$TMP/x.pyc', doraise=True)" "$f" \
     || fail "py_compile $f"
 done
 /bin/sh -n "$HOOK" && /bin/dash -n "$HOOK" || fail "hook shell syntax"
 [ -x "$HOOK" ] && [ "$(head -c 2 "$HOOK")" != '#!' ] || fail "hook must be executable and shebang-less (runs in-process in /bin/sh)"
 ! grep -Eq '(^|[^-])(python|jq)( |$)' <(grep -v '^#' "$HOOK") || fail "hook hot path must not call python or jq"
-ok "py_compile (python 3.9) of ingest, agent-usage, distill, autopilot; hook: sh+dash syntax, no shebang, no python/jq"
+ok "py_compile (python 3.9) of ingest, agent-usage, distill; hook: sh+dash syntax, no shebang, no python/jq"
 for f in "$HOME/.claude/settings.json" "$HOME/.claude_second/settings.json"; do
   "$PY" -m json.tool "$f" >/dev/null || fail "invalid JSON $f"
   "$PY" - "$f" <<'EOF' || fail "hook not registered in $1"

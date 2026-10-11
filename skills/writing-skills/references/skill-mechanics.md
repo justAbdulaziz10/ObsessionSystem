@@ -55,4 +55,4 @@ Keep it model-invoked when an agent must reach it on its own or when another ski
 
 ## Duplicate registration
 
-Claude Code scans `~/.claude/skills` (a symlink to `~/.agents/skills`) and treats a `.claude-plugin/` folder or `skills/<name>/SKILL.md` inside a skill directory as a plugin, so the same skill appears as both `name` and `name:name`. Upstream repos that ship both layouts must be installed as the plain `SKILL.md` layout only.
+Claude Code scans `~/.claude/skills` and treats a `.claude-plugin/` folder or `skills/<name>/SKILL.md` inside a skill directory as a plugin, so the same skill appears as both `name` and `name:name`. Upstream repos that ship both layouts must be installed as the plain `SKILL.md` layout only.

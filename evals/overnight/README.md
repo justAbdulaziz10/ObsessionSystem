@@ -1,3 +1,5 @@
 # agent-overnight regression tests
 
-Run `~/.agent-os/evals/overnight/regression.sh`. Uses fake codex-ha/claude on PATH; no network, no quota. Each case maps to a finding from the 2026-10-08 independent review (F1 interrupted work, F2 agent self-commit, F3 deny at run time, F4 push blocked, F5 failover timeout, F6 queue lock, F7 interruption cap, F8 unique ids). All 8 fail on the pre-fix version.
+Run `bash evals/overnight/regression.sh` from the repository root. It puts fake `codex-ha` and `claude` commands on PATH, so it needs no network and spends no quota.
+
+The eight cases cover: interrupted work, an agent committing by itself, a permission denied at run time, a blocked push, failover timeout, the queue lock, the interruption cap and unique task ids.

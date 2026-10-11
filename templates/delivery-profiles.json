@@ -1,19 +1,15 @@
 {
- "_doc": "Per-repo delivery rules for agent-ship. Matched against remote slugs (owner/name) or the checkout path/name. Rules come from your own instructions; quote the source in 'why'. Edit with evidence, not guesses.",
- "defaults": {
-  "canonical_host": "github",
-  "mirror_all_branches": true,
-  "why": "Push to GitHub first; mirror to a GitLab remote only when the project has one."
- },
- "profiles": [
-  {
-   "name": "example-app",
-   "match": ["your-org/your-app"],
-   "rules": [
-    "merge fast: target 0 open PRs; delete merged branches",
-    "App Store submission only when the user asks"
-   ],
-   "why": "example profile - replace with your own rules"
-  }
- ]
+  "defaults": {
+    "canonical_host": "github",
+    "mirror_all_branches": false,
+    "why": "Commits land on GitHub first; another host's copy is only fast-forwarded on base branches."
+  },
+  "profiles": [
+    {
+      "name": "example",
+      "match": ["your-org/your-app"],
+      "rules": ["Keep open pull requests near zero; delete branches after merge."],
+      "why": "Example only. Replace it with your own rules, and say where each one came from."
+    }
+  ]
 }

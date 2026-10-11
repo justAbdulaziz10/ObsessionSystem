@@ -39,7 +39,7 @@ esac
 umask 077
 d=${AGENTOS_TELEMETRY_SPOOL:-$HOME/.agent-os/runtime/telemetry-spool}
 m=
-read -r m <"$HOME/.agent-os/mode"
+{ read -r m <"$HOME/.agent-os/mode"; } 2>/dev/null
 set -C
 w() { printf 'AOS1\t%s\t%s\n%s\n' "${CLAUDE_CONFIG_DIR-}" "$m" "$ev" >"$1"; }
 if ! w "$d/e.$$"; then

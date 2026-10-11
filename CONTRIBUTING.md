@@ -10,13 +10,13 @@ cd ObsessionSystem
 evals/run-all.sh          # installs into a throwaway $HOME and runs every suite
 ```
 
-`run-all.sh` never touches your real home, repos or remotes. It takes about three minutes on a laptop and must pass before a PR merges (CI runs it on macOS).
+`run-all.sh` never touches your real home, repos or remotes. It takes a few minutes and must pass before a PR merges. CI runs it on macOS and Ubuntu.
 
 ## What makes a good PR
 
 - **One concern per PR.** A bug fix, a new check, a new command. Not all three.
 - **A regression check for new behavior.** Add a case to the matching suite in `evals/`. Bugs get a case that fails before the fix and passes after.
-- **Numbers for tuning.** Changes to the skill router (`agent-cap`), review routing or other heuristics need before/after scores. For the router, add or extend a *blind* holdout set **before** changing code, then report `evals/cap-router/run.py` results on it.
+- **Evidence for heuristics.** Changes to review routing, check detection or floor-guard rules need cases that show the old and new behavior.
 - **Meet the floor, don't lower it.** No skipped or deleted tests, stripped assertions, new lint suppressions or loosened CI. The floor guard in `agent-ship` blocks these; if one is truly deliberate, explain it in the PR.
 - **Keep it small.** Deleting dead weight counts as an improvement. A new dependency needs a reason.
 
@@ -25,12 +25,13 @@ evals/run-all.sh          # installs into a throwaway $HOME and runs every suite
 - Commands live in `bin/` as single-file Python 3.9+ or POSIX/zsh scripts, standard library only.
 - Paths come from `$HOME` (`~/.agent-os`, `~/bin`, `~/.agents/skills`). Never hard-code a user, machine or project name.
 - Skills follow `skills/writing-skills` and must pass `agent-skill-lint`. Adapted third-party work keeps its license file next to the skill.
-- Policy files (`policy/`) are short and prescriptive. If a rule needs a paragraph of explanation, it probably belongs in `docs/SYSTEM.md` instead.
+- `policy/RULES.md` is loaded into every session, so every line costs context. Detail belongs in `DELIVERY.md`, `TASKS.md` or `docs/`.
+- Docs describe what the code does today. If you change behavior, change the doc in the same PR.
 
 ## Good first contributions
 
-- Linux `systemd` / cron equivalents of the launchd templates in `templates/launchd/`
-- More blind holdout cases for `evals/cap-router/`
+- More check detection in `agent-ship` (languages and build tools it doesn't recognize yet)
+- Floor-guard patterns for test frameworks it doesn't cover
 - Clearer error messages wherever a command fails without saying what to do next
 
 ## Privacy

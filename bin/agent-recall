@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""agent-recall: one ranked index over AgentOS memory.
+"""agent-recall: one ranked index over agent memory.
 
 Sources (files stay the source of truth; the index is fully rebuildable):
   ~/.agent-os/{LESSONS,DECISIONS,IMPROVEMENTS}.md  one entry per "## " heading (whichever exist)
@@ -777,7 +777,7 @@ def main(argv):
                       sum(r.get("usd", 0.0) for r in runs)))
         return 0
 
-    ap = argparse.ArgumentParser(prog="agent-recall", description="Ranked pointers into AgentOS memory.")
+    ap = argparse.ArgumentParser(prog="agent-recall", description="Ranked pointers into agent memory.")
     ap.add_argument("query", nargs="+")
     ap.add_argument("--k", type=int, default=5)
     ap.add_argument("--kind", help="comma list: " + ",".join(KINDS))

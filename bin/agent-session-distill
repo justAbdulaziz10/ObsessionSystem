@@ -37,7 +37,7 @@ from datetime import datetime, timedelta
 
 HOME = os.path.expanduser("~")
 DB = os.environ.get("AGENTOS_TELEMETRY_DB") or os.path.join(HOME, ".agent-os", "v2", "db", "agentos.sqlite")
-RUNTIME = os.path.join(HOME, ".agent-os", "runtime", "autopilot")
+RUNTIME = os.path.join(HOME, ".agent-os", "runtime", "distill")
 LOG = os.environ.get("AGENTOS_DISTILL_LOG") or os.path.join(RUNTIME, "distill.log")
 CLAUDE_HOMES = [os.path.join(HOME, ".claude"), os.path.join(HOME, ".claude_second")]
 OUT_OF_USAGE = re.compile(r"usage limit|limit reached|hit your limit|rate.?limit|out of (extra )?usage|"

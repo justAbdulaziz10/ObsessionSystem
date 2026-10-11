@@ -21,7 +21,7 @@
   scorecard [--days N]                 per-project CI pass rate, CI time, pushes
   guard                                PreToolUse hook: blocks git pushes that break the topology
 
-Rules (see GLOBAL.md "Delivery"): the canonical remote is where commits actually land
+Rules (policy/DELIVERY.md): the canonical remote is where commits actually land
 (the one ahead), confirmed by mirror-mechanism evidence. Push there only. A mirror is
 pushed only to fast-forward a base branch to exactly the canonical commit, when its own
 mirror job is not keeping up. Diverged remotes, force pushes to base branches and
@@ -210,7 +210,7 @@ def topology(path, fetch=False):
     if prof.get("canonical") in names:
         canonical, reason = prof["canonical"], "set in delivery profile"
     elif preferred:
-        canonical, reason = preferred[0], f"user rule: pushes go to {prof['canonical_host']}"
+        canonical, reason = preferred[0], f"delivery profile: canonical_host is {prof['canonical_host']}"
     elif len(group) == 1:
         canonical, reason = group[0], "only remote for this repository" if not others else "no mirror on another host; " + ", ".join(others) + " left alone"
     elif group:

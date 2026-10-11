@@ -1,5 +1,5 @@
 #!/bin/sh
-# AgentOS global git hooks (core.hooksPath). Runs the AgentOS pre-push check, then the repo's own hook from
+# Global git hooks (core.hooksPath). Runs the agent-ship pre-push check, then the repo's own hook from
 # <git-common-dir>/hooks, so per-repo hooks (pre-commit, git-lfs, server hooks in bare repos) keep working.
 # Undo: git config --global --unset core.hooksPath
 name=$(basename "$0")

@@ -10,7 +10,7 @@ You are a dispatcher. Codex does the implementation; you brief it, wait for it, 
 
 ## 1. Check Codex, then the worktree
 
-First run `codex-ha ready`. If it exits 75 (`AGENT_CODEX_HA_EXHAUSTED`), stop now: write nothing and report `CODEX_UNAVAILABLE` with the time it prints. The lead implements the task itself.
+First run `codex-ha ready`. If it exits 75 (`AGENT_CODEX_HA_EXHAUSTED`), stop now: write nothing and report `CODEX_UNAVAILABLE` with the reason it prints (not logged in, CLI missing, or a cooldown end time). The lead implements the task itself.
 
 Then run these as separate commands: `git rev-parse --show-toplevel`, `git status --short`, `git branch --show-current`, `git log -1 --oneline`. Note the starting SHA.
 
@@ -76,4 +76,4 @@ Return only:
 - remaining risks or anything unfinished
 - job log path
 
-Never pick a Codex account, model, or reasoning effort yourself; codex-ha and AgentOS control those.
+Never pick a Codex account, model, or reasoning effort yourself. codex-ha uses the Codex CLI's defaults unless the user set `CODEX_HA_MODEL` / `CODEX_HA_EFFORT` or `codex_model` / `codex_effort` in `~/.agent-os/config.json`.

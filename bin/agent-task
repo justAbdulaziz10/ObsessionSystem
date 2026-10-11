@@ -136,7 +136,7 @@ CHECKLIST_RULES = [
      "Inspect the UI before and after the change and keep the evidence (agent-task proof artifact).",
      ("artifact-before", "artifact-after")),
 ]
-HIGH_RISK_WORDS = ("auth", "security", "secret", "password", "payment", "billing", "subscription",
+HIGH_RISK_WORDS = ("auth", "login", "token", "security", "secret", "password", "payment", "billing", "subscription",
                    "production", "deploy", "privacy", "encrypt", "delete", "migration")
 MEDIUM_RISK_WORDS = ("refactor", "database", "schema", "architecture", "concurrency", "upgrade")
 
