@@ -46,7 +46,11 @@ kept() { printf '  = %s\n' "${1/#$HOME/~}"; }
 # treesum PATH: the same function as in install.sh; keep them identical.
 treesum() {
   if [ -d "$1" ]; then
-    (cd "$1" && find . -type f | LC_ALL=C sort | while IFS= read -r f; do printf '%s ' "$f"; cksum < "$f"; done) | cksum
+    (cd "$1" && find . | LC_ALL=C sort | while IFS= read -r f; do
+      if [ -L "$f" ]; then printf 'L %s %s\n' "$f" "$(readlink "$f")"
+      elif [ -d "$f" ]; then printf 'D %s\n' "$f"
+      else printf 'F %s ' "$f"; cksum < "$f"; fi
+    done) | cksum
   else cksum < "$1"; fi
 }
 

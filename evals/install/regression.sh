@@ -133,6 +133,11 @@ echo "my note" >> "$HOME/.agents/skills/correct/SKILL.md"
 "$R/uninstall.sh" >/dev/null
 check "edited skill kept" 'grep -q "my note" "$HOME/.agents/skills/correct/SKILL.md"'
 check "unedited skill removed" '[ ! -e "$HOME/.agents/skills/diagnosing-bugs" ]'
+fresh
+"$R/install.sh" --copy >/dev/null
+mkdir "$HOME/.agents/skills/correct/my-notes"
+"$R/uninstall.sh" >/dev/null
+check "copy with an added empty folder kept" '[ -d "$HOME/.agents/skills/correct/my-notes" ]'
 
 echo "-- 13. --copy: a changed checkout does not pin unedited copies"
 fresh

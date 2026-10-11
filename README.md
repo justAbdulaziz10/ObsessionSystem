@@ -99,7 +99,7 @@ This needs `zsh`, `jq` and `sqlite3`. It installs into a temporary `HOME` and ru
 | Codex add-on | 24 |
 | `agent-overnight` | 10 |
 | Telemetry | 14 groups |
-| Install and uninstall | 46 checks in 16 scenarios |
+| Install and uninstall | 47 checks in 16 scenarios |
 | Skill lint | the 9 skills |
 
 ## Limits

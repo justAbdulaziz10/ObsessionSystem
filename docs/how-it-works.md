@@ -93,7 +93,7 @@ The telemetry hook records names and counts, never prompts or transcript text.
 
 ## Limits
 
-- Developed on macOS. The CI suite also runs on Linux; Windows is not supported.
+- Developed on macOS. The CI suite also runs on Linux; Windows is not supported. The telemetry ingester's shebang uses `env -S`, which needs GNU coreutils 8.30 or newer on Linux (not BusyBox).
 - The rules and skills were extracted from one person's setup and tuned for it. Edit `policy/RULES.md` to match how you work; it is meant to be yours.
 - The floor guard is pattern-based. It catches the common ways a change weakens a test suite, not every way.
 - The `agent-task` checklist comes from keywords in the request. Edit `checklist.json` when it is wrong.
