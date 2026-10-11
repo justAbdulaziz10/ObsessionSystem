@@ -5,7 +5,7 @@
 # in-process. That skips a second interpreter exec, the biggest remaining cost (~3 ms CPU per exec on a laptop).
 # It must therefore be started through a shell (as settings.json does), not via a direct execve without one.
 #
-# Registered in ~/.claude/settings.json and ~/.claude_second/settings.json on
+# Registered in the settings.json of each Claude config dir on
 #   PreToolUse (matcher ^(Skill|Agent|Task|Read)$|^mcp__), Stop, StopFailure, SessionEnd.
 # Hot path: no python, no jq, no DB; usually no fork at all (payloads > 8 KiB fork one `cat`).
 # Each kept event becomes one private file (mode 600, created O_EXCL via noclobber; concurrent writers never collide)

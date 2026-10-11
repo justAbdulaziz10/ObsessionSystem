@@ -1,4 +1,4 @@
-#!/usr/bin/python3 -I -S
+#!/usr/bin/env python3
 """Ingest the telemetry spool into the usage/sessions tables.
 
 ~/bin/agent-telemetry-hook (dash) writes one private file per Claude Code hook event into the spool:
@@ -28,6 +28,12 @@ Exit: 0 ok / nothing to do / lock busy; 1 ingest failed (files kept for the next
 import os
 import sys
 import time
+
+# Like python -I: never import from the script dir, the cwd or $PYTHONPATH (a stray json.py there would run
+# inside the hook's ingester). Everything imported later is stdlib.
+_skip = {os.path.dirname(os.path.abspath(__file__)), os.path.dirname(os.path.realpath(__file__))}
+_skip.update(os.path.abspath(p) for p in os.environ.get("PYTHONPATH", "").split(os.pathsep) if p)
+sys.path[:] = [p for p in sys.path if p and os.path.abspath(p) not in _skip]
 
 HOME = os.path.expanduser("~")
 SPOOL = os.environ.get("AGENTOS_TELEMETRY_SPOOL") or os.path.join(HOME, ".agent-os", "runtime", "telemetry-spool")
@@ -71,18 +77,40 @@ def iso(t):
     return time.strftime("%Y-%m-%dT%H:%M:%S", lt) + ".%03d" % int((t % 1) * 1000) + off[:3] + ":" + off[3:]
 
 
+def claude_dirs():
+    """~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated), de-duplicated by realpath."""
+    out, seen = [], set()
+    for d in [os.path.join(HOME, ".claude"), os.environ.get("CLAUDE_CONFIG_DIR", "")] + \
+            os.environ.get("AGENT_CLAUDE_DIRS", "").split(":"):
+        if d == "~" or d.startswith("~/"):
+            d = HOME + d[1:]
+        if not d:
+            continue
+        d = os.path.abspath(d)
+        r = os.path.realpath(d)
+        if r not in seen:
+            seen.add(r)
+            out.append((d, r))
+    return out
+
+
+def account_label(d):
+    b = os.path.basename(d.rstrip("/"))
+    return b[1:] if b.startswith(".") else b
+
+
+CLAUDE_DIRS = claude_dirs()
+
+
 def account_of(transcript, config_dir):
-    t = transcript or ""
-    if "/.claude_second/" in t:
-        return "claude2"
-    if "/.claude/" in t:
-        return "claude1"
-    d = (config_dir or "").rstrip("/")
-    if d.endswith("/.claude_second"):
-        return "claude2"
-    if not d or d.endswith("/.claude"):
-        return "claude1"
-    return os.path.basename(d) or "unknown"
+    """Label of the config dir holding the transcript, else of the spool header's dir, else 'claude'."""
+    if transcript:
+        t = os.path.abspath(transcript)
+        for cand in (t, os.path.realpath(t)):
+            for d, r in CLAUDE_DIRS:
+                if cand.startswith(d + "/") or cand.startswith(r + "/"):
+                    return account_label(d)
+    return (account_label(config_dir) if config_dir else "") or "claude"
 
 
 def repo_of(cwd):

@@ -17,7 +17,8 @@ by a Claude reviewer (a different model family from Codex) that lists what
 deserves attention. Nothing is merged or pushed. Every step is a row in
 decisions.tsv. Exit 75 from codex-ha (no account) stops the run unless
 --claude-fallback is given. Claude calls try each Claude account in turn when
-one is out of usage. One run at a time (run.lock).
+one is out of usage: ~/.claude, $CLAUDE_CONFIG_DIR, then each dir in
+$AGENT_CLAUDE_DIRS (colon-separated). One run at a time (run.lock).
 
 --no-baseline is for upkeep tasks whose check already passes (maintaining a
 skill): the agent runs anyway and "no-change" is a valid outcome. --key makes
@@ -46,7 +47,6 @@ PIDFILE = ROOT / "run.pid"
 ATTEMPT_TIMEOUT = 2 * 3600
 CHECK_TIMEOUT = 30 * 60
 REVIEW_BUDGET = "2"
-CLAUDE_HOMES = [Path.home() / ".claude", Path.home() / ".claude_second"]
 # Every agent and check runs with pushes disabled at the git level: an empty
 # pushInsteadOf prefix rewrites every push URL to a helper that does not exist.
 NO_PUSH_ENV = {"GIT_TERMINAL_PROMPT": "0", "GIT_CONFIG_COUNT": "1",
@@ -133,13 +133,31 @@ def tail(text, n=60):
     return "\n".join(text.strip().splitlines()[-n:])
 
 
+def claude_dirs():
+    """Existing Claude config dirs: ~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated),
+    de-duplicated by realpath."""
+    home, out, seen = str(Path.home()), [], set()
+    for d in [os.path.join(home, ".claude"), os.environ.get("CLAUDE_CONFIG_DIR", "")] + \
+            os.environ.get("AGENT_CLAUDE_DIRS", "").split(":"):
+        if d == "~" or d.startswith("~/"):
+            d = home + d[1:]
+        if d and os.path.isdir(d) and os.path.realpath(d) not in seen:
+            seen.add(os.path.realpath(d))
+            out.append(os.path.abspath(d))
+    return out
+
+
+def account_label(d):
+    """Account label of a config dir: its name without the leading dot (~/.claude -> claude)."""
+    b = os.path.basename(d.rstrip("/"))
+    return b[1:] if b.startswith(".") else b
+
+
 def claude(args, cwd, timeout, log=None):
     """Run `claude -p ARGS`, trying each Claude account until one is not out of usage.
     Return (rc, result text)."""
     rc, text = 75, "no Claude account available"
-    for home in CLAUDE_HOMES:
-        if not home.exists():
-            continue
+    for home in map(Path, claude_dirs()):
         env = {**os.environ, **NO_PUSH_ENV, "CLAUDE_CONFIG_DIR": str(home)}
         stdout = ""
         try:
@@ -160,7 +178,7 @@ def claude(args, cwd, timeout, log=None):
             with open(log, "a") as f:
                 f.write(f"\n$ claude -p ... (CLAUDE_CONFIG_DIR={home}, rc={rc})\n{text}\n")
         if is_error and OUT_OF_USAGE.search(text or raw):
-            rc, text = 75, f"{home.name}: {tail(text or raw, 1)[:160]}"
+            rc, text = 75, f"{account_label(str(home))}: {tail(text or raw, 1)[:160]}"
             continue
         return rc, text
     return rc, text

@@ -16,7 +16,6 @@ import re
 import sys
 
 HOME = os.path.expanduser("~")
-CLAUDE_HOMES = [f"{HOME}/.claude", f"{HOME}/.claude_second"]
 CODEX_HOMES = [f"{HOME}/.codex", f"{HOME}/.codex_second"]
 
 # Injected context, not something the user typed.
@@ -42,6 +41,20 @@ SECRET = re.compile(
 )
 
 
+def claude_dirs():
+    """Existing Claude config dirs: ~/.claude, $CLAUDE_CONFIG_DIR, then $AGENT_CLAUDE_DIRS (colon-separated),
+    de-duplicated by realpath."""
+    home, out, seen = HOME, [], set()
+    for d in [os.path.join(home, ".claude"), os.environ.get("CLAUDE_CONFIG_DIR", "")] + \
+            os.environ.get("AGENT_CLAUDE_DIRS", "").split(":"):
+        if d == "~" or d.startswith("~/"):
+            d = home + d[1:]
+        if d and os.path.isdir(d) and os.path.realpath(d) not in seen:
+            seen.add(os.path.realpath(d))
+            out.append(os.path.abspath(d))
+    return out
+
+
 def redact(text):
     return SECRET.sub("[REDACTED]", text)
 
@@ -58,7 +71,7 @@ def text_of(content):
 
 
 def claude_messages(since):
-    for home in CLAUDE_HOMES:
+    for home in claude_dirs():
         for path in glob.glob(f"{home}/projects/*/*.jsonl"):
             if os.path.getmtime(path) < since.timestamp():
                 continue

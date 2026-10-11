@@ -15,6 +15,8 @@ exit 0
 X
 cat > $F/claude <<'X'
 #!/bin/bash
+[ -n "${FAKE_CALLS:-}" ] && echo "$CLAUDE_CONFIG_DIR" >> "$FAKE_CALLS"
+[ -n "${FAKE_LIMIT_ALL:-}" ] && { echo '{"is_error":true,"result":"You hit your limit"}'; exit 1; }
 case "$CLAUDE_CONFIG_DIR" in
   */.claude) [ -n "${FAKE_LIMIT1:-}" ] && { echo '{"is_error":true,"result":"You hit your limit"}'; exit 1; } ;;
   *) [ -n "${FAKE_SLEEP2:-}" ] && sleep 5 ;;
@@ -74,7 +76,8 @@ N=$(python3 -c "import json;print(json.load(open('$B/ov/queue.json'))[-1]['id'])
 ok "F8 new id $N not reused" '[[ "$before" != *"$N:"* ]] && [[ "$N" == *"-006" ]]'
 
 # F5: failover where account 2 times out -> 124, not 75
-F5=$(python3 - <<'P'
+mkdir -p $B/.claude_second
+F5=$(AGENT_CLAUDE_DIRS=$B/.claude_second python3 - <<'P'
 import importlib.machinery,importlib.util,os
 l=importlib.machinery.SourceFileLoader('ov',__import__('shutil').which('agent-overnight'))
 m=importlib.util.module_from_spec(importlib.util.spec_from_loader('ov',l)); l.exec_module(m)
@@ -85,7 +88,25 @@ P
 )
 ok "F5 timeout after limit -> rc=$F5" '[[ "$F5" == 124 ]]'
 
+# Config dirs: ~/.claude, CLAUDE_CONFIG_DIR, AGENT_CLAUDE_DIRS in order, each once; only ~/.claude when neither is set
+ovclaude(){ python3 - <<'P'
+import importlib.machinery,importlib.util,os
+l=importlib.machinery.SourceFileLoader('ov',__import__('shutil').which('agent-overnight'))
+m=importlib.util.module_from_spec(importlib.util.spec_from_loader('ov',l)); l.exec_module(m)
+rc,text=m.claude(["x"],"/tmp",5)
+print(rc, text.split(":")[0])
+P
+}
+mkdir -p $B/work-claude; H=$(python3 -c "import os;print(os.path.abspath(os.environ['HOME']))")  # dirs are normalized
+ALL=$(CLAUDE_CONFIG_DIR=$B/.claude_second AGENT_CLAUDE_DIRS="$HOME/.claude:$B/work-claude:~/.claude:$B/.claude_second/:$B/missing" \
+  FAKE_LIMIT_ALL=1 FAKE_CALLS=$B/calls1 ovclaude)
+ok "all dirs tried in order, each once, missing skipped -> rc 75, label work-claude" \
+  '[[ "$ALL" == "75 work-claude" && "$(tr "\n" " " < $B/calls1)" == "$H/.claude $B/.claude_second $B/work-claude " ]]'
+ONE=$(unset CLAUDE_CONFIG_DIR AGENT_CLAUDE_DIRS; FAKE_LIMIT1=1 FAKE_CALLS=$B/calls2 ovclaude)
+ok "only ~/.claude when neither is set -> rc 75, label claude" '[[ "$ONE" == "75 claude" && "$(cat $B/calls2)" == "$H/.claude" ]]'
+
 # F6: concurrent add + update keep both
 R=$(mkrepo r6); for i in $(seq 1 8); do agent-overnight add --repo $R --done true "c$i" >/dev/null & done; wait
 ok "F6 8 concurrent adds all kept" '[ $(python3 -c "import json;print(sum(t[\"goal\"].startswith(\"c\") for t in json.load(open(\"$B/ov/queue.json\"))))") -eq 8 ]'
 echo "passed=$pass failed=$fail"; rm -rf $B
+[ "$fail" = 0 ]
