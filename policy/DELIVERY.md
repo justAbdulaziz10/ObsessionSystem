@@ -100,7 +100,7 @@ Remote CI is a second opinion. A remote CI quota or outage never blocks a local 
 | `floor_ignore` | path globs the floor guard skips |
 | `floor_allow` | regexes for an agreed idiom the floor guard accepts |
 | `report_status` | set to `false` to stop posting the local CI result to GitHub |
-| `why` | where the rule came from; required, so the next agent knows whether it still applies |
+| `why` | where the rule came from; recommended, so the next agent knows whether it still applies |
 
 ## Releases and housekeeping
 

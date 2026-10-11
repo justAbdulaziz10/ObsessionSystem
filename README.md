@@ -65,7 +65,7 @@ The installer never overwrites an existing file. It appends a marked three-line 
 | `--with-git-hooks` | a global git pre-push hook with the same push rules, for pushes from any tool |
 | `--copy` | copy files instead of linking to this checkout |
 
-`./uninstall.sh` reverses all of it. Your data in `~/.agent-os` stays unless you pass `--purge`.
+`./uninstall.sh` removes what the installer created, as listed in `~/.agent-os/install-manifest.tsv`, along with the import block and hooks. A copied file you have since edited is kept and reported. Your data in `~/.agent-os` stays unless you pass `--purge`.
 
 ## First steps in a project
 
@@ -90,7 +90,7 @@ The lead session can hand implementation slices to the [Codex CLI](https://githu
 evals/run-all.sh
 ```
 
-This installs into a temporary `HOME` and runs every suite there. Your own configuration is never touched. CI runs it on macOS and Ubuntu.
+This needs `zsh`, `jq` and `sqlite3`. It installs into a temporary `HOME` and runs every suite there. Your own configuration is never touched. CI runs it on macOS and Ubuntu.
 
 | Suite | Count |
 |---|---|
@@ -99,6 +99,7 @@ This installs into a temporary `HOME` and runs every suite there. Your own confi
 | Codex add-on | 24 |
 | `agent-overnight` | 8 |
 | Telemetry | 13 groups |
+| Install and uninstall | 32 checks in 10 scenarios |
 | Skill lint | the 9 skills |
 
 ## Limits

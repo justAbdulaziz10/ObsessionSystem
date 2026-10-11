@@ -9,7 +9,8 @@
 #
 # It never overwrites a file you already have: an existing path is left alone
 # and reported. Files it edits (CLAUDE.md, settings.json) are backed up first.
-# ./uninstall.sh reverses everything except your data in ~/.agent-os.
+# Everything it creates is listed in ~/.agent-os/install-manifest.tsv, which
+# ./uninstall.sh uses to remove exactly that and nothing else.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +18,7 @@ AOS="$HOME/.agent-os"
 BIN="$HOME/bin"
 SKILLS="$HOME/.agents/skills"
 CLAUDE="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+MANIFEST="$AOS/install-manifest.tsv"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 BEGIN='<!-- obsession-system:begin -->'
 END='<!-- obsession-system:end -->'
@@ -28,7 +30,7 @@ for a in "$@"; do
     --copy) COPY=1 ;;
     --with-hooks) HOOKS=1 ;;
     --with-git-hooks) GITHOOKS=1 ;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
   esac
 done
@@ -38,23 +40,38 @@ ok()   { printf '  + %s\n' "$*"; }
 keep() { printf '  = %s\n' "$*"; }
 run()  { if [ "$DRY" = 1 ]; then printf '    $ %s\n' "$*"; else "$@"; fi; }
 
-# place SRC DEST: symlink (or copy) SRC to DEST unless DEST already exists.
+# The manifest has one line per path this installer created: kind<TAB>dest<TAB>src.
+recorded() { [ -f "$MANIFEST" ] && awk -F'\t' -v d="$1" '$2 == d { f = 1 } END { exit !f }' "$MANIFEST"; }
+record() {
+  [ "$DRY" = 1 ] && return 0
+  mkdir -p "$AOS"
+  if [ -f "$MANIFEST" ]; then
+    awk -F'\t' -v d="$2" '$2 != d' "$MANIFEST" > "$MANIFEST.tmp" && mv "$MANIFEST.tmp" "$MANIFEST"
+  fi
+  printf '%s\t%s\t%s\n' "$1" "$2" "$3" >> "$MANIFEST"
+}
+
+# place SRC DEST: symlink (or copy) SRC to DEST unless something else is already there.
+# A link this installer made earlier is updated, e.g. after the checkout moved.
 place() {
   local src="$1" dest="$2"
   if [ -L "$dest" ] && [ "$(readlink "$dest")" = "$src" ]; then keep "$(tilde "$dest") (already linked)"; return; fi
-  if [ -e "$dest" ] || [ -L "$dest" ]; then keep "$(tilde "$dest") exists, left alone"; return; fi
+  if [ -L "$dest" ] && recorded "$dest"; then
+    run rm "$dest"
+  elif [ -e "$dest" ] || [ -L "$dest" ]; then
+    keep "$(tilde "$dest") exists, left alone"; return
+  fi
   run mkdir -p "$(dirname "$dest")"
-  if [ "$COPY" = 1 ]; then run cp -R "$src" "$dest"; else run ln -s "$src" "$dest"; fi
+  if [ "$COPY" = 1 ]; then run cp -R "$src" "$dest"; record copy "$dest" "$src"
+  else run ln -s "$src" "$dest"; record link "$dest" "$src"; fi
   ok "$(tilde "$dest")"
 }
 
-# seed SRC DEST: copy a starting file once. After that it is yours.
+# seed SRC DEST: copy a starting file once. After that it is yours (not in the manifest).
 seed() {
   if [ -e "$2" ]; then keep "$(tilde "$2") exists, left alone"; return; fi
   run mkdir -p "$(dirname "$2")"; run cp "$1" "$2"; ok "$(tilde "$2")"
 }
-
-backup() { [ -f "$1" ] && run cp "$1" "$1.bak-$STAMP" && ok "backup $(tilde "$1").bak-$STAMP"; return 0; }
 
 for t in python3 git; do command -v "$t" >/dev/null || { echo "missing required tool: $t" >&2; exit 1; }; done
 python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))' || { echo "Python 3.9 or newer is required" >&2; exit 1; }
@@ -75,7 +92,7 @@ echo "Skills -> ~/.agents/skills, linked into $(tilde "$CLAUDE")/skills"
 for d in "$REPO"/skills/*/; do
   n="$(basename "$d")"
   place "${d%/}" "$SKILLS/$n"
-  place "$SKILLS/$n" "$CLAUDE/skills/$n"
+  if [ ! "$SKILLS" -ef "$CLAUDE/skills" ]; then place "$SKILLS/$n" "$CLAUDE/skills/$n"; fi
 done
 
 echo "Agents -> $(tilde "$CLAUDE")/agents"
@@ -86,24 +103,24 @@ MD="$CLAUDE/CLAUDE.md"
 if [ -f "$MD" ] && grep -qF "$BEGIN" "$MD"; then
   keep "$(tilde "$MD") already imports the rules"
 else
-  backup "$MD"
+  if [ -f "$MD" ]; then run cp "$MD" "$MD.bak-$STAMP"; ok "backup $(tilde "$MD").bak-$STAMP"; fi
   if [ "$DRY" = 1 ]; then
     printf '    append to %s:\n      %s\n      %s\n      %s\n' "$(tilde "$MD")" "$BEGIN" "$(cat "$REPO/templates/claude/CLAUDE.md")" "$END"
   else
     mkdir -p "$CLAUDE"
-    { [ -s "$MD" ] && printf '\n'; printf '%s\n' "$BEGIN"; cat "$REPO/templates/claude/CLAUDE.md"; printf '%s\n' "$END"; } >> "$MD"
+    sep=""; [ -s "$MD" ] && sep=$'\n'
+    { printf '%s%s\n' "$sep" "$BEGIN"; cat "$REPO/templates/claude/CLAUDE.md"; printf '%s\n' "$END"; } >> "$MD"
   fi
   ok "$(tilde "$MD"): import block for ~/.agent-os/policy/RULES.md"
 fi
 
 if [ "$HOOKS" = 1 ]; then
-  echo "Claude Code hooks -> settings.json"
-  # A second Claude config dir (~/.claude_second) gets the same hooks if it exists.
-  for CDIR in "$CLAUDE" "$HOME/.claude_second"; do
-    if [ "$CDIR" != "$CLAUDE" ] && { [ ! -d "$CDIR" ] || [ "$CDIR" -ef "$CLAUDE" ]; }; then continue; fi
-    S="$CDIR/settings.json"
-    if [ "$DRY" = 1 ]; then printf '    merge templates/claude/settings.hooks.json into %s\n' "$(tilde "$S")"; continue; fi
-    mkdir -p "$CDIR"
+  echo "Claude Code hooks -> $(tilde "$CLAUDE")/settings.json"
+  S="$CLAUDE/settings.json"
+  if [ "$DRY" = 1 ]; then
+    printf '    merge templates/claude/settings.hooks.json into %s\n' "$(tilde "$S")"
+  else
+    mkdir -p "$CLAUDE"
     python3 - "$S" "$REPO/templates/claude/settings.hooks.json" "$STAMP" <<'PY'
 import json, os, shutil, sys
 dst, src, stamp = sys.argv[1:]
@@ -130,14 +147,16 @@ with open(dst, "w") as f:
     f.write("\n")
 print(f"  + {shown}: hooks merged, existing hooks kept")
 PY
-  done
+  fi
 fi
 
 if [ "$GITHOOKS" = 1 ]; then
   echo "Global git hooks"
   place "$REPO/git-hooks" "$AOS/git-hooks"
   cur="$(git config --global core.hooksPath || true)"
-  if [ -n "$cur" ] && [ "$cur" != "$AOS/git-hooks" ]; then
+  if [ "$cur" = "$AOS/git-hooks" ]; then
+    keep "core.hooksPath already set"
+  elif [ -n "$cur" ]; then
     keep "core.hooksPath is already $cur, left alone"
   else
     run git config --global core.hooksPath "$AOS/git-hooks"

@@ -35,6 +35,7 @@ run tasks       bash evals/tasks/regression.sh
 run codex       bash evals/codex/regression.sh
 run overnight   bash evals/overnight/regression.sh
 run telemetry   bash evals/telemetry/regression.sh
+run install     bash evals/install/regression.sh
 run skill-lint  agent-skill-lint
 
 echo

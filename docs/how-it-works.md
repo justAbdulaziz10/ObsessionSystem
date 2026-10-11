@@ -57,17 +57,18 @@ Plain Python and shell scripts in `~/bin`, with no dependencies beyond Python 3.
 
 | Path | Contents | Removed by `uninstall.sh` |
 |---|---|---|
-| `~/bin/agent-*`, `~/bin/codex-ha` | links to `bin/` | yes |
+| `~/bin/agent-*`, `~/bin/codex-ha` | links to `bin/` (copies with `--copy`) | yes |
 | `~/.agent-os/policy/` | links to `policy/` | yes |
 | `~/.agents/skills/<name>` | links to `skills/` | yes |
 | `~/.claude/skills/<name>`, `~/.claude/agents/<name>.md` | links | yes |
 | `~/.claude/CLAUDE.md` | a three-line marked block, appended | yes (backup kept) |
 | `~/.claude/settings.json` | hook entries (`--with-hooks` only) | yes (backup kept) |
 | git `core.hooksPath` | `~/.agent-os/git-hooks` (`--with-git-hooks` only) | yes |
+| `~/.agent-os/install-manifest.tsv` | every path the installer created | yes |
 | `~/.agent-os/config.json`, `delivery/profiles.json`, `LESSONS.md` | starting files, then yours | only with `--purge` |
 | `~/.agent-os/v2/`, `runtime/` | task records, telemetry, CI results | only with `--purge` |
 
-`CLAUDE_CONFIG_DIR` is honoured in place of `~/.claude`.
+The installer writes to `$CLAUDE_CONFIG_DIR` instead of `~/.claude` when that is set. `uninstall.sh` removes only paths listed in the manifest; an edited `--copy` file is kept.
 
 ## Data and network
 

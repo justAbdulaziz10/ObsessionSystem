@@ -14,8 +14,9 @@ A rewrite toward a smaller, accurate product. 1.0 was a copy of one person's mac
   - links skills one by one into `~/.claude/skills`, so an existing skills directory is no longer skipped;
   - adds a marked, removable import block to `~/.claude/CLAUDE.md`;
   - honours `CLAUDE_CONFIG_DIR`;
-  - backs up before editing, and only when it changes something.
-- Uninstaller: removes the import block and the hooks it added.
+  - backs up before editing, and only when it changes something;
+  - records everything it creates in `~/.agent-os/install-manifest.tsv`, and relinks after the checkout moves.
+- Uninstaller: removes only what the manifest lists, plus the import block and the hooks it added. A `--copy` file you have since edited is kept and reported.
 - `codex-ha`:
   - no hard-coded model; the Codex CLI's defaults apply unless configured;
   - `ready` and `status` check that the CLI exists and is logged in;

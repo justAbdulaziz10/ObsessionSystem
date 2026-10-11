@@ -31,9 +31,10 @@ jobs:
         run: |
           set -e
           for f in bin/*; do
-            if head -1 "$f" | grep -q python; then python3 -m py_compile "$f"; echo "py  $f"; fi
+            if head -1 "$f" | grep -q python; then python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read(), sys.argv[1])' "$f"; echo "py  $f"; fi
           done
-          for f in install.sh uninstall.sh evals/run-all.sh evals/*/regression.sh; do
+          for f in install.sh uninstall.sh evals/run-all.sh evals/*/*.sh; do
+            if head -1 "$f" | grep -q zsh; then continue; fi  # zsh suites run in the evals job
             bash -n "$f" && echo "sh  $f"
           done
           sh -n git-hooks/_dispatch && echo "sh  git-hooks/_dispatch"
@@ -48,8 +49,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v5
-      - name: Install zsh
+      - name: Install zsh, jq and sqlite3
         if: runner.os == 'Linux'
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh jq sqlite3
       - name: Install into a clean HOME and run every suite
         run: evals/run-all.sh
